@@ -36,7 +36,15 @@ extern "C" {
 /* ---- The confined half ---- */
 
 /* Lockdown flags. */
-#define SBX_LOCK_LOG_SOCKET 0x1u  /* allow socket(AF_UNIX, SOCK_DGRAM): Android's liblog, syslog */
+#define SBX_LOCK_LOG_SOCKET 0x1u  /* allow socket(AF_UNIX, SOCK_DGRAM) and connect: Android's liblog, syslog */
+/*
+ * No broker: path calls go to the kernel as they are, and only what
+ * reaches past the process is refused (sockets, execve, ptrace, namespaces,
+ * signals to other processes, io_uring, bpf and the rest). For a process
+ * whose files another wall already guards, such as an Android isolated
+ * process under its own UID. broker_fd is ignored.
+ */
+#define SBX_LOCK_UNBROKERED 0x2u
 
 #define SBX_SEALED_MAX 8
 

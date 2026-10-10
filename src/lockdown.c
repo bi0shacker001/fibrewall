@@ -116,6 +116,7 @@ static const int x86_args[6] = {REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_
 #define SBX_TRAP_DATA 0x5b0
 
 static int broker = -1;
+static int locked;
 /* The confined process's current directory: it cannot chdir for real, since it may not open what it enters. */
 static int cwd = -1;
 static struct sigaction previous;
@@ -411,6 +412,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1));
     ret(REFUSE);
 #endif
+    int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
     /* Brokered. */
     static const unsigned brokered[] = {
         __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
@@ -423,19 +425,22 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_rmdir, __NR_rename,
 #endif
     };
-    for (size_t i = 0; i < sizeof(brokered) / sizeof(brokered[0]); i++) rule(brokered[i], TRAP);
-    /* Callers fall back to the brokered or plain forms. */
-    rule(__NR_statx, NOSYS);
-    rule(__NR_openat2, NOSYS);
+    if (!unbrokered) {
+        for (size_t i = 0; i < sizeof(brokered) / sizeof(brokered[0]); i++) rule(brokered[i], TRAP);
+        /* Callers fall back to the brokered forms. */
+        rule(__NR_statx, NOSYS);
+        rule(__NR_openat2, NOSYS);
+        /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it is refused. */
+        jeq(__NR_utimensat, 0, 6);
+        load(ARG_LO(1));
+        jeq(0, 0, 3);
+        load(ARG_HI(1));
+        jeq(0, 0, 1);
+        ret(ALLOW);
+        ret(REFUSE);
+    }
+    /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
     rule(__NR_clone3, NOSYS);
-    /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it is refused. */
-    jeq(__NR_utimensat, 0, 6);
-    load(ARG_LO(1));
-    jeq(0, 0, 3);
-    load(ARG_HI(1));
-    jeq(0, 0, 1);
-    ret(ALLOW);
-    ret(REFUSE);
     /* A Unix datagram socket for the system log, when asked; no other socket. */
     if (flags & SBX_LOCK_LOG_SOCKET) {
         jeq(__NR_socket, 0, 7);
@@ -455,12 +460,14 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x7e020000u /* CLONE_NEW* */, 0, 1));
     ret(DENY);
     ret(ALLOW);
-    /* The SIGSYS handler stays ours. */
-    jeq(__NR_rt_sigaction, 0, 4);
-    load(ARG_LO(0));
-    jeq(SIGSYS, 0, 1);
-    ret(DENY);
-    ret(ALLOW);
+    if (!unbrokered) {
+        /* The SIGSYS handler stays ours. */
+        jeq(__NR_rt_sigaction, 0, 4);
+        load(ARG_LO(0));
+        jeq(SIGSYS, 0, 1);
+        ret(DENY);
+        ret(ALLOW);
+    }
     /* Signals only to this process. */
     own_process_only(__NR_kill, pid);
     own_process_only(__NR_tgkill, pid);
@@ -477,8 +484,8 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         sealed_block(__NR_dup2, 0, sealed, sealed_count);
 #endif
     }
-    /* Refused: other paths. */
-    static const unsigned refused[] = {
+    /* Refused: other paths (the kernel's own checks decide them when there is no broker). */
+    static const unsigned refused_paths[] = {
         __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchmodat, __NR_fchownat,
         __NR_inotify_add_watch, __NR_fanotify_mark, __NR_name_to_handle_at, __NR_open_by_handle_at,
         __NR_setxattr, __NR_lsetxattr, __NR_getxattr, __NR_lgetxattr, __NR_listxattr, __NR_llistxattr,
@@ -487,12 +494,19 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_link, __NR_symlink, __NR_mknod, __NR_chmod, __NR_chown, __NR_lchown, __NR_utime, __NR_utimes,
         __NR_futimesat, __NR_uselib,
 #endif
-        /* Reaching past the process. */
-        __NR_execve, __NR_execveat, __NR_bind, __NR_connect, __NR_ptrace, __NR_process_vm_readv,
-        __NR_process_vm_writev, __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup,
-        __NR_io_uring_enter, __NR_io_uring_register,
+    };
+    if (!unbrokered) {
+        for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) rule(refused_paths[i], REFUSE);
+    }
+    /* Refused: reaching past the process. */
+    static const unsigned refused[] = {
+        __NR_execve, __NR_execveat, __NR_bind, __NR_ptrace, __NR_process_vm_readv, __NR_process_vm_writev,
+        __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup, __NR_io_uring_enter,
+        __NR_io_uring_register,
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
+    /* connect only for the log's datagram socket, the one socket that can be made; nothing else to connect. */
+    if (!(flags & SBX_LOCK_LOG_SOCKET)) rule(__NR_connect, REFUSE);
     static const unsigned denied[] = {
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
@@ -511,16 +525,27 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     (void) options;
     return -ENOSYS;
 #else
-    if (broker >= 0) return -EALREADY;
-    if (broker_fd < 0) return -EBADF;
+    if (locked) return -EALREADY;
     struct sbx_lockdown_options none = {0, NULL, 0};
     if (!options) options = &none;
+    int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
+    if (unbrokered) broker_fd = -1;
+    else if (broker_fd < 0) return -EBADF;
     if (options->sealed_count > SBX_SEALED_MAX || (options->sealed_count && !options->sealed_fds)) return -EINVAL;
     for (unsigned k = 0; k < options->sealed_count; k++) {
         if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
     }
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) return built;
+    if (unbrokered) {
+        /* Nothing is forwarded, so no handler and no current directory to keep. */
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
+        struct sock_fprog program = {.len = filter_length, .filter = filter};
+        long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program);
+        if (synced != 0) return synced > 0 ? -EBUSY : -errno;
+        locked = 1;
+        return 0;
+    }
     int directory = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return -errno;
     broker = broker_fd;
@@ -539,7 +564,10 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     } else {
         struct sock_fprog program = {.len = filter_length, .filter = filter};
         long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program);
-        if (synced == 0) return 0;
+        if (synced == 0) {
+            locked = 1;
+            return 0;
+        }
         /* A positive result names a thread that could not be synchronised: a lockdown that misses threads is none. */
         error = synced > 0 ? -EBUSY : -errno;
     }

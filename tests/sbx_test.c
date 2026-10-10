@@ -514,6 +514,42 @@ static int sealed_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
+
+static int unbrokered_check(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sbx_lockdown_options options = {SBX_LOCK_UNBROKERED | SBX_LOCK_LOG_SOCKET, NULL, 0};
+        int locked = sbx_lockdown(-1, &options);
+        errno = -locked;
+        EXPECT(locked == 0, "unbrokered lockdown without a broker");
+        if (locked != 0) _exit(1);
+        char path[400];
+        snprintf(path, sizeof(path), "%s/key", secret);
+        int fd = open(path, O_RDONLY);
+        EXPECT(fd >= 0, "unbrokered: paths go to the kernel");
+        if (fd >= 0) close(fd);
+        char buffer[512];
+        EXPECT(getcwd(buffer, sizeof(buffer)) != NULL, "unbrokered: getcwd is the kernel's");
+        errno = 0;
+        EXPECT(refused(socket(AF_INET, SOCK_STREAM, 0)), "unbrokered: socket(AF_INET) refused");
+        int log_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
+        EXPECT(log_socket >= 0, "unbrokered: a Unix datagram socket for the log");
+        if (log_socket >= 0) close(log_socket);
+        errno = 0;
+        EXPECT(a_exec() == EACCES, "unbrokered: execve refused");
+        errno = 0;
+        EXPECT(kill(getppid(), 0) < 0 && errno == EPERM, "unbrokered: a signal to the parent refused");
+        errno = 0;
+        EXPECT(a_unshare() == EPERM, "unbrokered: unshare refused");
+        _exit(failures ? 1 : 0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -635,7 +671,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check();
+    int sealed_failures = sealed_check() | unbrokered_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }
