@@ -116,6 +116,15 @@ void sbx_policy_set_audit(struct sbx_policy *policy, sbx_audit_fn audit, void *c
     policy->audit_context = audit ? context : NULL;
 }
 
+/* out = a + b, both NUL-terminated; fails when the result would not fit in SBX_PATH_MAX. */
+static int join(char *out, const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    if (la + lb >= SBX_PATH_MAX) return -ENAMETOOLONG;
+    memmove(out + la, b, lb + 1);
+    if (out != a) memmove(out, a, la);
+    return 0;
+}
+
 /* Lexically absolute and normalised: no "", ".", ".." components, no trailing slash. Fails on overflow. */
 static int normalise(const char *base, const char *path, size_t path_len, char *out) {
     char joined[SBX_PATH_MAX * 2 + 2];
@@ -305,8 +314,7 @@ static int rewrite_proc(char *path, pid_t pid, pid_t tid) {
     } else {
         return 0;
     }
-    if (strlen(head) + strlen(tail) >= SBX_PATH_MAX) return -ENAMETOOLONG;
-    snprintf(rest, sizeof(rest), "%s%s", head, tail);
+    if (join(rest, head, tail) != 0) return -ENAMETOOLONG;
     strcpy(path, rest);
     return 0;
 }
@@ -388,9 +396,10 @@ static int resolve(const char *path, int follow_last, int may_create, char *out)
     char real_parent[PATH_MAX];
     if (!realpath(parent, real_parent)) return -errno;
     if (strlen(real_parent) + 1 + strlen(name) >= SBX_PATH_MAX) return -ENAMETOOLONG;
-    if (strcmp(real_parent, "/") == 0) snprintf(out, SBX_PATH_MAX, "/%s", name);
-    else snprintf(out, SBX_PATH_MAX, "%s/%s", real_parent, name);
-    return 0;
+    if (strcmp(real_parent, "/") == 0) real_parent[0] = ' ';
+    char with_slash[SBX_PATH_MAX];
+    if (join(with_slash, real_parent, "/") != 0) return -ENAMETOOLONG;
+    return join(out, with_slash, name);
 }
 
 static int fd_path(int fd, char *out) {

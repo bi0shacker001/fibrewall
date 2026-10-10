@@ -440,6 +440,12 @@ static void working(void) {
 
 /* ---- The race: swap a directory and a symlink out of the rules while opening for truncation. ---- */
 
+/*
+ * The swapper runs in the parent, unconfined: one broker thread serves the
+ * confined process's own renames in turn with its opens, so the confined
+ * side alone could never land a swap inside a request. Another process
+ * sharing the folder can, and that is what this plays.
+ */
 static volatile int racing;
 
 static void *swapper(void *argument) {
@@ -452,9 +458,6 @@ static void *swapper(void *argument) {
 }
 
 static void race(void) {
-    racing = 1;
-    pthread_t thread;
-    pthread_create(&thread, NULL, swapper, NULL);
     char path[400];
     snprintf(path, sizeof(path), "%s/dir/key", save);
     int opened = 0;
@@ -465,8 +468,6 @@ static void race(void) {
             close(fd);
         }
     }
-    racing = 0;
-    pthread_join(thread, NULL);
     printf("info race: %d of 5000 opens reached the real directory\n", opened);
 }
 
@@ -534,6 +535,7 @@ int main(void) {
     if (sbx_broker_prepare(pair[0]) != 0) { perror("prepare"); return 2; }
     parent_pid = getpid();
 
+    fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
         close(pair[0]);
@@ -550,9 +552,14 @@ int main(void) {
         _exit(failures ? 1 : 0);
     }
     close(pair[1]);
+    racing = 1;
+    pthread_t thread;
+    pthread_create(&thread, NULL, swapper, NULL);
     sbx_broker_serve(policy, pair[0]);
     int status = 0;
     waitpid(child, &status, 0);
+    racing = 0;
+    pthread_join(thread, NULL);
 
     char content[32] = {0};
     snprintf(path, sizeof(path), "%s/key", secret);
