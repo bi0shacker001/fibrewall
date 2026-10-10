@@ -27,3 +27,10 @@ if(SBX_TESTS)
   target_link_libraries(sbx_test PRIVATE sbx)
   target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# The native-kind feasibility probe: GPU drawing from a locked-down process with no ART (Android only).
+if(SBX_TESTS AND ANDROID)
+  add_executable(gpu_probe tests/android/gpu_probe.c)
+  target_link_libraries(gpu_probe PRIVATE sbx EGL GLESv2 nativewindow)
+  target_compile_options(gpu_probe PRIVATE -Wall -Wextra -Werror)
+endif()
