@@ -129,13 +129,40 @@ the broker's thread, and the confined call waits for it.
 - **Anything on a descriptor the process already holds.** It runs with the
   process's own UID. Run it under a separate UID (Android `isolatedProcess`)
   wherever the code can do without the GPU.
-- **Binder.** seccomp cannot read binder transactions. A confined ART
-  process can still ask system services for things as its app. The planned
-  `native` launcher closes this: a process with no ART that never opens
-  `/dev/binder`.
+- **Binder in an ART process.** seccomp cannot read binder transactions,
+  and ART needs binder. A confined ART process can still ask system
+  services for things as its app.
+
+  A process without ART can lose binder even when its graphics stack
+  opened it. Every transaction is an `ioctl` on the binder descriptor.
+  `sbx_lockdown`'s sealed descriptors refuse ioctl, mmap, fcntl and dup on
+  a descriptor the process keeps. On the emulator (API 28 and 34), libEGL
+  and the gralloc mapper opened `/dev/hwbinder` and `/dev/binder` during
+  setup. The probe then drew and imported a second buffer with both
+  sealed (`tests/android/gpu_probe.c`).
 - **Kernel bugs** in the system calls left open, the GPU driver's ioctls
   above all. Also denial of service (rlimits help) and timing side
   channels.
+
+## Testing
+
+`tests/sbx_test.c` runs every escape attempt twice: once unconfined as a
+control, then confined. A test cannot pass because the host refused
+something on its own. It also runs what must keep working and a symlink
+race. CI runs it on Linux (gcc, clang, ASan and UBSan) and on the Android
+emulator at API 28 (kernel 4.4) and API 34 (kernel 6.1).
+
+`tests/android/gpu_probe.c` measures the native kind on a real device. A
+re-executed child brings up EGL and imports a buffer its parent allocated.
+It then locks down with its binder descriptors sealed, draws timed frames,
+and imports a second buffer after lockdown. The parent checks the pixels.
+On every push to main, CI publishes both binaries for both ABIs as the
+rolling prerelease `probe-latest`, so a rig can run them with adb alone:
+
+```sh
+adb push sbx_test-arm64-v8a gpu_probe-arm64-v8a /data/local/tmp/
+adb shell 'cd /data/local/tmp && chmod 755 sbx_test-arm64-v8a gpu_probe-arm64-v8a && TMPDIR=/data/local/tmp ./sbx_test-arm64-v8a; ./gpu_probe-arm64-v8a; ./gpu_probe-arm64-v8a --no-seal'
+```
 
 ## Planned
 

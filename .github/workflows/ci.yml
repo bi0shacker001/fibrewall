@@ -97,3 +97,33 @@ jobs:
             adb shell 'cd /data/local/tmp && ./gpu_probe --no-seal; echo "probe_exit=$?"' || true
             adb logcat -d | grep -iE 'gpu_probe|binder|gralloc|mapper|F DEBUG|F libc|seccomp|avc' | tail -60 || true
             grep -q '^exit=0' result.txt
+
+  probe-binaries:
+    # The test and the GPU probe for both ABIs, as a rolling prerelease, so a rig or a console
+    # window can run them with adb without building anything (see docs/design.md, "Testing").
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [android-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build both ABIs
+        run: |
+          for abi in arm64-v8a x86_64; do
+            cmake -S . -B "build-$abi" \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-26
+            cmake --build "build-$abi" -j
+            cp "build-$abi/sbx_test" "sbx_test-$abi"
+            cp "build-$abi/gpu_probe" "gpu_probe-$abi"
+          done
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view probe-latest >/dev/null 2>&1 || \
+            gh release create probe-latest --prerelease --title "Test and GPU probe binaries (rolling)" \
+              --notes "Built from main by CI. Rebuilt on every push; see the commit in the asset upload time."
+          gh release upload probe-latest sbx_test-* gpu_probe-* --clobber
+          gh release edit probe-latest --notes "Built from ${GITHUB_SHA} by CI run ${GITHUB_RUN_ID}."
