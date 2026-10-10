@@ -11,7 +11,7 @@ option(SBX_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer"
 
 find_package(Threads REQUIRED)
 
-add_library(sbx STATIC src/lockdown.c src/broker.c)
+add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c)
 target_include_directories(sbx PUBLIC include PRIVATE src)
 target_link_libraries(sbx PUBLIC Threads::Threads)
 target_compile_options(sbx PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)

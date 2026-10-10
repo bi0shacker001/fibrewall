@@ -63,6 +63,37 @@ struct sbx_lockdown_options {
  */
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);
 
+/* ---- Starting a sandboxed program (the native kind) ---- */
+
+#define SBX_SPAWN_FDS_MAX 16
+#define SBX_SPAWN_LIMITS_MAX 8
+
+struct sbx_limit {
+    int resource;           /* RLIMIT_* */
+    unsigned long value;    /* soft and hard */
+};
+
+struct sbx_spawn_spec {
+    const char *path;       /* the program (on Android: a file in the app's native-library directory) */
+    char *const *argv;
+    char *const *envp;      /* NULL: an empty environment */
+    const int *fds;         /* handed over as descriptors 3, 4, ... in this order; 0-2 are inherited */
+    unsigned fd_count;
+    const struct sbx_limit *limits;
+    unsigned limit_count;
+};
+
+/*
+ * Starts spec->path as a new process holding only descriptors 0-2 and the
+ * handed ones, with the limits set and SIGKILL as its parent-death signal.
+ * Returns 0 and the pid once the program is executing, or a negative
+ * errno (the child's, if it got as far as failing to execute).
+ */
+int sbx_spawn(const struct sbx_spawn_spec *spec, pid_t *pid_out);
+
+/* Called by the spawned program first: makes it non-dumpable again (exec reset that). */
+int sbx_spawned_init(void);
+
 /* ---- The broker half ---- */
 
 /* Rule modes. A rule covers its path and everything under it; the longest matching rule decides. */

@@ -34,6 +34,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
@@ -513,6 +514,70 @@ static int sealed_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- sbx_spawn: a program starts with only what it was handed. ---- */
+
+extern char **environ;
+
+/* Runs in the spawned program (argv[1] == "--spawned"). */
+static int spawned_main(void) {
+    int bad = 0;
+    if (sbx_spawned_init() != 0) bad |= 1;
+    struct stat st;
+    if (fstat(3, &st) != 0 || !S_ISFIFO(st.st_mode)) bad |= 2;
+    DIR *fds = opendir("/proc/self/fd");
+    if (!fds) {
+        bad |= 4;
+    } else {
+        struct dirent *entry;
+        while ((entry = readdir(fds))) {
+            if (entry->d_name[0] == '.') continue;
+            int fd = atoi(entry->d_name);
+            if (fd > 3 && fd != dirfd(fds)) bad |= 8;
+        }
+        closedir(fds);
+    }
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur != 64) bad |= 16;
+    if (environ && environ[0]) bad |= 32;
+    if (prctl(PR_GET_DUMPABLE) != 0) bad |= 64;
+    char word[8];
+    snprintf(word, sizeof(word), "ok%d", bad);
+    ssize_t ignored = write(3, word, strlen(word));
+    (void) ignored;
+    return bad ? 1 : 0;
+}
+
+static int spawn_check(const char *self) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) return 1;
+    int leak = open("/dev/null", O_RDONLY);  /* inheritable, and must not be inherited */
+    char *argv[] = {(char *) self, "--spawned", NULL};
+    struct sbx_limit limit = {RLIMIT_NOFILE, 64};
+    struct sbx_spawn_spec spec = {self, argv, NULL, &pipe_fds[1], 1, &limit, 1};
+    pid_t pid = 0;
+    int started = sbx_spawn(&spec, &pid);
+    close(pipe_fds[1]);
+    close(leak);
+    errno = -started;
+    EXPECT(started == 0 && pid > 0, "sbx_spawn starts the program");
+    char word[16] = {0};
+    ssize_t n = read(pipe_fds[0], word, sizeof(word) - 1);
+    close(pipe_fds[0]);
+    int status = 0;
+    if (pid > 0) waitpid(pid, &status, 0);
+    if (n > 0) word[n] = 0;
+    EXPECT(strcmp(word, "ok0") == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "the spawned program holds only 0-3, its limit, an empty environment and is not dumpable");
+    if (strcmp(word, "ok0") != 0) printf("info spawned program reported %s\n", word);
+    char *missing_argv[] = {"/nonexistent", NULL};
+    struct sbx_spawn_spec missing = {"/nonexistent/program", missing_argv, NULL, NULL, 0, NULL, 0};
+    errno = 0;
+    started = sbx_spawn(&missing, NULL);
+    errno = -started;
+    EXPECT(started == -ENOENT, "sbx_spawn reports the child's exec error");
+    return failures ? 1 : 0;
+}
+
 /* ---- The parent: the broker, with a decider and an audit. ---- */
 
 static int refusals;
@@ -531,8 +596,14 @@ static void audit(void *context, const struct sbx_access *access, int result) {
     if (result < 0) refusals++;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc > 1 && strcmp(argv[1], "--spawned") == 0) return spawned_main();
+    char self[512];
+    ssize_t self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (self_len <= 0) { perror("readlink"); return 2; }
+    self[self_len] = 0;
+    int spawn_failures = spawn_check(self);
     snprintf(root, sizeof(root), "%s/sbx-test-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
     if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
     snprintf(game, sizeof(game), "%s/game", root);
@@ -612,7 +683,7 @@ int main(void) {
         if (!fgets(content, sizeof(content), f)) content[0] = '\0';
         fclose(f);
     }
-    int parent_failures = sealed_failures ? 1 : 0;
+    int parent_failures = sealed_failures || spawn_failures ? 1 : 0;
     if (strcmp(content, "secret") == 0) {
         printf("ok   the file outside the rules was never truncated by the race\n");
     } else {

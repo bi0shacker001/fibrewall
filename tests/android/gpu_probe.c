@@ -133,6 +133,7 @@ static unsigned collect_binder_fds(int *fds, unsigned max) {
 
 static int child(int broker, int control, int seal) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (sbx_spawned_init() != 0) printf("child: could not make itself non-dumpable\n");
     binder_fds("before EGL");
 
     double t0 = now_ms();
@@ -213,6 +214,8 @@ static int child(int broker, int control, int seal) {
     return 0;
 }
 
+extern char **environ;
+
 static int refusals;
 
 /* Whether the buffer's centre pixel is (about) the colour given. */
@@ -277,19 +280,22 @@ int main(int argc, char **argv) {
     }
 
     fflush(stdout);
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(broker[0]);
-        close(control[0]);
-        fcntl(broker[1], F_SETFD, 0);
-        fcntl(control[1], F_SETFD, 0);
-        char b[16], c[16];
-        snprintf(b, sizeof(b), "%d", broker[1]);
-        snprintf(c, sizeof(c), "%d", control[1]);
-        char *child_argv[] = {argv[0], "--child", b, c, seal ? "1" : "0", NULL};
-        execv("/proc/self/exe", child_argv);
-        perror("execv");
-        _exit(127);
+    char self[512];
+    ssize_t self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (self_len <= 0) {
+        perror("readlink");
+        return 1;
+    }
+    self[self_len] = 0;
+    /* The child gets the broker socket as 3 and the control socket as 4, and nothing else. */
+    int handed[2] = {broker[1], control[1]};
+    char *child_argv[] = {argv[0], "--child", "3", "4", seal ? "1" : "0", NULL};
+    struct sbx_spawn_spec spec = {self, child_argv, environ, handed, 2, NULL, 0};
+    pid_t pid = 0;
+    int started = sbx_spawn(&spec, &pid);
+    if (started != 0) {
+        printf("parent: FAIL sbx_spawn: %s\n", strerror(-started));
+        return 1;
     }
     close(broker[1]);
     close(control[1]);
