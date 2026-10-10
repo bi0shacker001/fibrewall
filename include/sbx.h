@@ -47,6 +47,7 @@ extern "C" {
 #define SBX_LOCK_UNBROKERED 0x2u
 
 #define SBX_SEALED_MAX 8
+#define SBX_OWN_OPENS_MAX 16
 
 struct sbx_lockdown_options {
     unsigned flags;
@@ -59,6 +60,18 @@ struct sbx_lockdown_options {
      */
     const int *sealed_fds;
     unsigned sealed_count;  /* at most SBX_SEALED_MAX */
+    /*
+     * Device files the process opens itself, just before the filter goes
+     * on, because the kernel ties what they hold to the process that
+     * opened them, so a descriptor the broker opened would not do: binder
+     * and hwbinder (a broker-opened /dev/hwbinder fails to mmap), and GPU
+     * nodes that keep per-process state (kgsl, Mali, DRM render nodes).
+     * After lockdown an open of exactly one of these paths is answered with
+     * a duplicate. Paths that do not exist or cannot be opened are skipped.
+     * Each platform's list is the host's (see docs/design.md).
+     */
+    const char *const *own_opens;
+    unsigned own_open_count;  /* at most SBX_OWN_OPENS_MAX */
 };
 
 /*

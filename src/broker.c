@@ -2,13 +2,21 @@
  * The broker half of sbx (see include/sbx.h): answers a confined process's
  * path calls from a policy of path rules and the host's decider.
  *
- * Each request is checked on two paths. First the path as asked, made
- * absolute (against the directory descriptor that came with it),
- * normalised lexically and mapped through the aliases, so a refusal never
- * says whether something exists. Then the path as the kernel would
- * resolve it: realpath() of the whole path, or of its parent for calls
- * that act on a name itself (lstat, readlink, unlink, rename, mkdir, a
- * create). The host's decider then sees both and the rules' verdict.
+ * Each request is made absolute (against the directory descriptor that
+ * came with it), normalised lexically and mapped through the aliases, then
+ * resolved as the kernel would: every symlink on the way is followed (the
+ * last one only for calls that follow it), found with readlink() alone.
+ * The rules decide on the resolved path; a path that does not resolve is
+ * decided on its lexical form, so a refusal never says whether something
+ * exists. The host's decider then sees both and the rules' verdict.
+ *
+ * The broker never stats or opens anything on the confined code's behalf
+ * beyond the call it was asked for (and O_PATH handles, which check no
+ * permission). It runs in the same SELinux domain as an app's code would,
+ * and a getattr can be refused there where the asked-for call is allowed:
+ * on the emulator a stat of /system/bin/hwservicemanager was, which sent
+ * libhidl down its passthrough path and aborted the allocator
+ * (Droidtop/tracker#26, ehsandbox lockdown run 4).
  *
  * The call itself is made relative to the resolved parent directory,
  * opened first and checked again through the name the kernel gives the
@@ -169,16 +177,15 @@ static int normalise(const char *base, const char *path, size_t path_len, char *
     return 0;
 }
 
-/* The canonical form of an absolute path a host names: realpath when it exists, else normalised. */
+static int resolve(const char *path, int follow_last, int may_create, char *out);
+
+/* The canonical form of an absolute path a host names: resolved when it resolves, else normalised. */
 static char *canonical_copy(const char *path) {
-    char canonical[PATH_MAX];
     char normal[SBX_PATH_MAX];
-    const char *chosen = realpath(path, canonical);
-    if (!chosen) {
-        if (normalise("/", path, strlen(path), normal) != 0) return NULL;
-        chosen = normal;
-    }
-    return strdup(chosen);
+    char resolved[SBX_PATH_MAX];
+    if (normalise("/", path, strlen(path), normal) != 0) return NULL;
+    if (resolve(normal, 1, 0, resolved) == 0) return strdup(resolved);
+    return strdup(normal);
 }
 
 static int add_rule(struct sbx_policy *policy, char *copy, unsigned mode);
@@ -340,10 +347,14 @@ static int rewrite_proc(char *path, pid_t pid, pid_t tid) {
     return 0;
 }
 
+/* Whether path names something, by lookup alone (access F_OK checks no permission on the file itself). */
+static int exists(const char *path) {
+    return syscall(__NR_faccessat, AT_FDCWD, path, F_OK, 0) == 0 || errno != ENOENT;
+}
+
 /*
  * Under a case-insensitive rule, rewrites each component of path that does
- * not exist to an entry of its directory that differs only in case, when
- * there is exactly one such name or an exact-length match first found.
+ * not exist to an entry of its directory that differs only in case.
  * Components above the rule are left as they are.
  */
 static void fold_case(const struct sbx_policy *policy, char *path) {
@@ -357,8 +368,7 @@ static void fold_case(const struct sbx_policy *policy, char *path) {
         while (*end && *end != '/') end++;
         char saved = *end;
         *end = '\0';
-        struct stat st;
-        if (lstat(path, &st) != 0 && errno == ENOENT) {
+        if (!exists(path)) {
             /* The directory holding name. */
             name[-1] = '\0';
             DIR *directory = opendir(path[0] ? path : "/");
@@ -396,31 +406,70 @@ static int split(const char *path, char *parent, const char **name) {
 }
 
 /*
- * The path as the kernel would resolve it. follow_last: resolve the final
- * component too (open, stat, access, statfs, chdir). Otherwise only the
- * parent is resolved and the final name appended (lstat, readlink,
- * unlink, rename, mkdir). A create of a name that does not exist yet also
- * resolves its parent only.
+ * The path as the kernel would resolve it, path being absolute and
+ * normalised. Every symlink on the way is followed, found by readlink()
+ * alone (EINVAL: not a link); the last component only when follow_last
+ * (open, stat, access, statfs, chdir), not for calls that act on a name
+ * itself (lstat, readlink, unlink, rename, mkdir). A final name that does
+ * not exist is kept when may_create, else ENOENT.
  */
 static int resolve(const char *path, int follow_last, int may_create, char *out) {
-    if (follow_last) {
-        if (realpath(path, out)) return 0;
-        if (errno != ENOENT || !may_create) return -errno;
+    char work[SBX_PATH_MAX];
+    if (strlen(path) >= sizeof(work)) return -ENAMETOOLONG;
+    strcpy(work, path);
+    for (int hops = 0;; hops++) {
+        if (hops > 40) return -ELOOP;
+        size_t used = 0;
+        out[0] = '\0';
+        const char *cursor = work;
+        int restarted = 0;
+        while (*cursor) {
+            while (*cursor == '/') cursor++;
+            if (!*cursor) break;
+            const char *end = cursor;
+            while (*end && *end != '/') end++;
+            size_t part = (size_t) (end - cursor);
+            const char *rest = end;
+            while (*rest == '/') rest++;
+            int last = *rest == '\0';
+            if (used + 1 + part >= SBX_PATH_MAX) return -ENAMETOOLONG;
+            out[used] = '/';
+            memcpy(out + used + 1, cursor, part);
+            size_t candidate = used + 1 + part;
+            out[candidate] = '\0';
+            if (last && !follow_last) return 0;
+            char target[SBX_PATH_MAX];
+            ssize_t n = readlink(out, target, sizeof(target) - 1);
+            if (n >= 0) {
+                target[n] = '\0';
+                /* The link's text, against its own directory, then the rest of the path. */
+                char joined[SBX_PATH_MAX * 2 + 2];
+                size_t length;
+                if (target[0] == '/') {
+                    length = (size_t) snprintf(joined, sizeof(joined), "%s/%s", target, rest);
+                } else {
+                    out[used] = '\0';
+                    length = (size_t) snprintf(joined, sizeof(joined), "%s/%s/%s", out, target, rest);
+                }
+                if (length >= sizeof(joined)) return -ENAMETOOLONG;
+                int error = normalise("/", joined, length, work);
+                if (error != 0) return error;
+                restarted = 1;
+                break;
+            }
+            if (errno == ENOENT) {
+                if (last && may_create) return 0;
+                return -ENOENT;
+            }
+            if (errno != EINVAL) return -errno;
+            used = candidate;
+            cursor = end;
+        }
+        if (!restarted) {
+            if (used == 0) strcpy(out, "/");
+            return 0;
+        }
     }
-    if (strcmp(path, "/") == 0) {
-        strcpy(out, "/");
-        return 0;
-    }
-    char parent[SBX_PATH_MAX];
-    const char *name;
-    if (split(path, parent, &name) != 0) return -EINVAL;
-    char real_parent[PATH_MAX];
-    if (!realpath(parent, real_parent)) return -errno;
-    if (strlen(real_parent) + 1 + strlen(name) >= SBX_PATH_MAX) return -ENAMETOOLONG;
-    if (strcmp(real_parent, "/") == 0) real_parent[0] = 0;
-    char with_slash[SBX_PATH_MAX];
-    if (join(with_slash, real_parent, "/") != 0) return -ENAMETOOLONG;
-    return join(out, with_slash, name);
 }
 
 static int fd_path(int fd, char *out) {
@@ -474,6 +523,11 @@ static void audit(const struct check *c, unsigned need, int result) {
 /*
  * Decides one path of a request; fills c->real. need: SBX_READ, SBX_WRITE
  * or LOOKUP. Returns 0 when the call may go ahead.
+ *
+ * The rules decide on the resolved path: a caller may name a place through
+ * an alias of the system's own (/sdcard, /data/user/0) or through one of
+ * the policy's, but what is acted on is always what the path resolves to.
+ * A path that does not resolve is decided on its lexical form.
  */
 static int decide(struct check *c, const char *base, const char *raw, size_t len, unsigned need,
                   int follow_last, int may_create) {
@@ -486,14 +540,12 @@ static int decide(struct check *c, const char *base, const char *raw, size_t len
     if (error != 0) return error;
     fold_case(c->policy, normal);
 
-    int verdict = permits(allowed(c->policy, normal, c->pid), need) ? 0 : -EACCES;
     int resolved = resolve(normal, follow_last, may_create, c->real);
     if (resolved != 0) c->real[0] = '\0';
-    if (verdict == 0 && resolved == 0) {
-        verdict = permits(allowed(c->policy, c->real, c->pid), need) ? 0 : -EACCES;
-    }
+    const char *decided = resolved == 0 ? c->real : normal;
+    int verdict = permits(allowed(c->policy, decided, c->pid), need) ? 0 : -EACCES;
 
-    const struct rule *rule = matching_rule(c->policy, resolved == 0 ? c->real : normal);
+    const struct rule *rule = matching_rule(c->policy, decided);
     int ask = c->policy->decide && (verdict != 0 || (rule && (rule->flags & SBX_DECIDE)));
     int result = verdict;
     if (ask) {
@@ -737,8 +789,7 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
     /* /proc/<pid>/task/<tid> must be the sender's own thread. */
     char task[64];
     snprintf(task, sizeof(task), "/proc/%d/task/%d", (int) pid, (int) request->tid);
-    struct stat ignored;
-    if (request->tid <= 0 || stat(task, &ignored) != 0) {
+    if (request->tid <= 0 || !exists(task)) {
         reply(answer, -EINVAL, NULL, 0, -1);
         return;
     }

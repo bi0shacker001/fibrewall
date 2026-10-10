@@ -372,10 +372,25 @@ static void working(void) {
     EXPECT(fd >= 0, "a name differing only in case opens under a case-insensitive rule");
     if (fd >= 0) close(fd);
 
-    /* Aliases. */
+    /* Aliases: the policy's, and one the filesystem makes (a symlink to a folder in the rules). */
     fd = open("/sandbox-test/game/data.txt", O_RDONLY);
     EXPECT(fd >= 0, "a file opens under its alias");
     if (fd >= 0) close(fd);
+    snprintf(path, sizeof(path), "%s/game-link/data.txt", root);
+    fd = open(path, O_RDONLY);
+    EXPECT(fd >= 0, "a file opens through a symlink that resolves into the rules");
+    if (fd >= 0) close(fd);
+
+    /* An own-opened device: answered with a duplicate, with no broker rule for it. */
+    fd = open("/dev/zero", O_RDONLY);
+    EXPECT(fd >= 0, "an own-opened device opens after lockdown");
+    if (fd >= 0) {
+        char zero = 1;
+        EXPECT(read(fd, &zero, 1) == 1 && zero == 0, "and reads as itself");
+        close(fd);
+    }
+    errno = 0;
+    EXPECT(refused(open("/dev/full", O_RDONLY)), "a device that is neither own-opened nor in the rules is refused");
 
     /* Writes. */
     snprintf(path, sizeof(path), "%s/s.txt", save);
@@ -663,6 +678,8 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof(path), "%s/key", secret);
     snprintf(link, sizeof(link), "%s/escape", game);
     if (symlink(path, link) != 0) { perror("symlink"); return 2; }
+    snprintf(link, sizeof(link), "%s/game-link", root);
+    if (symlink(game, link) != 0) { perror("symlink"); return 2; }
     /* For the race: a real directory and a symlink out of the rules, side by side in the writable folder. */
     snprintf(path, sizeof(path), "%s/dir", save);
     mkdir(path, 0700);
@@ -692,7 +709,9 @@ int main(int argc, char **argv) {
         close(pair[0]);
         if (chdir(game) != 0) _exit(2);
         controls();
-        int locked = sbx_lockdown(pair[1], NULL);
+        static const char *const devices[] = {"/dev/zero", "/dev/does-not-exist"};
+        struct sbx_lockdown_options options = {0, NULL, 0, devices, 2};
+        int locked = sbx_lockdown(pair[1], &options);
         errno = -locked;
         EXPECT(locked == 0, "lockdown installed on every thread");
         if (locked == 0) {

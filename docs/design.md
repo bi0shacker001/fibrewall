@@ -73,6 +73,18 @@ the kernel directly, only loses its own file access. The broker decides.
 The handler is async-signal-safe: no heap and no locks. Each request gets a
 fresh reply socketpair, so threads share nothing.
 
+**Process-bound devices.** Some device files cannot come from the broker,
+because the kernel ties what they hold to the process that opened them. A
+broker-opened `/dev/hwbinder` fails to `mmap` in the confined process. GPU
+nodes that keep per-process state behave the same way: kgsl, Mali, DRM
+render nodes. `sbx_lockdown_options.own_opens` names such paths. The
+process opens them itself just before the filter goes on, and after that
+an open of exactly one of those paths gets a duplicate. Each host keeps the
+list for its platform. Enginehost's is `/dev/hwbinder`, `/dev/kgsl-3d0`,
+`/dev/mali0` and `/dev/dri/renderD128`; `/dev/vndbinder` is left out,
+because an app cannot open it at all. A native-kind process that never
+needs binder seals those descriptors instead.
+
 The confined process cannot change directory for real (it may not be able
 to open what it enters). So the handler keeps the current directory as a
 descriptor the broker gave it, sends it with each relative request, and
@@ -96,6 +108,21 @@ For each request the broker:
 8. audits the result.
 
 A refusal is always `EACCES`. It never says whether the path exists.
+
+The rules decide on the **resolved** path. A caller may name a place
+through an alias, either the system's own (`/sdcard`, `/data/user/0`) or
+one of the policy's, but what gets acted on is always what the path
+resolves to. Only a path that does not resolve is decided on its lexical
+form.
+
+**The broker never stats on the confined code's behalf.** It resolves
+symlinks with `readlink()` alone, and makes exactly the call it was asked
+for. It runs in the same SELinux domain an app's code does, and a
+`getattr` can be refused there where the asked-for call is allowed. On the
+emulator, the broker's stat of `/system/bin/hwservicemanager` was refused,
+although libhidl only `access()`es it. That sent libhidl down its
+passthrough path and aborted the allocator (Enginehost's lockdown
+prototype, Droidtop/tracker#26).
 
 The call itself is made **relative to the resolved parent directory**. The
 broker opens that directory with `O_PATH|O_DIRECTORY`, confirms through
