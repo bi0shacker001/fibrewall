@@ -501,7 +501,7 @@ static int sealed_check(void) {
     if (child == 0) {
         int fd = open("/dev/null", O_RDWR);
         int keep = open("/dev/zero", O_RDONLY);
-        struct sbx_lockdown_options options = {0, &fd, 1};
+        struct sbx_lockdown_options options = {.sealed_fds = &fd, .sealed_count = 1};
         int locked = sbx_lockdown(pair[1], &options);
         errno = -locked;
         EXPECT(locked == 0, "lockdown with a sealed descriptor");
@@ -535,7 +535,7 @@ static int unbrokered_check(void) {
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
-        struct sbx_lockdown_options options = {SBX_LOCK_UNBROKERED | SBX_LOCK_LOG_SOCKET, NULL, 0};
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNBROKERED | SBX_LOCK_LOG_SOCKET};
         int locked = sbx_lockdown(-1, &options);
         errno = -locked;
         EXPECT(locked == 0, "unbrokered lockdown without a broker");
@@ -710,7 +710,7 @@ int main(int argc, char **argv) {
         if (chdir(game) != 0) _exit(2);
         controls();
         static const char *const devices[] = {"/dev/zero", "/dev/does-not-exist"};
-        struct sbx_lockdown_options options = {0, NULL, 0, devices, 2};
+        struct sbx_lockdown_options options = {.own_opens = devices, .own_open_count = 2};
         int locked = sbx_lockdown(pair[1], &options);
         errno = -locked;
         EXPECT(locked == 0, "lockdown installed on every thread");

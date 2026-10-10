@@ -174,7 +174,7 @@ static int child(int broker, int control, int seal) {
 
     int sealed[SBX_SEALED_MAX];
     unsigned sealed_count = seal ? collect_binder_fds(sealed, SBX_SEALED_MAX) : 0;
-    struct sbx_lockdown_options options = {SBX_LOCK_LOG_SOCKET, sealed, sealed_count};
+    struct sbx_lockdown_options options = {.flags = SBX_LOCK_LOG_SOCKET, .sealed_fds = sealed, .sealed_count = sealed_count};
     int locked = sbx_lockdown(broker, &options);
     if (locked != 0) {
         printf("child: FAIL lockdown: %s\n", strerror(-locked));

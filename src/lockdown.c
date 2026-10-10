@@ -551,7 +551,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     return -ENOSYS;
 #else
     if (locked) return -EALREADY;
-    struct sbx_lockdown_options none = {0, NULL, 0};
+    struct sbx_lockdown_options none = {.flags = 0};
     if (!options) options = &none;
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
     if (unbrokered) broker_fd = -1;
