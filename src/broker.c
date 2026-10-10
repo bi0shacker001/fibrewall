@@ -396,7 +396,7 @@ static int resolve(const char *path, int follow_last, int may_create, char *out)
     char real_parent[PATH_MAX];
     if (!realpath(parent, real_parent)) return -errno;
     if (strlen(real_parent) + 1 + strlen(name) >= SBX_PATH_MAX) return -ENAMETOOLONG;
-    if (strcmp(real_parent, "/") == 0) real_parent[0] = ' ';
+    if (strcmp(real_parent, "/") == 0) real_parent[0] = 0;
     char with_slash[SBX_PATH_MAX];
     if (join(with_slash, real_parent, "/") != 0) return -ENAMETOOLONG;
     return join(out, with_slash, name);
