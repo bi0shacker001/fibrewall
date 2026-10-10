@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux ${{ matrix.runner }} ${{ matrix.cc }}${{ matrix.sanitize == 'ON' && ' asan+ubsan' || '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04]
+        cc: [gcc, clang]
+        sanitize: [OFF]
+        include:
+          - runner: ubuntu-24.04
+            cc: clang
+            sanitize: ON
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel
+        run: uname -a; cat /proc/sys/kernel/seccomp/actions_avail
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DSBX_SANITIZE=${{ matrix.sanitize }}
+          cmake --build build -j
+      - name: Test
+        env:
+          # LeakSanitizer stops the world with ptrace, which the lockdown refuses.
+          ASAN_OPTIONS: detect_leaks=0
+        run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+
+  linux-arm64:
+    # Arm runners are free for public repositories only.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build
+          cmake --build build -j
+      - name: Test
+        run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+
+  android-build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with the NDK
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-26
+          cmake --build build -j
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbx_test-${{ matrix.abi }}
+          path: build/sbx_test
+
+  android-emulator:
+    needs: android-build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [28, 34]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbx_test-x86_64
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Test on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          script: adb push sbx_test /data/local/tmp/sbx_test && adb shell 'uname -a; cat /proc/sys/kernel/seccomp/actions_avail; chmod 755 /data/local/tmp/sbx_test && cd /data/local/tmp && TMPDIR=/data/local/tmp ./sbx_test; echo "exit=$?"' | tee result.txt && grep -q '^exit=0' result.txt
