@@ -344,7 +344,7 @@ static void on_sigsys(int signal_number, siginfo_t *info, void *context) {
 }
 
 #ifdef SBX_ARCH
-#define FILTER_MAX 256
+#define FILTER_MAX 512
 static struct sock_filter filter[FILTER_MAX];
 static unsigned short filter_length;
 
@@ -391,7 +391,16 @@ static void own_process_only(unsigned nr, pid_t pid) {
     ret(DENY);
 }
 
-static int build_filter(unsigned flags, pid_t pid) {
+/* nr is refused when its argument arg is one of the sealed descriptors (compared as the kernel reads an fd: 32 bits). */
+static void sealed_block(unsigned nr, unsigned arg, const int *fds, unsigned count) {
+    jeq(nr, 0, (unsigned char) (count + 3));
+    load(ARG_LO(arg));
+    for (unsigned k = 0; k < count; k++) jeq((unsigned) fds[k], (unsigned char) (count - k), 0);
+    ret(ALLOW);
+    ret(DENY);
+}
+
+static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
     load(offsetof(struct seccomp_data, arch));
     jeq(SBX_ARCH, 1, 0);
@@ -457,6 +466,17 @@ static int build_filter(unsigned flags, pid_t pid) {
     own_process_only(__NR_tgkill, pid);
     own_process_only(__NR_rt_sigqueueinfo, pid);
     own_process_only(__NR_rt_tgsigqueueinfo, pid);
+    /* Sealed descriptors: kept, but no longer used. */
+    if (sealed_count > 0) {
+        sealed_block(__NR_ioctl, 0, sealed, sealed_count);
+        sealed_block(__NR_fcntl, 0, sealed, sealed_count);
+        sealed_block(__NR_dup, 0, sealed, sealed_count);
+        sealed_block(__NR_dup3, 0, sealed, sealed_count);
+        sealed_block(__NR_mmap, 4, sealed, sealed_count);
+#ifdef __NR_dup2
+        sealed_block(__NR_dup2, 0, sealed, sealed_count);
+#endif
+    }
     /* Refused: other paths. */
     static const unsigned refused[] = {
         __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchmodat, __NR_fchownat,
@@ -485,15 +505,21 @@ static int build_filter(unsigned flags, pid_t pid) {
 }
 #endif
 
-int sbx_lockdown(int broker_fd, unsigned flags) {
+int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
 #ifndef SBX_ARCH
     (void) broker_fd;
-    (void) flags;
+    (void) options;
     return -ENOSYS;
 #else
     if (broker >= 0) return -EALREADY;
     if (broker_fd < 0) return -EBADF;
-    int built = build_filter(flags, getpid());
+    struct sbx_lockdown_options none = {0, NULL, 0};
+    if (!options) options = &none;
+    if (options->sealed_count > SBX_SEALED_MAX || (options->sealed_count && !options->sealed_fds)) return -EINVAL;
+    for (unsigned k = 0; k < options->sealed_count; k++) {
+        if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
+    }
+    int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) return built;
     int directory = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (directory < 0) return -errno;

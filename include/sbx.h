@@ -38,14 +38,30 @@ extern "C" {
 /* Lockdown flags. */
 #define SBX_LOCK_LOG_SOCKET 0x1u  /* allow socket(AF_UNIX, SOCK_DGRAM): Android's liblog, syslog */
 
+#define SBX_SEALED_MAX 8
+
+struct sbx_lockdown_options {
+    unsigned flags;
+    /*
+     * Descriptors the process keeps but may no longer use: ioctl, mmap,
+     * fcntl and dup on them are refused (EPERM); close is allowed. For a
+     * descriptor a library opened during setup and holds on to, such as
+     * Android's binder device after the graphics stack came up: binder
+     * transactions are ioctls, so a sealed binder descriptor carries none.
+     */
+    const int *sealed_fds;
+    unsigned sealed_count;  /* at most SBX_SEALED_MAX */
+};
+
 /*
  * Confines the calling process. broker_fd is a connected SOCK_SEQPACKET
  * Unix socket whose other end a broker serves; the process keeps it.
- * Returns 0 when every thread is confined, or a negative errno when
- * nothing was installed (never half-installed). A caller that gets an
- * error must not go on to run the code it meant to confine.
+ * options may be NULL for the defaults. Returns 0 when every thread is
+ * confined, or a negative errno when nothing was installed (never
+ * half-installed). A caller that gets an error must not go on to run the
+ * code it meant to confine.
  */
-int sbx_lockdown(int broker_fd, unsigned flags);
+int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);
 
 /* ---- The broker half ---- */
 
@@ -63,7 +79,9 @@ struct sbx_policy *sbx_policy_new(void);
 void sbx_policy_free(struct sbx_policy *policy);
 
 /*
- * Adds a rule for path (absolute; canonicalised when it exists). Every
+ * Adds a rule for path (absolute). When the path exists and resolves
+ * elsewhere (a symlink such as /dev/qemu_pipe), the rule covers both the
+ * name as given and what it resolves to. Every
  * ancestor of a rule can be stat()ed and traversed, but not listed or
  * opened. /proc/self and /proc/thread-self mean the confined process's own
  * entries, which are always allowed; other processes' are always denied.

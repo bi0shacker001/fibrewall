@@ -7,17 +7,21 @@
  * (libEGL, the vendor driver, the gralloc mapper) open binder on its own,
  * which would leave a hole a seccomp filter cannot close?
  *
- * The parent allocates an AHardwareBuffer, starts a broker whose rules
+ * The parent allocates two AHardwareBuffers, starts a broker whose rules
  * allow the system's read-only code, the GPU device nodes and nothing
  * else (no /dev/binder, /dev/hwbinder or /dev/vndbinder), and re-executes
- * itself as the child. The child:
+ * itself as the child. The child, as a native-kind launcher would:
  *   1. lists its binder descriptors (none expected);
- *   2. brings up EGL with a pbuffer context, then lists them again;
- *   3. locks down;
- *   4. receives the buffer over the socket, imports it as an EGLImage and
- *      draws 300 frames into it, timing them, the last one green;
- *   5. lists its binder descriptors a last time.
- * The parent then reads the buffer's centre pixel with the CPU. Every
+ *   2. brings up EGL with a pbuffer context, receives and imports the
+ *      first buffer, and lists them again: whatever the graphics stack
+ *      opened on its own shows here;
+ *   3. locks down with those binder descriptors sealed (no ioctl, so no
+ *      transaction), unless run with --no-seal;
+ *   4. draws 300 timed frames into the first buffer, the last one green;
+ *   5. receives and imports the second buffer after lockdown (a resize)
+ *      and clears it blue;
+ *   6. lists its binder descriptors a last time.
+ * The parent then reads both buffers' centre pixels with the CPU. Every
  * refusal the broker makes is printed, so a driver's lazy open that the
  * rules missed shows up by name.
  *
@@ -81,7 +85,53 @@ static int binder_fds(const char *when) {
     return count;
 }
 
-static int child(int broker, int control) {
+/* Imports buffer as the colour target of a new framebuffer; returns 0 or prints why not. */
+static int bind_buffer(EGLDisplay display, AHardwareBuffer *buffer, const char *which) {
+    EGLClientBuffer client = eglGetNativeClientBufferANDROID(buffer);
+    const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+    EGLImageKHR image = client ? eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client,
+                                                   image_attributes)
+                               : EGL_NO_IMAGE_KHR;
+    if (image == EGL_NO_IMAGE_KHR) {
+        printf("child: FAIL importing the %s buffer as an EGLImage (0x%x)\n", which, eglGetError());
+        return 1;
+    }
+    GLuint texture, framebuffer;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES) image);
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        printf("child: FAIL framebuffer on the %s buffer: 0x%x\n", which, status);
+        return 1;
+    }
+    glViewport(0, 0, WIDTH, HEIGHT);
+    return 0;
+}
+
+/* Fills fds with this process's binder descriptors; returns how many (at most max). */
+static unsigned collect_binder_fds(int *fds, unsigned max) {
+    unsigned count = 0;
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) return 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) && count < max) {
+        if (entry->d_name[0] == '.') continue;
+        char link[64], target[256];
+        snprintf(link, sizeof(link), "/proc/self/fd/%s", entry->d_name);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = '\0';
+        if (strstr(target, "binder")) fds[count++] = atoi(entry->d_name);
+    }
+    closedir(dir);
+    return count;
+}
+
+static int child(int broker, int control, int seal) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     binder_fds("before EGL");
 
@@ -111,43 +161,25 @@ static int child(int broker, int control) {
     }
     printf("child: EGL %d.%d up in %.1f ms; GL_RENDERER %s\n", major, minor, now_ms() - t0,
            (const char *) glGetString(GL_RENDERER));
-    int before = binder_fds("after EGL, before lockdown");
-
-    int locked = sbx_lockdown(broker, SBX_LOCK_LOG_SOCKET);
-    if (locked != 0) {
-        printf("child: FAIL lockdown: %s\n", strerror(-locked));
-        return 1;
-    }
-    printf("child: locked down\n");
 
     AHardwareBuffer *buffer = NULL;
     int received = AHardwareBuffer_recvHandleFromUnixSocket(control, &buffer);
     if (received != 0 || !buffer) {
-        printf("child: FAIL receiving the buffer after lockdown: %d\n", received);
+        printf("child: FAIL receiving the first buffer before lockdown: %d\n", received);
         return 1;
     }
-    EGLClientBuffer client = eglGetNativeClientBufferANDROID(buffer);
-    const EGLint image_attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
-    EGLImageKHR image = client ? eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client,
-                                                   image_attributes)
-                               : EGL_NO_IMAGE_KHR;
-    if (image == EGL_NO_IMAGE_KHR) {
-        printf("child: FAIL importing the buffer as an EGLImage (0x%x)\n", eglGetError());
+    if (bind_buffer(display, buffer, "first") != 0) return 1;
+    int before = binder_fds("after EGL and the first buffer, before lockdown");
+
+    int sealed[SBX_SEALED_MAX];
+    unsigned sealed_count = seal ? collect_binder_fds(sealed, SBX_SEALED_MAX) : 0;
+    struct sbx_lockdown_options options = {SBX_LOCK_LOG_SOCKET, sealed, sealed_count};
+    int locked = sbx_lockdown(broker, &options);
+    if (locked != 0) {
+        printf("child: FAIL lockdown: %s\n", strerror(-locked));
         return 1;
     }
-    GLuint texture, framebuffer;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES) image);
-    glGenFramebuffers(1, &framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        printf("child: FAIL framebuffer on the imported buffer: 0x%x\n", status);
-        return 1;
-    }
-    glViewport(0, 0, WIDTH, HEIGHT);
+    printf("child: locked down, %u binder descriptor(s) sealed\n", sealed_count);
     double start = now_ms(), worst = 0;
     for (int i = 0; i < FRAMES; i++) {
         double frame = now_ms();
@@ -160,14 +192,44 @@ static int child(int broker, int control) {
     }
     printf("child: %d frames into the parent's buffer, %.3f ms each on average, worst %.3f ms\n", FRAMES,
            (now_ms() - start) / FRAMES, worst);
-    int after = binder_fds("after lockdown and drawing");
-    printf("child: binder descriptors: %d after EGL, %d at the end\n", before, after);
-    char done = 'd';
-    if (write(control, &done, 1) != 1) return 1;
+
+    /* A second buffer after lockdown, as a resize would bring. */
+    char second = 'n';
+    AHardwareBuffer *buffer2 = NULL;
+    received = AHardwareBuffer_recvHandleFromUnixSocket(control, &buffer2);
+    if (received != 0 || !buffer2) {
+        printf("child: second buffer: receiving it after lockdown failed: %d\n", received);
+    } else if (bind_buffer(display, buffer2, "second") == 0) {
+        glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+        second = 'b';
+        printf("child: second buffer: received, imported and cleared after lockdown\n");
+    }
+    int after = binder_fds("at the end");
+    printf("child: binder descriptors: %d after setup, %d at the end\n", before, after);
+    char done[2] = {'d', second};
+    if (write(control, done, 2) != 2) return 1;
     return 0;
 }
 
 static int refusals;
+
+/* Whether the buffer's centre pixel is (about) the colour given. */
+static int centre_is(AHardwareBuffer *buffer, const char *which, int r, int g, int b) {
+    void *pixels = NULL;
+    if (AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &pixels) != 0 || !pixels) {
+        printf("parent: FAIL locking the %s buffer for the CPU\n", which);
+        return 0;
+    }
+    AHardwareBuffer_Desc actual;
+    AHardwareBuffer_describe(buffer, &actual);
+    const unsigned char *centre = (const unsigned char *) pixels + ((HEIGHT / 2) * actual.stride + WIDTH / 2) * 4;
+    printf("parent: %s buffer centre pixel RGBA %u %u %u %u\n", which, centre[0], centre[1], centre[2], centre[3]);
+    int match = abs(centre[0] - r) < 16 && abs(centre[1] - g) < 16 && abs(centre[2] - b) < 16;
+    AHardwareBuffer_unlock(buffer, NULL);
+    return match;
+}
 
 static void audit(void *context, const struct sbx_access *access, int result) {
     (void) context;
@@ -179,15 +241,17 @@ static void audit(void *context, const struct sbx_access *access, int result) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc == 4 && strcmp(argv[1], "--child") == 0) return child(atoi(argv[2]), atoi(argv[3]));
+    if (argc == 5 && strcmp(argv[1], "--child") == 0) return child(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
+    int seal = !(argc > 1 && strcmp(argv[1], "--no-seal") == 0);
+    printf("parent: binder descriptors %s\n", seal ? "sealed at lockdown" : "left open (--no-seal)");
 
     AHardwareBuffer_Desc description = {
         .width = WIDTH, .height = HEIGHT, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
         .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                  AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
     };
-    AHardwareBuffer *buffer = NULL;
-    if (AHardwareBuffer_allocate(&description, &buffer) != 0) {
+    AHardwareBuffer *buffer = NULL, *buffer2 = NULL;
+    if (AHardwareBuffer_allocate(&description, &buffer) != 0 || AHardwareBuffer_allocate(&description, &buffer2) != 0) {
         printf("parent: FAIL AHardwareBuffer_allocate\n");
         return 1;
     }
@@ -222,7 +286,7 @@ int main(int argc, char **argv) {
         char b[16], c[16];
         snprintf(b, sizeof(b), "%d", broker[1]);
         snprintf(c, sizeof(c), "%d", control[1]);
-        char *child_argv[] = {argv[0], "--child", b, c, NULL};
+        char *child_argv[] = {argv[0], "--child", b, c, seal ? "1" : "0", NULL};
         execv("/proc/self/exe", child_argv);
         perror("execv");
         _exit(127);
@@ -233,31 +297,23 @@ int main(int argc, char **argv) {
         printf("parent: FAIL broker\n");
         return 1;
     }
-    if (AHardwareBuffer_sendHandleToUnixSocket(buffer, control[0]) != 0) {
-        printf("parent: FAIL sending the buffer\n");
+    if (AHardwareBuffer_sendHandleToUnixSocket(buffer, control[0]) != 0 ||
+        AHardwareBuffer_sendHandleToUnixSocket(buffer2, control[0]) != 0) {
+        printf("parent: FAIL sending the buffers\n");
         return 1;
     }
-    char done = 0;
-    ssize_t got = read(control[0], &done, 1);
+    char done[2] = {0, 0};
+    ssize_t got = read(control[0], done, 2);
     int status = 0;
     waitpid(pid, &status, 0);
-    if (got != 1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (got != 2 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         printf("parent: FAIL the child did not finish (status 0x%x)\n", status);
         return 1;
     }
-    void *pixels = NULL;
-    if (AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &pixels) != 0 || !pixels) {
-        printf("parent: FAIL locking the buffer for the CPU\n");
-        return 1;
-    }
-    AHardwareBuffer_Desc actual;
-    AHardwareBuffer_describe(buffer, &actual);
-    const unsigned char *centre = (const unsigned char *) pixels + ((HEIGHT / 2) * actual.stride + WIDTH / 2) * 4;
-    printf("parent: centre pixel RGBA %u %u %u %u\n", centre[0], centre[1], centre[2], centre[3]);
-    int green = centre[0] < 16 && centre[1] > 240 && centre[2] < 16;
-    AHardwareBuffer_unlock(buffer, NULL);
-    AHardwareBuffer_release(buffer);
-    printf("parent: %s; the broker refused %d request(s)\n",
-           green ? "OK the locked-down child drew into the parent's buffer" : "FAIL the buffer is not green", refusals);
+    int green = centre_is(buffer, "first", 0, 255, 0);
+    int blue = done[1] == 'b' && centre_is(buffer2, "second", 0, 0, 255);
+    printf("parent: %s; second buffer after lockdown: %s; the broker refused %d request(s)\n",
+           green ? "OK the locked-down child drew into the parent's buffer" : "FAIL the first buffer is not green",
+           blue ? "OK" : "not drawn", refusals);
     return green ? 0 : 1;
 }

@@ -31,6 +31,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -471,6 +473,46 @@ static void race(void) {
     printf("info race: %d of 5000 opens reached the real directory\n", opened);
 }
 
+/* ---- Sealed descriptors, in a process of their own. ---- */
+
+static int sealed_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int fd = open("/dev/null", O_RDWR);
+        int keep = open("/dev/zero", O_RDONLY);
+        struct sbx_lockdown_options options = {0, &fd, 1};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "lockdown with a sealed descriptor");
+        if (locked != 0) _exit(1);
+        int n = 0;
+        errno = 0;
+        EXPECT(ioctl(fd, FIONREAD, &n) < 0 && errno == EPERM, "sealed: ioctl refused");
+        errno = 0;
+        EXPECT(dup(fd) < 0 && errno == EPERM, "sealed: dup refused");
+        errno = 0;
+        EXPECT(dup3(fd, 100, 0) < 0 && errno == EPERM, "sealed: dup3 refused");
+        errno = 0;
+        EXPECT(fcntl(fd, F_DUPFD_CLOEXEC, 0) < 0 && errno == EPERM, "sealed: fcntl(F_DUPFD) refused");
+        errno = 0;
+        EXPECT(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED && errno == EPERM, "sealed: mmap refused");
+        EXPECT(ioctl(keep, FIONREAD, &n) >= 0 || errno != EPERM, "an unsealed descriptor keeps its ioctl");
+        void *mapped = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, keep, 0);
+        EXPECT(mapped != MAP_FAILED, "an unsealed descriptor keeps its mmap");
+        EXPECT(close(fd) == 0, "sealed: close allowed");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- The parent: the broker, with a decider and an audit. ---- */
 
 static int refusals;
@@ -522,6 +564,8 @@ int main(void) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
+    int sealed_failures = sealed_check();
+
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }
     struct sbx_policy *policy = sbx_policy_new();
@@ -541,7 +585,7 @@ int main(void) {
         close(pair[0]);
         if (chdir(game) != 0) _exit(2);
         controls();
-        int locked = sbx_lockdown(pair[1], 0);
+        int locked = sbx_lockdown(pair[1], NULL);
         errno = -locked;
         EXPECT(locked == 0, "lockdown installed on every thread");
         if (locked == 0) {
@@ -568,7 +612,7 @@ int main(void) {
         if (!fgets(content, sizeof(content), f)) content[0] = '\0';
         fclose(f);
     }
-    int parent_failures = 0;
+    int parent_failures = sealed_failures ? 1 : 0;
     if (strcmp(content, "secret") == 0) {
         printf("ok   the file outside the rules was never truncated by the race\n");
     } else {

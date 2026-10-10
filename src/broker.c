@@ -181,10 +181,31 @@ static char *canonical_copy(const char *path) {
     return strdup(chosen);
 }
 
+static int add_rule(struct sbx_policy *policy, char *copy, unsigned mode);
+
 int sbx_policy_add(struct sbx_policy *policy, const char *path, unsigned mode) {
     if (!policy || !path || path[0] != '/') return -EINVAL;
     char *copy = canonical_copy(path);
     if (!copy) return -ENOMEM;
+    /* The name as given, when it differs from what it resolves to: both checks must pass, and they see both. */
+    char normal[SBX_PATH_MAX];
+    if (normalise("/", path, strlen(path), normal) == 0 && strcmp(normal, copy) != 0) {
+        char *given = strdup(normal);
+        if (!given) {
+            free(copy);
+            return -ENOMEM;
+        }
+        int added = add_rule(policy, given, mode);
+        if (added != 0) {
+            free(copy);
+            return added;
+        }
+    }
+    return add_rule(policy, copy, mode);
+}
+
+/* Takes copy. */
+static int add_rule(struct sbx_policy *policy, char *copy, unsigned mode) {
     struct rule *grown = realloc(policy->rules, (policy->count + 1) * sizeof(struct rule));
     if (!grown) {
         free(copy);
