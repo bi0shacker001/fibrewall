@@ -67,7 +67,8 @@ struct sbx_lockdown_options {
      * and hwbinder (a broker-opened /dev/hwbinder fails to mmap), and GPU
      * nodes that keep per-process state (kgsl, Mali, DRM render nodes).
      * After lockdown an open of exactly one of these paths is answered with
-     * a duplicate. Paths that do not exist or cannot be opened are skipped.
+     * a duplicate, and stat or access of it from that descriptor (libhidl
+     * checks /dev/hwbinder with access before it opens it). Paths that do not exist or cannot be opened are skipped.
      * Each platform's list is the host's (see docs/design.md).
      */
     const char *const *own_opens;

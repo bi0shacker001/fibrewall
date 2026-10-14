@@ -128,16 +128,41 @@ static struct {
 } own[SBX_OWN_OPENS_MAX];
 static unsigned own_count;
 
+/* The index of the own-opened device at exactly path, or -1. */
+static int own_index(const char *path) {
+    if (path == NULL || path[0] != '/') return -1;
+    for (unsigned i = 0; i < own_count; i++) {
+        if (strcmp(path, own[i].path) == 0) return (int) i;
+    }
+    return -1;
+}
+
 /* A duplicate of an own-opened device for an open of exactly its path, or -ENOENT when path is not one. */
 static long own_open(const char *path, int flags) {
-    if (path == NULL || path[0] != '/') return -ENOENT;
-    for (unsigned i = 0; i < own_count; i++) {
-        if (strcmp(path, own[i].path) == 0) {
-            long fd = fcntl(own[i].fd, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
-            return fd < 0 ? -errno : fd;
-        }
-    }
-    return -ENOENT;
+    int i = own_index(path);
+    if (i < 0) return -ENOENT;
+    long fd = fcntl(own[i].fd, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+    return fd < 0 ? -errno : fd;
+}
+
+/*
+ * stat and access of an own-opened device's path, answered from its
+ * descriptor: the broker's rules need not hold the device, and a library
+ * that checks for the node before it opens it (libhidl's access of
+ * /dev/hwbinder) must see what the open will give. The answer is the
+ * device's, even for lstat of a path that is a symlink to it. -ENOENT
+ * when path is not one.
+ */
+static long own_stat(const char *path, struct stat *st) {
+    int i = own_index(path);
+    if (i < 0) return -ENOENT;
+    return syscall(__NR_fstat, own[i].fd, st) == 0 ? 0 : -errno;
+}
+
+static long own_access(const char *path, int mode) {
+    if (own_index(path) < 0) return -ENOENT;
+    /* It was opened for reading and writing; a device is never run. */
+    return (mode & X_OK) ? -EACCES : 0;
 }
 
 static int current_directory(void) { return __atomic_load_n(&cwd, __ATOMIC_ACQUIRE); }
@@ -285,12 +310,17 @@ static long dispatch(long nr, ucontext_t *uc) {
         if ((a3 & AT_EMPTY_PATH) && path != NULL && path[0] == '\0') {
             return syscall(__NR_fstat, (int) a0, (void *) a2) == 0 ? 0 : -errno;
         }
+        long mine = own_stat(path, (struct stat *) a2);
+        if (mine != -ENOENT) return mine;
         return forward(SBX_STAT, (int) a0, path, 0, NULL, (int) (a3 & AT_SYMLINK_NOFOLLOW), 0,
                        (void *) a2, sizeof(struct stat));
     }
     case __NR_faccessat:
-    case __NR_faccessat2:
+    case __NR_faccessat2: {
+        long mine = own_access((const char *) a1, (int) a2);
+        if (mine != -ENOENT) return mine;
         return forward(SBX_ACCESS, (int) a0, (const char *) a1, 0, NULL, 0, (uint32_t) a2, NULL, 0);
+    }
     case __NR_readlinkat:
         if (a3 <= 0) return -EINVAL;
         return forward(SBX_READLINK, (int) a0, (const char *) a1, 0, NULL, 0, (uint32_t) a3, (void *) a2,
@@ -323,12 +353,17 @@ static long dispatch(long nr, ucontext_t *uc) {
         return forward(SBX_OPEN, AT_FDCWD, (const char *) a0, 0, NULL, O_CREAT | O_WRONLY | O_TRUNC,
                        (uint32_t) a1, NULL, 0);
     case __NR_stat:
-        return forward(SBX_STAT, AT_FDCWD, (const char *) a0, 0, NULL, 0, 0, (void *) a1, sizeof(struct stat));
-    case __NR_lstat:
-        return forward(SBX_STAT, AT_FDCWD, (const char *) a0, 0, NULL, AT_SYMLINK_NOFOLLOW, 0, (void *) a1,
-                       sizeof(struct stat));
-    case __NR_access:
+    case __NR_lstat: {
+        long mine = own_stat((const char *) a0, (struct stat *) a1);
+        if (mine != -ENOENT) return mine;
+        return forward(SBX_STAT, AT_FDCWD, (const char *) a0, 0, NULL, nr == __NR_lstat ? AT_SYMLINK_NOFOLLOW : 0, 0,
+                       (void *) a1, sizeof(struct stat));
+    }
+    case __NR_access: {
+        long mine = own_access((const char *) a0, (int) a1);
+        if (mine != -ENOENT) return mine;
         return forward(SBX_ACCESS, AT_FDCWD, (const char *) a0, 0, NULL, 0, (uint32_t) a1, NULL, 0);
+    }
     case __NR_readlink:
         if (a2 <= 0) return -EINVAL;
         return forward(SBX_READLINK, AT_FDCWD, (const char *) a0, 0, NULL, 0, (uint32_t) a2, (void *) a1,

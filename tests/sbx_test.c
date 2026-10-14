@@ -389,6 +389,10 @@ static void working(void) {
         EXPECT(read(fd, &zero, 1) == 1 && zero == 0, "and reads as itself");
         close(fd);
     }
+    EXPECT(access("/dev/zero", R_OK | W_OK) == 0, "access of an own-opened device answers from its descriptor");
+    EXPECT(stat("/dev/zero", &st) == 0 && S_ISCHR(st.st_mode), "and stat sees the device");
+    errno = 0;
+    EXPECT(refused(access("/dev/full", F_OK)), "access of a device outside the rules is still refused");
     errno = 0;
     EXPECT(refused(open("/dev/full", O_RDONLY)), "a device that is neither own-opened nor in the rules is refused");
 
