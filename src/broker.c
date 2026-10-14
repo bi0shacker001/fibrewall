@@ -328,6 +328,8 @@ static int permits(unsigned mode, unsigned need) {
     return mode != LOOKUP && (mode & need) == need;
 }
 
+static int exists(const char *path);
+
 /* Rewrites /proc/self and /proc/thread-self for the sender. */
 static int rewrite_proc(char *path, pid_t pid, pid_t tid) {
     char rest[SBX_PATH_MAX];
@@ -339,6 +341,13 @@ static int rewrite_proc(char *path, pid_t pid, pid_t tid) {
     } else if (strncmp(path, "/proc/thread-self", 17) == 0 && (path[17] == '\0' || path[17] == '/')) {
         tail = path + 17;
         snprintf(head, sizeof(head), "/proc/%d/task/%d", (int) pid, (int) tid);
+        /*
+         * The thread the request names must be the sender's own. Checked
+         * here, where it is used, not for every request: a broker under
+         * another UID may not see the sender's /proc at all (an Android app
+         * serving its isolated process), and needs it for nothing else.
+         */
+        if (tid <= 0 || !exists(head)) return -EINVAL;
     } else {
         return 0;
     }
@@ -783,13 +792,6 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         request->path_len >= SBX_PATH_MAX || request->path2_len >= SBX_PATH_MAX ||
         fd_count != 1 + request->dirfd_sent + request->dirfd2_sent ||
         (request->op == SBX_RENAME) != (request->path2_len != 0)) {
-        reply(answer, -EINVAL, NULL, 0, -1);
-        return;
-    }
-    /* /proc/<pid>/task/<tid> must be the sender's own thread. */
-    char task[64];
-    snprintf(task, sizeof(task), "/proc/%d/task/%d", (int) pid, (int) request->tid);
-    if (request->tid <= 0 || !exists(task)) {
         reply(answer, -EINVAL, NULL, 0, -1);
         return;
     }
