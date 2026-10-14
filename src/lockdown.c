@@ -119,6 +119,14 @@ static const int x86_args[6] = {REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_
 #define SET_RESULT(uc, v) ((uc)->uc_mcontext.gregs[REG_RAX] = (long) (v))
 #endif
 
+/*
+ * Everything from here to sbx_lockdown is for the two architectures the
+ * handler knows (their system-call numbers and registers). Elsewhere (a
+ * 32-bit build of a host that also ships those ABIs) the library builds,
+ * and sbx_lockdown and sbx_local_add answer ENOSYS.
+ */
+#ifdef SBX_ARCH
+
 /* SECCOMP_RET_DATA of our traps, which tells them from anyone else's SIGSYS. */
 #define SBX_TRAP_DATA 0x5b0
 
@@ -655,7 +663,6 @@ static void on_sigsys(int signal_number, siginfo_t *info, void *context) {
     errno = saved_errno;
 }
 
-#ifdef SBX_ARCH
 #define FILTER_MAX 512
 static struct sock_filter filter[FILTER_MAX];
 static unsigned short filter_length;
@@ -863,6 +870,12 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) rule(denied[i], DENY);
     ret(ALLOW);
     return filter_length <= FILTER_MAX ? 0 : -E2BIG;
+}
+#else
+int sbx_local_add(const char *path, int fd) {
+    (void) path;
+    if (fd >= 0) close(fd);
+    return -ENOSYS;
 }
 #endif
 

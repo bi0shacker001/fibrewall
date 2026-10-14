@@ -55,7 +55,15 @@
 #define O_PATH 010000000
 #endif
 #ifndef __NR_renameat2
+#if defined(__x86_64__)
 #define __NR_renameat2 316
+#elif defined(__aarch64__)
+#define __NR_renameat2 276
+#elif defined(__arm__)
+#define __NR_renameat2 382
+#elif defined(__i386__)
+#define __NR_renameat2 353
+#endif
 #endif
 
 #define LOOKUP 0x100u       /* internal need: stat, access F_OK, traversal */
