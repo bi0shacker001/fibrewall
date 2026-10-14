@@ -39,6 +39,7 @@
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -569,6 +570,124 @@ static int unbrokered_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- Passthrough: claimed folders through the broker, every other path to the kernel, local files. ---- */
+
+static int read_word(int fd, char *out, size_t size) {
+    ssize_t n = read(fd, out, size - 1);
+    if (n < 0) n = 0;
+    out[n] = '\0';
+    return (int) n;
+}
+
+static int passthrough_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    sbx_policy_alias(policy, "/sandbox-test/data", save);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char real_game[512];
+    if (!realpath(game, real_game)) return 1;
+    char local_path[400];
+    snprintf(local_path, sizeof(local_path), "%s/local.txt", root);
+    write_file(local_path, "local");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        /* The broker's folders: an alias, the real folder it names, and one with no rule at all. */
+        const char *claims[] = {"/sandbox-test", save, secret};
+        struct sbx_lockdown_options options = {
+            .flags = SBX_LOCK_PASSTHROUGH | SBX_LOCK_LOG_SOCKET, .claims = claims, .claim_count = 3};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "passthrough lockdown");
+        if (locked != 0) _exit(1);
+        char path[600], word[16];
+
+        snprintf(path, sizeof(path), "%s/data.txt", game);
+        int fd = open(path, O_RDONLY);
+        EXPECT(fd >= 0, "passthrough: an unclaimed path goes to the kernel (no rule needed)");
+        if (fd >= 0) {
+            read_word(fd, word, sizeof(word));
+            EXPECT(strcmp(word, "hello") == 0, "passthrough: and reads");
+            close(fd);
+        }
+        struct stat st;
+        EXPECT(stat("/proc/self/status", &st) == 0, "passthrough: the process's own /proc from the kernel");
+        char target[512];
+        EXPECT(readlink("/proc/self/exe", target, sizeof(target)) > 0, "passthrough: readlink from the kernel");
+        snprintf(path, sizeof(path), "%s/key", secret);
+        errno = 0;
+        EXPECT(refused(open(path, O_RDONLY)), "passthrough: a claimed path the broker has no rule for is refused");
+
+        fd = open("/sandbox-test/data/p.txt", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        EXPECT(fd >= 0, "passthrough: a claimed alias goes to the broker and creates a file");
+        if (fd >= 0) {
+            EXPECT(write(fd, "put", 3) == 3, "passthrough: writes through the brokered descriptor");
+            close(fd);
+        }
+        snprintf(path, sizeof(path), "%s/p.txt", save);
+        fd = open(path, O_RDONLY);
+        EXPECT(fd >= 0, "passthrough: the real claimed folder holds it");
+        if (fd >= 0) {
+            read_word(fd, word, sizeof(word));
+            EXPECT(strcmp(word, "put") == 0, "passthrough: with what was written");
+            close(fd);
+        }
+
+        EXPECT(chdir(game) == 0, "passthrough: chdir into an unclaimed folder");
+        fd = open("data.txt", O_RDONLY);
+        EXPECT(fd >= 0, "passthrough: a relative path from there goes to the kernel");
+        if (fd >= 0) close(fd);
+        char cwd[512];
+        EXPECT(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, real_game) == 0, "passthrough: getcwd names it");
+        EXPECT(chdir("/sandbox-test/data") == 0, "passthrough: chdir into a claimed folder");
+        fd = open("p.txt", O_RDONLY);
+        EXPECT(fd >= 0, "passthrough: a relative path from there goes to the broker");
+        if (fd >= 0) close(fd);
+        int dir = open(game, O_RDONLY | O_DIRECTORY);
+        EXPECT(dir >= 0, "passthrough: an unclaimed folder opens as a directory");
+        if (dir >= 0) {
+            fd = openat(dir, "data.txt", O_RDONLY);
+            EXPECT(fd >= 0, "passthrough: openat relative to it");
+            if (fd >= 0) close(fd);
+            close(dir);
+        }
+        struct statfs fs;
+        EXPECT(statfs(game, &fs) == 0, "passthrough: statfs from the kernel");
+
+        /* A local file, given after the lockdown under a name nothing else has. */
+        fd = open(local_path, O_RDONLY);
+        int added = fd >= 0 ? sbx_local_add("/sandbox-local/lib.so", fd) : -EBADF;
+        errno = -added;
+        EXPECT(added == 0, "sbx_local_add after lockdown");
+        fd = open("/sandbox-local/lib.so", O_RDONLY);
+        EXPECT(fd >= 0, "a local file opens by its name");
+        if (fd >= 0) {
+            read_word(fd, word, sizeof(word));
+            EXPECT(strcmp(word, "local") == 0, "and reads from its start");
+            close(fd);
+        }
+        EXPECT(stat("/sandbox-local/lib.so", &st) == 0 && st.st_size == 5, "stat of a local file");
+        EXPECT(access("/sandbox-local/lib.so", R_OK) == 0, "access of a local file");
+        errno = 0;
+        EXPECT(refused(access("/sandbox-local/lib.so", W_OK)), "a local file is not writable (access)");
+        errno = 0;
+        EXPECT(refused(open("/sandbox-local/lib.so", O_RDWR)), "a local file is not writable (open)");
+
+        errno = 0;
+        EXPECT(refused(socket(AF_INET, SOCK_STREAM, 0)), "passthrough: socket(AF_INET) refused");
+        errno = 0;
+        EXPECT(a_exec() == EACCES, "passthrough: execve refused");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -692,7 +811,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | unbrokered_check();
+    int sealed_failures = sealed_check() | unbrokered_check() | passthrough_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

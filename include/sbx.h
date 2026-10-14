@@ -45,9 +45,23 @@ extern "C" {
  * process under its own UID. broker_fd is ignored.
  */
 #define SBX_LOCK_UNBROKERED 0x2u
+/*
+ * Brokered for the claimed folders only (sbx_lockdown_options.claims):
+ * every other path call is made by the handler with the kernel deciding,
+ * as it would without the filter. Also for a process another wall already
+ * guards: what the broker adds there is the host's folders, which that
+ * wall keeps out of the process's own reach (an Android isolated process
+ * given its app's files through the broker). Every path call still traps,
+ * so local files (sbx_local_add) answer here too. truncate, link, chmod,
+ * xattrs and the other path calls the broker does not make go to the
+ * kernel, as in the unbrokered mode.
+ */
+#define SBX_LOCK_PASSTHROUGH 0x4u
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
+#define SBX_CLAIMS_MAX 32
+#define SBX_LOCALS_MAX 512
 
 struct sbx_lockdown_options {
     unsigned flags;
@@ -68,11 +82,21 @@ struct sbx_lockdown_options {
      * nodes that keep per-process state (kgsl, Mali, DRM render nodes).
      * After lockdown an open of exactly one of these paths is answered with
      * a duplicate, and stat or access of it from that descriptor (libhidl
-     * checks /dev/hwbinder with access before it opens it). Paths that do not exist or cannot be opened are skipped.
+     * checks /dev/hwbinder with access before it opens it): they are local
+     * files (sbx_local_add), read and written. Paths that do not exist or
+     * cannot be opened are skipped.
      * Each platform's list is the host's (see docs/design.md).
      */
     const char *const *own_opens;
     unsigned own_open_count;  /* at most SBX_OWN_OPENS_MAX */
+    /*
+     * With SBX_LOCK_PASSTHROUGH: the absolute folders (each with
+     * everything under it) whose paths go to the broker. Name both a
+     * folder's aliases and its real path, as the confined code may use
+     * either. A relative path is judged by the folder it lands in.
+     */
+    const char *const *claims;
+    unsigned claim_count;  /* at most SBX_CLAIMS_MAX */
 };
 
 /*
@@ -84,6 +108,20 @@ struct sbx_lockdown_options {
  * code it meant to confine.
  */
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);
+
+/*
+ * Gives the process a local file: an open of exactly path (absolute, of
+ * any name) is answered with a duplicate of fd, read only, and stat and
+ * access from it, by the handler, with no broker and no rule. For files
+ * the host handed over that the process could not open by name (code and
+ * data an Android app passes to its isolated process). Takes fd, and
+ * closes it on error. Replaces the descriptor of an earlier path.
+ * Callable before or after sbx_lockdown, from any thread but not from a
+ * signal handler. At most SBX_LOCALS_MAX paths, own-opened devices
+ * included. Returns 0 or a negative errno. A path call is answered from
+ * here only while the filter traps it (brokered or passthrough).
+ */
+int sbx_local_add(const char *path, int fd);
 
 /* ---- Starting a sandboxed program (the native kind) ---- */
 

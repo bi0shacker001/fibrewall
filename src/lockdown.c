@@ -24,6 +24,11 @@
  * It stacks on whatever filter the process already has and can only
  * narrow it.
  *
+ * The handler answers some paths itself, from descriptors (local files:
+ * own-opened devices and the host's sbx_local_add). In passthrough it
+ * sends only the paths under the host's claims to the broker and does the
+ * rest itself, with the kernel deciding, as if there were no filter.
+ *
  * Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
  */
 #define _GNU_SOURCE
@@ -32,8 +37,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -121,48 +128,157 @@ static int locked;
 static int cwd = -1;
 static struct sigaction previous;
 
-/* Devices this process opened itself before lockdown (see sbx_lockdown_options.own_opens). */
+/*
+ * Local files: paths the handler answers itself from a descriptor, with no
+ * broker. Two kinds: devices this process opened just before lockdown
+ * (sbx_lockdown_options.own_opens), read and written; and files the host
+ * hands over under names of its choosing (sbx_local_add), read only.
+ * Entries are added from ordinary code, before or after lockdown, under a
+ * spin lock; the handler reads them without one, because an entry is
+ * complete before the count that publishes it is stored.
+ */
+#define LOCAL_DEVICE 0x100u
 static struct {
-    char path[64];
+    const char *path;
     int fd;
-} own[SBX_OWN_OPENS_MAX];
-static unsigned own_count;
+    unsigned mode; /* SBX_READ, or SBX_READ | SBX_WRITE | LOCAL_DEVICE */
+} locals[SBX_LOCALS_MAX];
+static unsigned local_count;
+static char local_lock;
 
-/* The index of the own-opened device at exactly path, or -1. */
-static int own_index(const char *path) {
+static void lock_locals(void) {
+    while (__atomic_test_and_set(&local_lock, __ATOMIC_ACQUIRE)) sched_yield();
+}
+
+static void unlock_locals(void) { __atomic_clear(&local_lock, __ATOMIC_RELEASE); }
+
+/* The index of the local file at exactly path, or -1. */
+static int local_index(const char *path) {
     if (path == NULL || path[0] != '/') return -1;
-    for (unsigned i = 0; i < own_count; i++) {
-        if (strcmp(path, own[i].path) == 0) return (int) i;
+    unsigned count = __atomic_load_n(&local_count, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < count; i++) {
+        if (strcmp(path, locals[i].path) == 0) return (int) i;
     }
     return -1;
 }
 
-/* A duplicate of an own-opened device for an open of exactly its path, or -ENOENT when path is not one. */
-static long own_open(const char *path, int flags) {
-    int i = own_index(path);
+static int local_fd(int i) { return __atomic_load_n(&locals[i].fd, __ATOMIC_ACQUIRE); }
+
+/* A duplicate of a local file for an open of exactly its path, or -ENOENT when path is not one. */
+static long local_open(const char *path, int flags) {
+    int i = local_index(path);
     if (i < 0) return -ENOENT;
-    long fd = fcntl(own[i].fd, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
-    return fd < 0 ? -errno : fd;
+    int writing = (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0;
+    if (writing && !(locals[i].mode & SBX_WRITE)) return -EACCES;
+    long fd = fcntl(local_fd(i), (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+    if (fd < 0) return -errno;
+    /* A handed-over file reads from its start (the duplicate shares its offset with every other one). */
+    if (!(locals[i].mode & LOCAL_DEVICE)) lseek((int) fd, 0, SEEK_SET);
+    return fd;
 }
 
 /*
- * stat and access of an own-opened device's path, answered from its
- * descriptor: the broker's rules need not hold the device, and a library
- * that checks for the node before it opens it (libhidl's access of
- * /dev/hwbinder) must see what the open will give. The answer is the
- * device's, even for lstat of a path that is a symlink to it. -ENOENT
- * when path is not one.
+ * stat and access of a local file, answered from its descriptor: the
+ * broker's rules need not hold it, and a library that checks for a file
+ * before it opens it (libhidl's access of /dev/hwbinder) must see what the
+ * open will give. The answer is the file's, even for lstat of a path that
+ * is a symlink to it. -ENOENT when path is not one.
  */
-static long own_stat(const char *path, struct stat *st) {
-    int i = own_index(path);
+static long local_stat(const char *path, struct stat *st) {
+    int i = local_index(path);
     if (i < 0) return -ENOENT;
-    return syscall(__NR_fstat, own[i].fd, st) == 0 ? 0 : -errno;
+    return syscall(__NR_fstat, local_fd(i), st) == 0 ? 0 : -errno;
 }
 
-static long own_access(const char *path, int mode) {
-    if (own_index(path) < 0) return -ENOENT;
-    /* It was opened for reading and writing; a device is never run. */
-    return (mode & X_OK) ? -EACCES : 0;
+static long local_access(const char *path, int mode) {
+    int i = local_index(path);
+    if (i < 0) return -ENOENT;
+    if ((mode & W_OK) && !(locals[i].mode & SBX_WRITE)) return -EACCES;
+    /* A device is never run. */
+    if ((mode & X_OK) && (locals[i].mode & LOCAL_DEVICE)) return -EACCES;
+    return 0;
+}
+
+/* Adds an entry, or replaces the descriptor of the one at the same path; takes fd. Ordinary code only. */
+static int add_local(const char *path, int fd, unsigned mode) {
+    if (path == NULL || path[0] != '/' || strnlen(path, SBX_PATH_MAX) == SBX_PATH_MAX || fd < 0) return -EINVAL;
+    lock_locals();
+    unsigned count = local_count;
+    for (unsigned i = 0; i < count; i++) {
+        if (strcmp(path, locals[i].path) == 0) {
+            int old = __atomic_exchange_n(&locals[i].fd, fd, __ATOMIC_ACQ_REL);
+            unlock_locals();
+            close(old);
+            return 0;
+        }
+    }
+    if (count == SBX_LOCALS_MAX) {
+        unlock_locals();
+        return -ENOSPC;
+    }
+    char *copy = strdup(path);
+    if (copy == NULL) {
+        unlock_locals();
+        return -ENOMEM;
+    }
+    locals[count].path = copy;
+    locals[count].fd = fd;
+    locals[count].mode = mode;
+    __atomic_store_n(&local_count, count + 1, __ATOMIC_RELEASE);
+    unlock_locals();
+    return 0;
+}
+
+int sbx_local_add(const char *path, int fd) {
+    int added = add_local(path, fd, SBX_READ);
+    if (added != 0 && fd >= 0) close(fd);
+    return added;
+}
+
+/* Removes the entries from first on and closes their descriptors (a refused lockdown's own-opened devices). */
+static void drop_locals_from(unsigned first) {
+    lock_locals();
+    unsigned count = local_count;
+    __atomic_store_n(&local_count, first, __ATOMIC_RELEASE);
+    for (unsigned i = first; i < count; i++) {
+        close(locals[i].fd);
+        free((void *) locals[i].path);
+    }
+    unlock_locals();
+}
+
+/*
+ * Passthrough (SBX_LOCK_PASSTHROUGH): the folders the broker answers for;
+ * every other path goes to the kernel, through the handler, as the call
+ * would have gone without the filter.
+ */
+static int passthrough;
+static char *claims[SBX_CLAIMS_MAX];
+static size_t claim_lengths[SBX_CLAIMS_MAX];
+static unsigned claim_count;
+
+/*
+ * The directory argument of the handler's own calls to the kernel in
+ * passthrough. Every path the handler sends there is absolute, and the
+ * kernel ignores the directory argument of an absolute path, so this is
+ * never a descriptor: it is the one value the filter lets through
+ * untrapped. Code that uses it itself reaches only what the kernel would
+ * give the process anyway, which is what passthrough means.
+ */
+#define PASS_DIRFD (-0x5b1)
+
+static int claimed(const char *path) {
+    for (unsigned i = 0; i < claim_count; i++) {
+        size_t n = claim_lengths[i];
+        if (strncmp(path, claims[i], n) == 0 && (path[n] == '/' || path[n] == '\0')) return 1;
+    }
+    return 0;
+}
+
+static void free_claims(void) {
+    for (unsigned i = 0; i < claim_count; i++) free(claims[i]);
+    claim_count = 0;
+    passthrough = 0;
 }
 
 static int current_directory(void) { return __atomic_load_n(&cwd, __ATOMIC_ACQUIRE); }
@@ -273,13 +389,6 @@ static void set_directory(int directory) {
     if (old >= 0) close(old);
 }
 
-static long change_directory(const char *path) {
-    long fd = forward(SBX_CHDIR, AT_FDCWD, path, 0, NULL, 0, 0, NULL, 0);
-    if (fd < 0) return fd;
-    set_directory((int) fd);
-    return 0;
-}
-
 static long change_directory_fd(int fd) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -errno;
@@ -290,92 +399,234 @@ static long change_directory_fd(int fd) {
     return 0;
 }
 
-static long get_directory(char *buffer, size_t size) {
-    if (buffer == NULL || size == 0) return -EINVAL;
-    long n = forward(SBX_GETCWD, AT_FDCWD, ".", 0, NULL, 0, (uint32_t) size, buffer, size);
-    if (n < 0) return n;
-    return n; /* the broker counts the terminating NUL, as the kernel does */
+/* "/proc/self/fd/<fd>" into name (at least 32 bytes), with no stdio in the handler. */
+static void fd_link(char *name, int fd) {
+    static const char prefix[] = "/proc/self/fd/";
+    memcpy(name, prefix, sizeof(prefix) - 1);
+    char digits[12];
+    int n = 0;
+    unsigned value = fd < 0 ? 0u : (unsigned) fd;
+    do digits[n++] = (char) ('0' + value % 10);
+    while ((value /= 10) != 0);
+    size_t at = sizeof(prefix) - 1;
+    while (n > 0) name[at++] = digits[--n];
+    name[at] = '\0';
+}
+
+static long kernel(long result) { return result < 0 ? -errno : result; }
+
+#define ROUTE_BROKER 0
+#define ROUTE_KERNEL 1
+
+/*
+ * Where a path call goes. Without passthrough, always to the broker. In
+ * passthrough, an absolute path under a claim goes to the broker and any
+ * other to the kernel as it is. A relative path is judged by where it
+ * lands, its directory's name (from /proc/self/fd) joined to it: under a
+ * claim it goes to the broker with its directory; otherwise to the kernel
+ * as /proc/self/fd/<directory>/<path>, which the kernel walks from that
+ * same directory. *where is set for ROUTE_KERNEL, in buffer
+ * (SBX_PATH_MAX bytes) when it had to be built.
+ */
+static long route(int dirfd, const char *path, char *buffer, const char **where) {
+    if (!passthrough) return ROUTE_BROKER;
+    if (path == NULL) return -EFAULT;
+    if (path[0] == '\0') return -ENOENT;
+    if (path[0] == '/') {
+        if (claimed(path)) return ROUTE_BROKER;
+        *where = path;
+        return ROUTE_KERNEL;
+    }
+    char link[32];
+    fd_link(link, dirfd == AT_FDCWD ? current_directory() : dirfd);
+    size_t length = strnlen(path, SBX_PATH_MAX);
+    long n = syscall(__NR_readlinkat, PASS_DIRFD, link, buffer, SBX_PATH_MAX - 1);
+    if (n < 0) return errno == ENOENT ? -EBADF : -errno;
+    if (buffer[0] == '/' && (size_t) n + 1 + length < SBX_PATH_MAX) {
+        buffer[n] = '/';
+        memcpy(buffer + n + 1, path, length);
+        buffer[n + 1 + length] = '\0';
+        if (claimed(buffer)) return ROUTE_BROKER;
+    }
+    size_t prefix = strlen(link);
+    if (prefix + 1 + length >= SBX_PATH_MAX) return -ENAMETOOLONG;
+    memcpy(buffer, link, prefix);
+    buffer[prefix] = '/';
+    memcpy(buffer + prefix + 1, path, length);
+    buffer[prefix + 1 + length] = '\0';
+    *where = buffer;
+    return ROUTE_KERNEL;
+}
+
+static long open_path(int dirfd, const char *path, int flags, uint32_t mode, char *buffer) {
+    long mine = local_open(path, flags);
+    if (mine != -ENOENT) return mine;
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_openat, PASS_DIRFD, where, flags, mode));
+    return forward(SBX_OPEN, dirfd, path, 0, NULL, flags, mode, NULL, 0);
+}
+
+static long stat_path(int dirfd, const char *path, struct stat *st, int flags, char *buffer) {
+    long mine = local_stat(path, st);
+    if (mine != -ENOENT) return mine;
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_newfstatat, PASS_DIRFD, where, st, flags));
+    return forward(SBX_STAT, dirfd, path, 0, NULL, flags & AT_SYMLINK_NOFOLLOW, 0, st, sizeof(struct stat));
+}
+
+static long access_path(int dirfd, const char *path, int mode, int flags, char *buffer) {
+    long mine = local_access(path, mode);
+    if (mine != -ENOENT) return mine;
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) {
+        if (flags == 0) return kernel(syscall(__NR_faccessat, PASS_DIRFD, where, mode));
+        return kernel(syscall(__NR_faccessat2, PASS_DIRFD, where, mode, flags));
+    }
+    return forward(SBX_ACCESS, dirfd, path, 0, NULL, 0, (uint32_t) mode, NULL, 0);
+}
+
+static long readlink_path(int dirfd, const char *path, char *out, long size, char *buffer) {
+    if (size <= 0) return -EINVAL;
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_readlinkat, PASS_DIRFD, where, out, size));
+    return forward(SBX_READLINK, dirfd, path, 0, NULL, 0, (uint32_t) size, out, (size_t) size);
+}
+
+static long mkdir_path(int dirfd, const char *path, uint32_t mode, char *buffer) {
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_mkdirat, PASS_DIRFD, where, mode));
+    return forward(SBX_MKDIR, dirfd, path, 0, NULL, 0, mode, NULL, 0);
+}
+
+static long unlink_path(int dirfd, const char *path, int flags, char *buffer) {
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_unlinkat, PASS_DIRFD, where, flags));
+    return forward(SBX_UNLINK, dirfd, path, 0, NULL, flags & AT_REMOVEDIR, 0, NULL, 0);
+}
+
+/* A rename goes to the kernel only when neither name is the broker's. */
+static long rename_path(int dirfd, const char *path, int dirfd2, const char *path2, int flags, char *buffer) {
+    const char *where = NULL, *where2 = NULL;
+    char buffer2[SBX_PATH_MAX];
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    long to2 = route(dirfd2, path2, buffer2, &where2);
+    if (to2 < 0) return to2;
+    if (to == ROUTE_KERNEL && to2 == ROUTE_KERNEL) {
+        return kernel(syscall(__NR_renameat2, PASS_DIRFD, where, PASS_DIRFD, where2, flags));
+    }
+    return forward(SBX_RENAME, dirfd, path, dirfd2, path2, flags, 0, NULL, 0);
+}
+
+static long statfs_path(const char *path, struct statfs *out, char *buffer) {
+    const char *where = NULL;
+    long to = route(AT_FDCWD, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_BROKER) return forward(SBX_STATFS, AT_FDCWD, path, 0, NULL, 0, 0, out, sizeof(struct statfs));
+    long fd = syscall(__NR_openat, PASS_DIRFD, where, O_PATH | O_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    long result = kernel(syscall(__NR_fstatfs, (int) fd, out));
+    close((int) fd);
+    return result;
+}
+
+static long change_directory(const char *path, char *buffer) {
+    const char *where = NULL;
+    long to = route(AT_FDCWD, path, buffer, &where);
+    if (to < 0) return to;
+    long fd;
+    if (to == ROUTE_KERNEL) fd = kernel(syscall(__NR_openat, PASS_DIRFD, where, O_PATH | O_DIRECTORY | O_CLOEXEC, 0));
+    else fd = forward(SBX_CHDIR, AT_FDCWD, path, 0, NULL, 0, 0, NULL, 0);
+    if (fd < 0) return fd;
+    set_directory((int) fd);
+    return 0;
+}
+
+static long get_directory(char *out, size_t size) {
+    if (out == NULL || size == 0) return -EINVAL;
+    if (!passthrough) {
+        /* The broker counts the terminating NUL, as the kernel does. */
+        return forward(SBX_GETCWD, AT_FDCWD, ".", 0, NULL, 0, (uint32_t) size, out, size);
+    }
+    char link[32];
+    fd_link(link, current_directory());
+    long n = syscall(__NR_readlinkat, PASS_DIRFD, link, out, size);
+    if (n < 0) return -errno;
+    if ((size_t) n >= size) return -ERANGE;
+    out[n] = '\0';
+    return n + 1;
 }
 
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
+    char buffer[SBX_PATH_MAX];
     switch (nr) {
-    case __NR_openat: {
-        long mine = own_open((const char *) a1, (int) a2);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_OPEN, (int) a0, (const char *) a1, 0, NULL, (int) a2, (uint32_t) a3, NULL, 0);
-    }
+    case __NR_openat:
+        return open_path((int) a0, (const char *) a1, (int) a2, (uint32_t) a3, buffer);
     case __NR_newfstatat: {
         const char *path = (const char *) a1;
         if ((a3 & AT_EMPTY_PATH) && path != NULL && path[0] == '\0') {
             return syscall(__NR_fstat, (int) a0, (void *) a2) == 0 ? 0 : -errno;
         }
-        long mine = own_stat(path, (struct stat *) a2);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_STAT, (int) a0, path, 0, NULL, (int) (a3 & AT_SYMLINK_NOFOLLOW), 0,
-                       (void *) a2, sizeof(struct stat));
+        return stat_path((int) a0, path, (struct stat *) a2, (int) a3, buffer);
     }
     case __NR_faccessat:
-    case __NR_faccessat2: {
-        long mine = own_access((const char *) a1, (int) a2);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_ACCESS, (int) a0, (const char *) a1, 0, NULL, 0, (uint32_t) a2, NULL, 0);
-    }
+        return access_path((int) a0, (const char *) a1, (int) a2, 0, buffer);
+    case __NR_faccessat2:
+        return access_path((int) a0, (const char *) a1, (int) a2, (int) a3, buffer);
     case __NR_readlinkat:
-        if (a3 <= 0) return -EINVAL;
-        return forward(SBX_READLINK, (int) a0, (const char *) a1, 0, NULL, 0, (uint32_t) a3, (void *) a2,
-                       (size_t) a3);
+        return readlink_path((int) a0, (const char *) a1, (char *) a2, a3, buffer);
     case __NR_mkdirat:
-        return forward(SBX_MKDIR, (int) a0, (const char *) a1, 0, NULL, 0, (uint32_t) a2, NULL, 0);
+        return mkdir_path((int) a0, (const char *) a1, (uint32_t) a2, buffer);
     case __NR_unlinkat:
-        return forward(SBX_UNLINK, (int) a0, (const char *) a1, 0, NULL, (int) (a2 & AT_REMOVEDIR), 0, NULL, 0);
+        return unlink_path((int) a0, (const char *) a1, (int) a2, buffer);
 #ifdef __NR_renameat
     case __NR_renameat:
-        return forward(SBX_RENAME, (int) a0, (const char *) a1, (int) a2, (const char *) a3, 0, 0, NULL, 0);
+        return rename_path((int) a0, (const char *) a1, (int) a2, (const char *) a3, 0, buffer);
 #endif
     case __NR_renameat2:
-        return forward(SBX_RENAME, (int) a0, (const char *) a1, (int) a2, (const char *) a3, (int) a4, 0, NULL, 0);
+        return rename_path((int) a0, (const char *) a1, (int) a2, (const char *) a3, (int) a4, buffer);
     case __NR_statfs:
-        return forward(SBX_STATFS, AT_FDCWD, (const char *) a0, 0, NULL, 0, 0, (void *) a1, sizeof(struct statfs));
+        return statfs_path((const char *) a0, (struct statfs *) a1, buffer);
     case __NR_chdir:
-        return change_directory((const char *) a0);
+        return change_directory((const char *) a0, buffer);
     case __NR_fchdir:
         return change_directory_fd((int) a0);
     case __NR_getcwd:
         return get_directory((char *) a0, (size_t) a1);
 #ifdef __NR_open
-    case __NR_open: {
-        long mine = own_open((const char *) a0, (int) a1);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_OPEN, AT_FDCWD, (const char *) a0, 0, NULL, (int) a1, (uint32_t) a2, NULL, 0);
-    }
+    case __NR_open:
+        return open_path(AT_FDCWD, (const char *) a0, (int) a1, (uint32_t) a2, buffer);
     case __NR_creat:
-        return forward(SBX_OPEN, AT_FDCWD, (const char *) a0, 0, NULL, O_CREAT | O_WRONLY | O_TRUNC,
-                       (uint32_t) a1, NULL, 0);
+        return open_path(AT_FDCWD, (const char *) a0, O_CREAT | O_WRONLY | O_TRUNC, (uint32_t) a1, buffer);
     case __NR_stat:
-    case __NR_lstat: {
-        long mine = own_stat((const char *) a0, (struct stat *) a1);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_STAT, AT_FDCWD, (const char *) a0, 0, NULL, nr == __NR_lstat ? AT_SYMLINK_NOFOLLOW : 0, 0,
-                       (void *) a1, sizeof(struct stat));
-    }
-    case __NR_access: {
-        long mine = own_access((const char *) a0, (int) a1);
-        if (mine != -ENOENT) return mine;
-        return forward(SBX_ACCESS, AT_FDCWD, (const char *) a0, 0, NULL, 0, (uint32_t) a1, NULL, 0);
-    }
+        return stat_path(AT_FDCWD, (const char *) a0, (struct stat *) a1, 0, buffer);
+    case __NR_lstat:
+        return stat_path(AT_FDCWD, (const char *) a0, (struct stat *) a1, AT_SYMLINK_NOFOLLOW, buffer);
+    case __NR_access:
+        return access_path(AT_FDCWD, (const char *) a0, (int) a1, 0, buffer);
     case __NR_readlink:
-        if (a2 <= 0) return -EINVAL;
-        return forward(SBX_READLINK, AT_FDCWD, (const char *) a0, 0, NULL, 0, (uint32_t) a2, (void *) a1,
-                       (size_t) a2);
+        return readlink_path(AT_FDCWD, (const char *) a0, (char *) a1, a2, buffer);
     case __NR_mkdir:
-        return forward(SBX_MKDIR, AT_FDCWD, (const char *) a0, 0, NULL, 0, (uint32_t) a1, NULL, 0);
+        return mkdir_path(AT_FDCWD, (const char *) a0, (uint32_t) a1, buffer);
     case __NR_unlink:
-        return forward(SBX_UNLINK, AT_FDCWD, (const char *) a0, 0, NULL, 0, 0, NULL, 0);
+        return unlink_path(AT_FDCWD, (const char *) a0, 0, buffer);
     case __NR_rmdir:
-        return forward(SBX_UNLINK, AT_FDCWD, (const char *) a0, 0, NULL, AT_REMOVEDIR, 0, NULL, 0);
+        return unlink_path(AT_FDCWD, (const char *) a0, AT_REMOVEDIR, buffer);
     case __NR_rename:
-        return forward(SBX_RENAME, AT_FDCWD, (const char *) a0, AT_FDCWD, (const char *) a1, 0, 0, NULL, 0);
+        return rename_path(AT_FDCWD, (const char *) a0, AT_FDCWD, (const char *) a1, 0, buffer);
 #endif
     default:
         return -ENOSYS;
@@ -461,6 +712,29 @@ static void sealed_block(unsigned nr, unsigned arg, const int *fds, unsigned cou
     ret(DENY);
 }
 
+/*
+ * In passthrough, nr is let through when its directory argument (both of
+ * them, for a rename) is PASS_DIRFD: the handler's own calls to the
+ * kernel. Any other use of nr traps.
+ */
+static void passthrough_block(unsigned nr, int two_directories) {
+    if (!two_directories) {
+        jeq(nr, 0, 4);
+        load(ARG_LO(0));
+        jeq((unsigned) PASS_DIRFD, 0, 1);
+        ret(ALLOW);
+        ret(TRAP);
+        return;
+    }
+    jeq(nr, 0, 6);
+    load(ARG_LO(0));
+    jeq((unsigned) PASS_DIRFD, 0, 3);
+    load(ARG_LO(2));
+    jeq((unsigned) PASS_DIRFD, 0, 1);
+    ret(ALLOW);
+    ret(TRAP);
+}
+
 static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
     load(offsetof(struct seccomp_data, arch));
@@ -473,6 +747,17 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     ret(REFUSE);
 #endif
     int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
+    int pass = (flags & SBX_LOCK_PASSTHROUGH) != 0;
+    if (pass) {
+        static const unsigned one[] = {
+            __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat, __NR_unlinkat,
+        };
+        for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) passthrough_block(one[i], 0);
+        passthrough_block(__NR_renameat2, 1);
+#ifdef __NR_renameat
+        passthrough_block(__NR_renameat, 1);
+#endif
+    }
     /* Brokered. */
     static const unsigned brokered[] = {
         __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
@@ -490,6 +775,8 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         /* Callers fall back to the brokered forms. */
         rule(__NR_statx, NOSYS);
         rule(__NR_openat2, NOSYS);
+    }
+    if (!unbrokered && !pass) {
         /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it is refused. */
         jeq(__NR_utimensat, 0, 6);
         load(ARG_LO(1));
@@ -544,7 +831,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         sealed_block(__NR_dup2, 0, sealed, sealed_count);
 #endif
     }
-    /* Refused: other paths (the kernel's own checks decide them when there is no broker). */
+    /* Refused: other paths (the kernel's own checks decide them when there is no broker, and in passthrough). */
     static const unsigned refused_paths[] = {
         __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchmodat, __NR_fchownat,
         __NR_inotify_add_watch, __NR_fanotify_mark, __NR_name_to_handle_at, __NR_open_by_handle_at,
@@ -555,7 +842,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_futimesat, __NR_uselib,
 #endif
     };
-    if (!unbrokered) {
+    if (!unbrokered && !pass) {
         for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) rule(refused_paths[i], REFUSE);
     }
     /* Refused: reaching past the process. */
@@ -589,8 +876,15 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     struct sbx_lockdown_options none = {.flags = 0};
     if (!options) options = &none;
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
+    int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
+    if (unbrokered && pass) return -EINVAL;
     if (unbrokered) broker_fd = -1;
     else if (broker_fd < 0) return -EBADF;
+    if (options->claim_count > SBX_CLAIMS_MAX || (options->claim_count && !options->claims)) return -EINVAL;
+    for (unsigned k = 0; k < options->claim_count; k++) {
+        const char *claim = options->claims[k];
+        if (!claim || claim[0] != '/' || strnlen(claim, SBX_PATH_MAX) == SBX_PATH_MAX) return -EINVAL;
+    }
     if (options->sealed_count > SBX_SEALED_MAX || (options->sealed_count && !options->sealed_fds)) return -EINVAL;
     if (options->own_open_count > SBX_OWN_OPENS_MAX || (options->own_open_count && !options->own_opens)) return -EINVAL;
     for (unsigned k = 0; k < options->sealed_count; k++) {
@@ -611,24 +905,37 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (directory < 0) return -errno;
     broker = broker_fd;
     cwd = directory;
-    own_count = 0;
+    unsigned locals_before = __atomic_load_n(&local_count, __ATOMIC_ACQUIRE);
     for (unsigned i = 0; i < options->own_open_count; i++) {
         const char *path = options->own_opens[i];
-        if (!path || path[0] != '/' || strlen(path) >= sizeof(own[0].path)) continue;
+        if (!path || path[0] != '/') continue;
         int fd = open(path, O_RDWR | O_CLOEXEC);
         if (fd < 0) continue;
-        strcpy(own[own_count].path, path);
-        own[own_count].fd = fd;
-        own_count++;
+        if (add_local(path, fd, SBX_READ | SBX_WRITE | LOCAL_DEVICE) != 0) close(fd);
     }
+    int error = 0;
+    for (unsigned k = 0; k < options->claim_count && error == 0; k++) {
+        char *copy = strdup(options->claims[k]);
+        if (copy == NULL) {
+            error = -ENOMEM;
+            break;
+        }
+        size_t n = strlen(copy);
+        while (n > 0 && copy[n - 1] == '/') copy[--n] = '\0';  /* "/" claims everything: length 0 */
+        claims[claim_count] = copy;
+        claim_lengths[claim_count] = n;
+        claim_count++;
+    }
+    passthrough = pass;
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = on_sigsys;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
-    int error = 0;
-    if (sigaction(SIGSYS, &action, &previous) != 0) {
+    if (error != 0) {
+        /* Nothing installed yet. */
+    } else if (sigaction(SIGSYS, &action, &previous) != 0) {
         error = -errno;
     } else if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
         error = -errno;
@@ -642,9 +949,9 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         /* A positive result names a thread that could not be synchronised: a lockdown that misses threads is none. */
         error = synced > 0 ? -EBUSY : -errno;
     }
-    sigaction(SIGSYS, &previous, NULL);
-    for (unsigned i = 0; i < own_count; i++) close(own[i].fd);
-    own_count = 0;
+    if (error != -ENOMEM) sigaction(SIGSYS, &previous, NULL);
+    drop_locals_from(locals_before);
+    free_claims();
     close(directory);
     broker = -1;
     cwd = -1;

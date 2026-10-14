@@ -85,6 +85,32 @@ list for its platform. Enginehost's is `/dev/hwbinder`, `/dev/kgsl-3d0`,
 because an app cannot open it at all. A native-kind process that never
 needs binder seals those descriptors instead.
 
+**Local files.** `sbx_local_add(path, fd)` gives the process a file under
+a name of the host's choosing, read only: an open of exactly that path gets
+a duplicate, and stat and access answer from the descriptor, in the
+handler, with no broker and no rule. It works before or after lockdown, so
+a host can hand over code and data as it loads them. Own-opened devices are
+local files too (read and written). This is how droidtop's isolated plugin
+processes see the files it hands them as descriptors at virtual paths:
+every library that opens a path is covered, not only the ones a PLT hook
+reached.
+
+**Passthrough** (`SBX_LOCK_PASSTHROUGH`) is for a process another wall
+already guards, where the broker's job is to add folders, not to take the
+kernel's place: an Android isolated process, whose UID and SELinux domain
+keep every app's files out, given its own folder through a broker in the
+app. Only paths under `claims` go to the broker. The handler makes every
+other path call itself, with the kernel deciding, as if there were no
+filter. Its calls name an absolute path (a relative one is rewritten as
+`/proc/self/fd/<directory>/<path>`, which the kernel walks from that same
+directory) and carry a directory argument that is no descriptor, the one
+value the filter lets through untrapped. Code that uses that value itself
+gets only what the kernel would give the process anyway. A relative path
+is claimed when the folder it lands in is (the directory's name from
+`/proc/self/fd`, joined to it). truncate, link, chmod, xattrs and the
+other path calls the broker does not make go to the kernel, as in the
+unbrokered mode.
+
 The confined process cannot change directory for real (it may not be able
 to open what it enters). So the handler keeps the current directory as a
 descriptor the broker gave it, sends it with each relative request, and
