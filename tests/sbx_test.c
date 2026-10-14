@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
@@ -586,7 +587,7 @@ static int passthrough_check(void) {
     sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
     sbx_policy_alias(policy, "/sandbox-test/data", save);
     if (sbx_broker_start(policy, pair[0]) != 0) return 1;
-    char real_game[512];
+    char real_game[PATH_MAX];
     if (!realpath(game, real_game)) return 1;
     char local_path[400];
     snprintf(local_path, sizeof(local_path), "%s/local.txt", root);
@@ -640,7 +641,7 @@ static int passthrough_check(void) {
         fd = open("data.txt", O_RDONLY);
         EXPECT(fd >= 0, "passthrough: a relative path from there goes to the kernel");
         if (fd >= 0) close(fd);
-        char cwd[512];
+        char cwd[PATH_MAX];
         EXPECT(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, real_game) == 0, "passthrough: getcwd names it");
         EXPECT(chdir("/sandbox-test/data") == 0, "passthrough: chdir into a claimed folder");
         fd = open("p.txt", O_RDONLY);
