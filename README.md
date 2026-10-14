@@ -48,7 +48,7 @@ After lockdown, no system call can name a file by itself. Each one traps and is 
 | **Aliases** | A folder handed over under a fixed name. |
 | **Decider and audit** | Your callbacks: grant or refuse each access, and log it. |
 
-The broker resolves paths itself and makes each call relative to a parent directory it has opened and checked, so a symlink swapped in mid-call cannot lead outside the rules. The design follows Chromium's Linux syscall broker and Android's minijail policies. The reasoning is in the "What it does not stop" section of [docs/design.md](docs/design.md).
+The broker resolves paths itself and makes each call relative to a parent directory it has opened and checked, so a symlink swapped in mid-call cannot lead outside the rules. The design follows Chromium's Linux syscall broker and Android's minijail policies. The reasoning is in [docs/design.md](docs/design.md).
 
 ## What it blocks
 
