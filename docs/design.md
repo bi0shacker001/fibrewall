@@ -53,8 +53,9 @@ The filter:
 - **Refuses with EACCES.** Any other path call: truncate, link, symlink,
   mknod, chmod/chown, utimes on a path, xattrs on a path, inotify and
   fanotify marks, file handles. Also execve(at), socket (a Unix datagram
-  socket for the system log can be allowed with `SBX_LOCK_LOG_SOCKET`),
-  bind, connect, ptrace, process_vm_readv/writev, process_madvise, bpf,
+  socket for the system log can be allowed with `SBX_LOCK_LOG_SOCKET`, or
+  inet sockets with `SBX_LOCK_INET`), bind and connect (open again with
+  the sockets those flags allow), ptrace, process_vm_readv/writev, process_madvise, bpf,
   perf_event_open, io_uring. Also a call through another architecture's
   entry (x32 or `int 0x80` on x86_64).
 - **Refuses with EPERM.**
@@ -110,6 +111,19 @@ is claimed when the folder it lands in is (the directory's name from
 `/proc/self/fd`, joined to it). truncate, link, chmod, xattrs and the
 other path calls the broker does not make go to the kernel, as in the
 unbrokered mode.
+
+**Network** (`SBX_LOCK_INET`) is for a process that talks to the network
+itself, such as droidtop's Syncthing plugin (Droidtop/tracker#553): it
+dials peers and listens for them, so the host cannot open its sockets for
+it. socket is allowed for `AF_INET` and `AF_INET6` with `SOCK_STREAM` or
+`SOCK_DGRAM`, and connect and bind are open. Raw sockets, netlink and every
+Unix socket stay refused; socketpair is untouched, as in every mode. The
+filter cannot read the address bind is given, so bind is open only because
+inet sockets are then the only ones the process can make. That is why the
+flag cannot be combined with `SBX_LOCK_LOG_SOCKET`: its Unix datagram
+socket could bind a name in the file system or the abstract namespace, and
+`sbx_lockdown` answers `-EINVAL`. The kernel's own network checks (an
+Android app's `inet` group) still apply underneath.
 
 The confined process cannot change directory for real (it may not be able
 to open what it enters). So the handler keeps the current directory as a

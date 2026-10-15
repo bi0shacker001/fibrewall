@@ -45,6 +45,8 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef __NR_statx
 #define __NR_statx 332
@@ -571,6 +573,63 @@ static int unbrokered_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- Inet: inet sockets and nothing else that reaches out. ---- */
+
+static int inet_check(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sbx_lockdown_options both = {.flags = SBX_LOCK_UNBROKERED | SBX_LOCK_INET | SBX_LOCK_LOG_SOCKET};
+        EXPECT(sbx_lockdown(-1, &both) == -EINVAL, "inet: not with the log socket, whose bind it cannot tell apart");
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNBROKERED | SBX_LOCK_INET};
+        int locked = sbx_lockdown(-1, &options);
+        errno = -locked;
+        EXPECT(locked == 0, "inet lockdown");
+        if (locked != 0) _exit(1);
+        errno = 0;
+        EXPECT(a_inet6() != EACCES, "inet: socket(AF_INET6) not refused by the filter");
+        errno = 0;
+        EXPECT(a_unix_dgram() == EACCES, "inet: socket(AF_UNIX, SOCK_DGRAM) refused");
+        errno = 0;
+        EXPECT(a_unix_stream() == EACCES, "inet: socket(AF_UNIX, SOCK_STREAM) refused");
+        errno = 0;
+        EXPECT(a_netlink() == EACCES, "inet: socket(AF_NETLINK) refused");
+        errno = 0;
+        EXPECT(try_socket(AF_INET, SOCK_RAW, IPPROTO_UDP) == EACCES, "inet: socket(AF_INET, SOCK_RAW) refused");
+
+        /* A loopback round trip: bind, listen, connect, accept. */
+        int server = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        EXPECT(server >= 0, "inet: socket(AF_INET, SOCK_STREAM)");
+        struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        socklen_t length = sizeof(address);
+        EXPECT(server >= 0 && bind(server, (struct sockaddr *) &address, sizeof(address)) == 0, "inet: bind");
+        EXPECT(server >= 0 && listen(server, 1) == 0, "inet: listen");
+        EXPECT(server >= 0 && getsockname(server, (struct sockaddr *) &address, &length) == 0, "inet: getsockname");
+        int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        EXPECT(client >= 0 && connect(client, (struct sockaddr *) &address, sizeof(address)) == 0, "inet: connect");
+        int accepted = server >= 0 ? accept(server, NULL, NULL) : -1;
+        EXPECT(accepted >= 0, "inet: accept");
+        char byte = 0;
+        EXPECT(client >= 0 && write(client, "x", 1) == 1 && accepted >= 0 && read(accepted, &byte, 1) == 1 && byte == 'x',
+               "inet: bytes cross the loopback connection");
+        if (accepted >= 0) close(accepted);
+        if (client >= 0) close(client);
+        if (server >= 0) close(server);
+        int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        EXPECT(udp >= 0, "inet: socket(AF_INET, SOCK_DGRAM)");
+        if (udp >= 0) close(udp);
+
+        errno = 0;
+        EXPECT(a_exec() == EACCES, "inet: execve refused");
+        errno = 0;
+        EXPECT(kill(getppid(), 0) < 0 && errno == EPERM, "inet: a signal to the parent refused");
+        _exit(failures ? 1 : 0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- Passthrough: claimed folders through the broker, every other path to the kernel, local files. ---- */
 
 static int read_word(int fd, char *out, size_t size) {
@@ -812,7 +871,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | unbrokered_check() | passthrough_check();
+    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

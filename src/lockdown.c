@@ -795,13 +795,24 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
     rule(__NR_clone3, NOSYS);
-    /* A Unix datagram socket for the system log, when asked; no other socket. */
+    /* A Unix datagram socket for the system log, or inet sockets, when asked; no other socket. */
     if (flags & SBX_LOCK_LOG_SOCKET) {
         jeq(__NR_socket, 0, 7);
         load(ARG_LO(0));
         jeq(AF_UNIX, 0, 4);
         load(ARG_LO(1));
         emit((struct sock_filter) BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf));
+        jeq(SOCK_DGRAM, 0, 1);
+        ret(ALLOW);
+        ret(REFUSE);
+    } else if (flags & SBX_LOCK_INET) {
+        jeq(__NR_socket, 0, 9);
+        load(ARG_LO(0));
+        jeq(AF_INET, 1, 0);
+        jeq(AF_INET6, 0, 5);
+        load(ARG_LO(1));
+        emit((struct sock_filter) BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf));
+        jeq(SOCK_STREAM, 1, 0);
         jeq(SOCK_DGRAM, 0, 1);
         ret(ALLOW);
         ret(REFUSE);
@@ -854,13 +865,14 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     /* Refused: reaching past the process. */
     static const unsigned refused[] = {
-        __NR_execve, __NR_execveat, __NR_bind, __NR_ptrace, __NR_process_vm_readv, __NR_process_vm_writev,
+        __NR_execve, __NR_execveat, __NR_ptrace, __NR_process_vm_readv, __NR_process_vm_writev,
         __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup, __NR_io_uring_enter,
         __NR_io_uring_register,
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
-    /* connect only for the log's datagram socket, the one socket that can be made; nothing else to connect. */
-    if (!(flags & SBX_LOCK_LOG_SOCKET)) rule(__NR_connect, REFUSE);
+    /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
+    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET))) rule(__NR_connect, REFUSE);
+    if (!(flags & SBX_LOCK_INET)) rule(__NR_bind, REFUSE);
     static const unsigned denied[] = {
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
@@ -891,6 +903,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (unbrokered && pass) return -EINVAL;
+    if ((options->flags & SBX_LOCK_INET) && (options->flags & SBX_LOCK_LOG_SOCKET)) return -EINVAL;
     if (unbrokered) broker_fd = -1;
     else if (broker_fd < 0) return -EBADF;
     if (options->claim_count > SBX_CLAIMS_MAX || (options->claim_count && !options->claims)) return -EINVAL;

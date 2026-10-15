@@ -57,6 +57,16 @@ extern "C" {
  * kernel, as in the unbrokered mode.
  */
 #define SBX_LOCK_PASSTHROUGH 0x4u
+/*
+ * Network: socket(AF_INET or AF_INET6, SOCK_STREAM or SOCK_DGRAM), with
+ * connect, bind and listen, and no other socket. For a process that talks
+ * to the network itself, such as a sync daemon. bind is open because every
+ * socket the process can make is an inet one; the filter cannot read the
+ * address bind is given, so this flag cannot be combined with
+ * SBX_LOCK_LOG_SOCKET (sbx_lockdown answers -EINVAL), whose Unix socket
+ * could otherwise bind a name in the file system or the abstract namespace.
+ */
+#define SBX_LOCK_INET 0x8u
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16

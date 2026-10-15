@@ -52,7 +52,7 @@ The broker resolves paths itself and makes each call relative to a parent direct
 
 ## What it blocks
 
-Refused outright: sockets, `execve`, `ptrace`, namespaces, mounts, `io_uring`, `bpf`, signals to other processes and foreign system-call ABIs.
+Refused outright: sockets (a process that needs the network can be given inet sockets, and only those, with `SBX_LOCK_INET`), `execve`, `ptrace`, namespaces, mounts, `io_uring`, `bpf`, signals to other processes and foreign system-call ABIs.
 
 An end-to-end test runs escape attempts first without the sandbox, as a control, and then confined, and checks that each one fails. It also races a symlink against the broker and checks that a file outside the rules is never touched.
 
