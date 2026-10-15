@@ -579,6 +579,7 @@ static int inet_check(void) {
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
+        alarm(30); /* A hang (a blocked accept) fails the check instead of the run. */
         struct sbx_lockdown_options both = {.flags = SBX_LOCK_UNBROKERED | SBX_LOCK_INET | SBX_LOCK_LOG_SOCKET};
         EXPECT(sbx_lockdown(-1, &both) == -EINVAL, "inet: not with the log socket, whose bind it cannot tell apart");
         struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNBROKERED | SBX_LOCK_INET};
@@ -597,7 +598,12 @@ static int inet_check(void) {
         errno = 0;
         EXPECT(try_socket(AF_INET, SOCK_RAW, IPPROTO_UDP) == EACCES, "inet: socket(AF_INET, SOCK_RAW) refused");
 
-        /* A loopback round trip: bind, listen, connect, accept. */
+        /*
+         * A loopback round trip: bind, listen, connect, accept. connect and
+         * accept go to the kernel directly: bionic's report each inet socket
+         * to netd over a Unix socket (/dev/socket/fwmarkd), which this flag
+         * refuses, and the filter is what is tested here.
+         */
         int server = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         EXPECT(server >= 0, "inet: socket(AF_INET, SOCK_STREAM)");
         struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
@@ -606,14 +612,26 @@ static int inet_check(void) {
         EXPECT(server >= 0 && listen(server, 1) == 0, "inet: listen");
         EXPECT(server >= 0 && getsockname(server, (struct sockaddr *) &address, &length) == 0, "inet: getsockname");
         int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        EXPECT(client >= 0 && connect(client, (struct sockaddr *) &address, sizeof(address)) == 0, "inet: connect");
-        int accepted = server >= 0 ? accept(server, NULL, NULL) : -1;
+        int connected = client >= 0 && syscall(__NR_connect, client, &address, sizeof(address)) == 0;
+        EXPECT(connected, "inet: connect");
+        /* Only with a connection waiting, so a failed connect cannot leave accept blocked. */
+        int accepted = connected ? (int) syscall(__NR_accept4, server, NULL, NULL, SOCK_CLOEXEC) : -1;
         EXPECT(accepted >= 0, "inet: accept");
         char byte = 0;
-        EXPECT(client >= 0 && write(client, "x", 1) == 1 && accepted >= 0 && read(accepted, &byte, 1) == 1 && byte == 'x',
+        EXPECT(accepted >= 0 && write(client, "x", 1) == 1 && read(accepted, &byte, 1) == 1 && byte == 'x',
                "inet: bytes cross the loopback connection");
         if (accepted >= 0) close(accepted);
         if (client >= 0) close(client);
+#ifdef __ANDROID__
+        /* A measurement, not a gate: what C code that uses bionic's connect gets under this flag. */
+        int through_libc = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (through_libc >= 0) {
+            errno = 0;
+            int r = connect(through_libc, (struct sockaddr *) &address, sizeof(address));
+            printf("info inet: bionic connect %s (%s)\n", r == 0 ? "succeeded" : "failed", r == 0 ? "-" : strerror(errno));
+            close(through_libc);
+        }
+#endif
         if (server >= 0) close(server);
         int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         EXPECT(udp >= 0, "inet: socket(AF_INET, SOCK_DGRAM)");

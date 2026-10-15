@@ -65,6 +65,8 @@ extern "C" {
  * address bind is given, so this flag cannot be combined with
  * SBX_LOCK_LOG_SOCKET (sbx_lockdown answers -EINVAL), whose Unix socket
  * could otherwise bind a name in the file system or the abstract namespace.
+ * On Android, bionic's connect and accept also talk to netd over a Unix
+ * socket and so fail here; code that calls the kernel itself (Go) does not.
  */
 #define SBX_LOCK_INET 0x8u
 

@@ -125,6 +125,13 @@ socket could bind a name in the file system or the abstract namespace, and
 `sbx_lockdown` answers `-EINVAL`. The kernel's own network checks (an
 Android app's `inet` group) still apply underneath.
 
+On Android, bionic's `connect` and `accept` report each inet socket to
+netd over a Unix stream socket (`/dev/socket/fwmarkd`), which this flag
+refuses, so they fail there; the test measures this (an `info` line on the
+emulator). Code that makes the calls itself, as Go does, is unaffected. C
+code in such a process needs another answer from its host before it can
+use bionic's calls.
+
 The confined process cannot change directory for real (it may not be able
 to open what it enters). So the handler keeps the current directory as a
 descriptor the broker gave it, sends it with each relative request, and
