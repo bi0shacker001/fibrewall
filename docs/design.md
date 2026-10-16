@@ -84,23 +84,36 @@ So, within one app, a confined process can be given:
    may not use a socket it was given; a byte relay for those versions is
    planned. A UDP `sendto` names its destination in memory the broker
    never sees, so `SBX_NET_CONNECT` covers every datagram destination.
-2. **Drawing without the GPU**: the confined process renders on the CPU into
+2. **Drawing without the GPU**: the isolated process renders on the CPU into
    shared memory the host passes (`ashmem`/`memfd`, or an `AHardwareBuffer`
    allocated by the host), and the host composites it. Hardware GPU work
-   inside a confined process is impossible on Android; it would need a GPU
-   process under the host's UID running a restricted command stream, as
-   Chromium does, which is outside this library's scope today.
+   inside an isolated process is impossible on Android. A confined process
+   that keeps its app's own SELinux domain keeps the GPU through
+   `own_opens` (it opens the device itself before the lockdown and the
+   filter then collapses the rest), as windowcast and Enginehost do; that
+   mechanism cannot reach `gpu_device` from `isolated_app`. droidtop's
+   owner decided, for its plugins (2026-10-16, verbatim): "Plugins
+   shouldn't be drawing stuff themselves anyway", so an isolated plugin
+   draws on the CPU, or not at all.
 3. **A binder relay** (planned, `sbx_relay`): to use a system service as the
    host's identity, the confined process gets a binder whose every
    transaction a relay in the host's process checks and forwards to the
-   real service. The relay holds an allowlist per service and transaction
-   code; anything that could name a component of the host's own package
-   (starting, binding or querying its services, receivers, activities and
-   providers) is refused. The service sees the host's UID, with the host's
-   permissions. A host uses this only for code it trusts with its
-   permissions; it is how a Shizuku binder obtained by the host can be used
-   from a confined process, since Shizuku authorizes by the caller's UID and
-   package and an isolated UID can never be granted.
+   real service. The relay is allowlist-only: the host names each service
+   and, within it, each transaction code it forwards (and may inspect the
+   arguments); there is no pass-through mode, and a transaction not listed
+   is refused. Anything that could name a component of the host's own
+   package (starting, binding or querying its services, receivers,
+   activities and providers) is refused whatever the list says. The
+   service sees the host's UID, with the host's permissions, for exactly
+   the listed calls. It is how a Shizuku binder obtained by the host can be
+   used from a confined process, since Shizuku authorizes by the caller's
+   UID and package and an isolated UID can never be granted. droidtop's
+   owner decided (2026-10-16, verbatim): "every plugin is isolated,
+   regardless of access. We have to assume that plugins are untrusted
+   third party code from our perspective, so full access does NOT mean
+   they get to fuck with stuff not prescribed by the API"; so droidtop
+   runs every plugin isolated and gives full access only this relay, with
+   the list its declared API points prescribe.
 
 What cannot be had at all, by any means inside one app: a confined process
 with an identity of its own that holds Android permissions or a Shizuku
