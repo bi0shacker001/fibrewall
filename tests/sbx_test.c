@@ -1024,14 +1024,16 @@ static void net_granted(const char *resolver) {
     EXPECT(named >= 0 && listen(named, 1) < 0 && errno == EACCES, "net: a Unix listen refused (no abstract name)");
     if (named >= 0) close(named);
 
-    int resolver_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un target;
-    unix_at(&target, resolver);
-    EXPECT(resolver_client >= 0 && connect(resolver_client, (struct sockaddr *) &target, sizeof(target)) == 0,
-           "net: the resolver's socket, connected by the broker");
-    EXPECT(resolver_client >= 0 && (fcntl(resolver_client, F_GETFD) & FD_CLOEXEC), "net: the resolver's socket keeps close-on-exec");
-    EXPECT(resolver_client >= 0 && write(resolver_client, "q", 1) == 1, "net: the resolver's socket carries bytes");
-    if (resolver_client >= 0) close(resolver_client);
+    if (resolver[0]) {
+        int resolver_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        unix_at(&target, resolver);
+        EXPECT(resolver_client >= 0 && connect(resolver_client, (struct sockaddr *) &target, sizeof(target)) == 0,
+               "net: the resolver's socket, connected by the broker");
+        EXPECT(resolver_client >= 0 && (fcntl(resolver_client, F_GETFD) & FD_CLOEXEC), "net: the resolver's socket keeps close-on-exec");
+        EXPECT(resolver_client >= 0 && write(resolver_client, "q", 1) == 1, "net: the resolver's socket carries bytes");
+        if (resolver_client >= 0) close(resolver_client);
+    }
 
     int elsewhere = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     char none[400];
@@ -1048,6 +1050,7 @@ static void net_granted(const char *resolver) {
 static void net_refused(const char *resolver) {
     errno = 0;
     EXPECT(a_inet() == EACCES, "net, no grant: socket(AF_INET) refused by the broker");
+    if (!resolver[0]) return;
     int resolver_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un target;
     unix_at(&target, resolver);
@@ -1063,14 +1066,20 @@ static int net_check(unsigned grants) {
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un at;
     unix_at(&at, resolver);
-    if (listener < 0 || bind(listener, (struct sockaddr *) &at, sizeof(at)) != 0 || listen(listener, 8) != 0) return 1;
+    if (listener < 0 || bind(listener, (struct sockaddr *) &at, sizeof(at)) != 0 || listen(listener, 8) != 0) {
+        /* Android's shell may not make a socket file under /data/local/tmp: the system-socket checks are skipped, the rest run. */
+        printf("info net: no stand-in resolver socket here (%s); its checks are skipped\n", strerror(errno));
+        if (listener >= 0) close(listener);
+        listener = -1;
+        resolver[0] = '\0';
+    }
     int pair[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { printf("FAIL net: socketpair (%s)\n", strerror(errno)); return 1; }
     struct sbx_policy *policy = sbx_policy_new();
     sbx_policy_set_net(policy, grants);
-    sbx_policy_add_system_socket(policy, resolver, SBX_NET_RESOLVE);
+    if (resolver[0]) sbx_policy_add_system_socket(policy, resolver, SBX_NET_RESOLVE);
     sbx_policy_set_decider(policy, net_decider, NULL);
-    if (sbx_broker_prepare(pair[0]) != 0) return 1;
+    if (sbx_broker_prepare(pair[0]) != 0) { printf("FAIL net: broker prepare\n"); return 1; }
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -1094,8 +1103,10 @@ static int net_check(unsigned grants) {
     sbx_broker_serve(policy, pair[0]);
     int status = 0;
     waitpid(child, &status, 0);
-    close(listener);
-    unlink(resolver);
+    if (listener >= 0) {
+        close(listener);
+        unlink(resolver);
+    }
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
