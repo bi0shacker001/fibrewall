@@ -33,6 +33,70 @@ pointer names, so it cannot tell one path from another. Paths therefore go
 to a **broker** in another process, as in Chromium's
 `sandbox/linux/syscall_broker`.
 
+## A UID of its own for every confined process (design, 2026-10-16)
+
+Code running under the host's own UID is not confined from the host: Android
+lets it reach every component of the host's package, exported or not, and
+every permission the host holds, whatever the host checks, and binder
+cannot be filtered by seccomp. So the library confines every process under
+an **isolated UID** (`android:isolatedProcess`, `bindIsolatedService` from
+API 29, UIDs 90000-99999, SELinux domain `isolated_app`), and the host grants
+what the code may do through the broker, never by sharing its UID. What the
+platform allows an isolated process, from AOSP (sepolicy and frameworks as
+of Android 8.0 to 15; read from LineageOS's byte-identical mirrors, branch
+`lineage-15.1` = 8.1 to `lineage-22.2` = 15):
+
+| Capability | Isolated UID | Source |
+| --- | --- | --- |
+| Create an INET socket | **no**, any version | `private/isolated_app_all.te` (8 to 13: `isolated_app.te`): `neverallow isolated_app_all { self ... untrusted_app_all }:{ socket tcp_socket udp_socket ... } create`; `ProcessList` gives an isolated process no gids, so no `inet` (3003) |
+| Use a TCP or UDP socket the host created and passed (SCM_RIGHTS): read, write, connect, bind, options | **API 30+**; never `ioctl` | `private/isolated_app.te` from Android 11: `allow isolated_app { ephemeral_app priv_app untrusted_app_all }:{ tcp_socket udp_socket } { rw_socket_perms_no_ioctl }`; port checks use the socket's own (host) label |
+| `listen` / `accept` on a passed socket | **no** | not in `rw_socket_perms_no_ioctl`; `selinux_socket_accept` checks the caller |
+| The GPU (EGL, Vulkan on a hardware driver) | **no**, 8 to 15 | `neverallow { isolated_app_all -isolated_compute_app } gpu_device:chr_file ...`; `isolated_compute_app` is assigned by the system only to its own services (`ActiveServices.generateAdditionalSeInfoFromService`) |
+| Service manager lookups | `activity`, `display`, `webviewupdate` only | sepolicy neverallow on `service_manager find`; `ServiceManager.cpp`: `!service->allowIsolated && is_multiuser_uid_isolated` |
+| Call a system binder the host hands over | the call is made, as the **isolated** UID: permission, AppOps and calling-package checks fail | `ActivityManager.checkComponentPermission`: "Isolated processes don't get any permissions"; `enforceNotIsolatedCaller` |
+| Read and write a file descriptor the host opened | **yes** (no open, no execute, no ioctl; no `map` on 8.1) | `isolated_app_all.te`: `allow isolated_app_all { app_data_file ... }:file { append read write getattr lock map }` |
+| Hold an Android permission, or a Shizuku grant | **never** | isolated UIDs have no package; Shizuku's `attachApplication` requires `getPackagesForUid(callingUid)` to contain the caller's package |
+
+Two other mechanisms were weighed and set aside. An **app zygote**
+(`useAppZygote`, API 29) gives isolated children the same `isolated_app`
+domain (faster starts, nothing more). The **SDK Runtime** has its own UID
+with network and GPU, but loads only declared SDK packages, never arbitrary
+code, and is being retired. A second APK has its own UID and permissions
+but is not a library feature (and was declined by droidtop's owner).
+
+So, within one app, a confined process can be given:
+
+1. **Sockets** (`SBX_SOCKET`, planned): the broker creates the socket under
+   the host's UID, checks the grant (address family, outbound destinations,
+   a listening port), connects it or accepts on it, and hands the connected
+   descriptor back (API 30+). The confined side never listens: an accepted
+   connection arrives as a new descriptor on the broker socket. DNS is the
+   broker's (`SBX_RESOLVE`). Below API 30 the descriptor is a Unix stream
+   pair whose far end the broker splices to the network socket. Traffic is
+   the host's UID's, so Android's per-app network rules see the host.
+2. **Drawing without the GPU**: the confined process renders on the CPU into
+   shared memory the host passes (`ashmem`/`memfd`, or an `AHardwareBuffer`
+   allocated by the host), and the host composites it. Hardware GPU work
+   inside a confined process is impossible on Android; it would need a GPU
+   process under the host's UID running a restricted command stream, as
+   Chromium does, which is outside this library's scope today.
+3. **A binder relay** (planned, `sbx_relay`): to use a system service as the
+   host's identity, the confined process gets a binder whose every
+   transaction a relay in the host's process checks and forwards to the
+   real service. The relay holds an allowlist per service and transaction
+   code; anything that could name a component of the host's own package
+   (starting, binding or querying its services, receivers, activities and
+   providers) is refused. The service sees the host's UID, with the host's
+   permissions. A host uses this only for code it trusts with its
+   permissions; it is how a Shizuku binder obtained by the host can be used
+   from a confined process, since Shizuku authorizes by the caller's UID and
+   package and an isolated UID can never be granted.
+
+What cannot be had at all, by any means inside one app: a confined process
+with an identity of its own that holds Android permissions or a Shizuku
+grant. Such code either uses the relay (the host's identity, filtered) or
+runs under the host's UID (not confined from the host).
+
 ## The confined side (`src/lockdown.c`)
 
 `sbx_lockdown(broker_fd, flags)` does three things:
@@ -270,7 +334,11 @@ adb shell 'cd /data/local/tmp && chmod 755 sbx_test-arm64-v8a gpu_probe-arm64-v8
 - **The `native` launcher.** It sets up descriptors, limits, code loaded
   from memfd, GPU driver warm-up and shared frame buffers, then locks down
   and runs an engine. It has no ART and no binder.
-- **A broker `connect` grant**, which hands back a connected socket.
+- **A broker `connect` grant**, which hands back a connected socket
+  (`SBX_SOCKET`, with `SBX_RESOLVE` and accepted connections, as designed in
+  "A UID of its own for every confined process").
+- **A binder relay** (`sbx_relay`) with a per-service, per-transaction
+  allowlist, from the same section.
 - **An Android AAR** with a Kotlin API over the same C core.
 - **Desktop-only hardening**: Landlock and namespaces, under the same
   broker.
