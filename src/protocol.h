@@ -45,6 +45,21 @@ enum sbx_op {
     SBX_CHMOD = 12,    /* mode = the new mode (the broker keeps 0777 of it) */
     SBX_UTIMENS = 13,  /* flags = AT_SYMLINK_NOFOLLOW or 0; path2 = two struct timespec (atime, mtime), or
                           empty for "now" */
+    /*
+     * Sockets (SBX_LOCK_NET_BROKERED). The body ("path") is binary here, never a name: an int, or a socket
+     * address. The socket a call is about travels as the first descriptor after the answer socket
+     * (dirfd_sent = 1); the broker acts on that same open file description.
+     */
+    SBX_SOCKET = 14,   /* flags = domain, mode = type (with SOCK_NONBLOCK); body = int protocol; the reply
+                          carries the new socket */
+    SBX_CONNECT = 15,  /* body = the address. An inet socket is connected by the broker (result 0 or -errno,
+                          -EINPROGRESS for a non-blocking one). A Unix path is answered with a new socket the
+                          broker connected when it is a system socket the process may have (the caller puts it
+                          in place of its own), else -ENOSYS: the caller connects it itself */
+    SBX_BIND = 16,     /* body = the address */
+    SBX_LISTEN = 17,   /* body = int backlog */
+    SBX_ACCEPT = 18,   /* body = int accept4 flags; the reply carries the connection, data = the peer's
+                          address, result = its length */
 };
 
 struct sbx_request {

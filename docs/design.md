@@ -66,14 +66,24 @@ but is not a library feature (and was declined by droidtop's owner).
 
 So, within one app, a confined process can be given:
 
-1. **Sockets** (`SBX_SOCKET`, planned): the broker creates the socket under
-   the host's UID, checks the grant (address family, outbound destinations,
-   a listening port), connects it or accepts on it, and hands the connected
-   descriptor back (API 30+). The confined side never listens: an accepted
-   connection arrives as a new descriptor on the broker socket. DNS is the
-   broker's (`SBX_RESOLVE`). Below API 30 the descriptor is a Unix stream
-   pair whose far end the broker splices to the network socket. Traffic is
-   the host's UID's, so Android's per-app network rules see the host.
+1. **Sockets** (`SBX_LOCK_NET_BROKERED`, built): `socket(AF_INET or
+   AF_INET6)` traps and the broker creates the socket under the host's UID
+   and hands it over (`SBX_SOCKET`); `connect`, `bind`, `listen` and
+   `accept` on it trap and the broker does them on the same socket
+   (`SBX_CONNECT`, `SBX_BIND`, `SBX_LISTEN`, `SBX_ACCEPT`) after the grants
+   (`sbx_policy_set_net`: `SBX_NET_CONNECT`, `SBX_NET_LISTEN`,
+   `SBX_NET_RESOLVE`) and the decider, which sees the address in words. A
+   blocking connect or accept waits on a broker thread of its own. Reads
+   and writes are the process's own. Unix sockets stay the process's, but
+   may not be bound or listened on; a connect to a system socket the host
+   named (`sbx_policy_add_system_socket`: Android's `dnsproxyd` for name
+   lookups, `fwmarkd`, which bionic's `connect` and `accept` report each
+   socket to) is the broker's, and the caller's socket is replaced by the
+   one the broker connected. Traffic is the host's UID's, so Android's
+   per-app network rules see the host. Below API 30 an isolated process
+   may not use a socket it was given; a byte relay for those versions is
+   planned. A UDP `sendto` names its destination in memory the broker
+   never sees, so `SBX_NET_CONNECT` covers every datagram destination.
 2. **Drawing without the GPU**: the confined process renders on the CPU into
    shared memory the host passes (`ashmem`/`memfd`, or an `AHardwareBuffer`
    allocated by the host), and the host composites it. Hardware GPU work
@@ -334,9 +344,9 @@ adb shell 'cd /data/local/tmp && chmod 755 sbx_test-arm64-v8a gpu_probe-arm64-v8
 - **The `native` launcher.** It sets up descriptors, limits, code loaded
   from memfd, GPU driver warm-up and shared frame buffers, then locks down
   and runs an engine. It has no ART and no binder.
-- **A broker `connect` grant**, which hands back a connected socket
-  (`SBX_SOCKET`, with `SBX_RESOLVE` and accepted connections, as designed in
-  "A UID of its own for every confined process").
+- **A byte relay for sockets below API 30**, where an isolated process may
+  not use a socket it was given (the rest of `SBX_LOCK_NET_BROKERED` is
+  built).
 - **A binder relay** (`sbx_relay`) with a per-service, per-transaction
   allowlist, from the same section.
 - **An Android AAR** with a Kotlin API over the same C core.

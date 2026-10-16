@@ -43,6 +43,7 @@
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -921,6 +922,183 @@ static int list_check(void) {
     return failures ? 1 : 0;
 }
 
+/* ---- The network through the broker (SBX_LOCK_NET_BROKERED). ---- */
+
+/* A Unix socket address for path (cut to fit; the test's paths are short). */
+static void unix_at(struct sockaddr_un *address, const char *path) {
+    memset(address, 0, sizeof(*address));
+    address->sun_family = AF_UNIX;
+    size_t n = strlen(path);
+    if (n >= sizeof(address->sun_path)) n = sizeof(address->sun_path) - 1;
+    memcpy(address->sun_path, path, n);
+}
+
+static int net_decider(void *context, const struct sbx_access *access) {
+    (void) context;
+    /* The host's own word on one destination: port 9 is refused even with SBX_NET_CONNECT. */
+    size_t n = strlen(access->asked);
+    if (strcmp(access->op, "connect") == 0 && n > 2 && strcmp(access->asked + n - 2, ":9") == 0) return -EACCES;
+    return SBX_KEEP;
+}
+
+static void *net_accept_thread(void *argument) {
+    int server = *(int *) argument;
+    struct sockaddr_in peer;
+    socklen_t length = sizeof(peer);
+    long accepted = accept4(server, (struct sockaddr *) &peer, &length, SOCK_CLOEXEC);
+    return (void *) accepted;
+}
+
+static void net_granted(const char *resolver) {
+    errno = 0;
+    EXPECT(a_netlink() == EACCES, "net: socket(AF_NETLINK) refused");
+    int pair[2];
+    EXPECT(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0, "net: a socketpair of the process's own");
+    int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    EXPECT(udp >= 0, "net: socket(AF_INET, SOCK_DGRAM) from the broker");
+    if (udp >= 0) close(udp);
+    errno = 0;
+    /* A machine without IPv6 answers EAFNOSUPPORT from the broker's own socket(); the grant is what is tested. */
+    EXPECT(a_inet6() != EACCES, "net: socket(AF_INET6) not refused");
+
+    int server = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    EXPECT(server >= 0 && (fcntl(server, F_GETFD) & FD_CLOEXEC), "net: socket(AF_INET, SOCK_STREAM) from the broker, close-on-exec kept");
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t length = sizeof(address);
+    EXPECT(bind(server, (struct sockaddr *) &address, sizeof(address)) == 0, "net: bind a port of the system's choosing");
+    EXPECT(listen(server, 4) == 0, "net: listen, by the broker");
+    EXPECT(getsockname(server, (struct sockaddr *) &address, &length) == 0 && address.sin_port != 0, "net: getsockname");
+
+    /* A blocking accept waits in the broker on a thread of its own: the connect below still gets through. */
+    pthread_t waiter;
+    pthread_create(&waiter, NULL, net_accept_thread, &server);
+    usleep(100 * 1000);
+    int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    EXPECT(client >= 0 && connect(client, (struct sockaddr *) &address, sizeof(address)) == 0,
+           "net: connect while an accept waits in the broker");
+    void *accepted_value = NULL;
+    pthread_join(waiter, &accepted_value);
+    int accepted = (int) (long) accepted_value;
+    EXPECT(accepted >= 0, "net: accept, by the broker");
+    char byte = 0;
+    EXPECT(accepted >= 0 && write(client, "x", 1) == 1 && read(accepted, &byte, 1) == 1 && byte == 'x',
+           "net: bytes cross the connection, in the process itself");
+    if (accepted >= 0) close(accepted);
+    if (client >= 0) close(client);
+
+    struct sockaddr_in peer;
+    socklen_t peer_length = sizeof(peer);
+    int nonblocking = fcntl(server, F_GETFL);
+    fcntl(server, F_SETFL, nonblocking | O_NONBLOCK);
+    errno = 0;
+    EXPECT(accept4(server, (struct sockaddr *) &peer, &peer_length, 0) < 0 && errno == EAGAIN,
+           "net: a non-blocking accept with nothing waiting answers EAGAIN");
+    int second = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    EXPECT(second >= 0 && connect(second, (struct sockaddr *) &address, sizeof(address)) == 0, "net: a second connect");
+    usleep(50 * 1000);
+    peer_length = sizeof(peer);
+    int third = accept4(server, (struct sockaddr *) &peer, &peer_length, SOCK_CLOEXEC);
+    EXPECT(third >= 0 && peer_length == sizeof(peer) && peer.sin_family == AF_INET &&
+               peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK),
+           "net: accept4 gives the peer's address");
+    if (third >= 0) close(third);
+    if (second >= 0) close(second);
+
+    struct sockaddr_in discard = address;
+    discard.sin_port = htons(9);
+    int refused_socket = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    errno = 0;
+    EXPECT(refused_socket >= 0 && connect(refused_socket, (struct sockaddr *) &discard, sizeof(discard)) < 0 && errno == EACCES,
+           "net: the decider refuses one destination");
+    if (refused_socket >= 0) close(refused_socket);
+    close(server);
+
+    int named = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un local;
+    char mine[400];
+    snprintf(mine, sizeof(mine), "%s/mine.sock", root);
+    unix_at(&local, mine);
+    errno = 0;
+    EXPECT(named >= 0 && bind(named, (struct sockaddr *) &local, sizeof(local)) < 0 && errno == EACCES, "net: a Unix bind refused");
+    errno = 0;
+    EXPECT(named >= 0 && listen(named, 1) < 0 && errno == EACCES, "net: a Unix listen refused (no abstract name)");
+    if (named >= 0) close(named);
+
+    int resolver_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un target;
+    unix_at(&target, resolver);
+    EXPECT(resolver_client >= 0 && connect(resolver_client, (struct sockaddr *) &target, sizeof(target)) == 0,
+           "net: the resolver's socket, connected by the broker");
+    EXPECT(resolver_client >= 0 && (fcntl(resolver_client, F_GETFD) & FD_CLOEXEC), "net: the resolver's socket keeps close-on-exec");
+    EXPECT(resolver_client >= 0 && write(resolver_client, "q", 1) == 1, "net: the resolver's socket carries bytes");
+    if (resolver_client >= 0) close(resolver_client);
+
+    int elsewhere = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    char none[400];
+    snprintf(none, sizeof(none), "%s/none.sock", root);
+    unix_at(&target, none);
+    errno = 0;
+    EXPECT(elsewhere >= 0 && connect(elsewhere, (struct sockaddr *) &target, sizeof(target)) < 0 && errno == ENOENT,
+           "net: any other Unix connect is the kernel's");
+    if (elsewhere >= 0) close(elsewhere);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+static void net_refused(const char *resolver) {
+    errno = 0;
+    EXPECT(a_inet() == EACCES, "net, no grant: socket(AF_INET) refused by the broker");
+    int resolver_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un target;
+    unix_at(&target, resolver);
+    errno = 0;
+    EXPECT(resolver_client >= 0 && connect(resolver_client, (struct sockaddr *) &target, sizeof(target)) < 0 && errno == EACCES,
+           "net, no grant: the resolver refused");
+    if (resolver_client >= 0) close(resolver_client);
+}
+
+static int net_check(unsigned grants) {
+    char resolver[400];
+    snprintf(resolver, sizeof(resolver), "%s/resolver-%u.sock", root, grants);
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un at;
+    unix_at(&at, resolver);
+    if (listener < 0 || bind(listener, (struct sockaddr *) &at, sizeof(at)) != 0 || listen(listener, 8) != 0) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_set_net(policy, grants);
+    sbx_policy_add_system_socket(policy, resolver, SBX_NET_RESOLVE);
+    sbx_policy_set_decider(policy, net_decider, NULL);
+    if (sbx_broker_prepare(pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(30);
+        close(pair[0]);
+        struct sbx_lockdown_options bad = {.flags = SBX_LOCK_NET_BROKERED | SBX_LOCK_INET};
+        EXPECT(sbx_lockdown(pair[1], &bad) == -EINVAL, "net: not with SBX_LOCK_INET");
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_NET_BROKERED | SBX_LOCK_UNBROKERED};
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "net: not without a broker");
+        options.flags = SBX_LOCK_NET_BROKERED | SBX_LOCK_PASSTHROUGH;
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "net: lockdown");
+        if (locked == 0) {
+            if (grants) net_granted(resolver);
+            else net_refused(resolver);
+        }
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    sbx_broker_serve(policy, pair[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    close(listener);
+    unlink(resolver);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -1044,7 +1222,8 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check();
+    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

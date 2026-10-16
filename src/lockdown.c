@@ -44,6 +44,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -310,44 +311,28 @@ static void free_claims(void) {
 
 static int current_directory(void) { return __atomic_load_n(&cwd, __ATOMIC_ACQUIRE); }
 
-static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const char *path2,
-                    int flags, uint32_t mode, void *out, size_t out_len) {
-    if (path == NULL || (op == SBX_RENAME && path2 == NULL)) return -EFAULT;
-    size_t length = strnlen(path, SBX_PATH_MAX);
-    /* A rename's second name; a utimensat's two times travel in the same place, as bytes. */
-    size_t length2 = op == SBX_RENAME ? strnlen(path2, SBX_PATH_MAX)
-                   : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec) : 0;
-    if (length == SBX_PATH_MAX || length2 == SBX_PATH_MAX) return -ENAMETOOLONG;
-    if (length == 0 || (op == SBX_RENAME && length2 == 0)) return -ENOENT;
-
-    struct sbx_request request;
-    memset(&request, 0, sizeof(request));
-    request.version = SBX_PROTOCOL_VERSION;
-    request.op = (uint16_t) op;
-    request.flags = flags;
-    request.mode = mode;
-    request.path_len = (uint32_t) length;
-    request.path2_len = (uint32_t) length2;
-    request.tid = (int32_t) syscall(__NR_gettid);
-
+/*
+ * One request and its reply. extra are the descriptors after the answer
+ * socket (the directories, or the socket a network call is about); body
+ * and body2 are the request's bytes. The reply's data goes to out, and a
+ * descriptor it carries to *passed (else -1), received close-on-exec
+ * unless keep_open. Returns the reply's result, or -EIO when the broker is
+ * gone (-EBADF for a bad descriptor of the caller's).
+ */
+static long exchange(struct sbx_request *request, const int *extra, int extra_count, const void *body, size_t body_len,
+                     const void *body2, size_t body2_len, void *out, size_t out_len, int keep_open, int *passed) {
+    *passed = -1;
     int answer[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, answer) != 0) return -errno;
     int fds[3];
     int count = 0;
     fds[count++] = answer[1];
-    if (path[0] != '/') {
-        fds[count++] = dirfd == AT_FDCWD ? current_directory() : dirfd;
-        request.dirfd_sent = 1;
-    }
-    if (op == SBX_RENAME && path2[0] != '/') {
-        fds[count++] = dirfd2 == AT_FDCWD ? current_directory() : dirfd2;
-        request.dirfd2_sent = 1;
-    }
+    for (int i = 0; i < extra_count && count < 3; i++) fds[count++] = extra[i];
 
     struct iovec parts[3] = {
-        {&request, sizeof(request)},
-        {(void *) path, length},
-        {(void *) path2, length2},
+        {request, sizeof(*request)},
+        {(void *) body, body_len},
+        {(void *) body2, body2_len},
     };
     union {
         char buffer[CMSG_SPACE(sizeof(int) * 3)];
@@ -357,7 +342,7 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
     struct msghdr message;
     memset(&message, 0, sizeof(message));
     message.msg_iov = parts;
-    message.msg_iovlen = length2 ? 3 : 2;
+    message.msg_iovlen = body2_len ? 3 : 2;
     message.msg_control = control.buffer;
     message.msg_controllen = CMSG_SPACE(sizeof(int) * count);
     struct cmsghdr *header = CMSG_FIRSTHDR(&message);
@@ -391,25 +376,62 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
     answer_message.msg_iovlen = out_len ? 2 : 1;
     answer_message.msg_control = back_control.buffer;
     answer_message.msg_controllen = sizeof(back_control.buffer);
-    int keep_open = op == SBX_OPEN && !(flags & O_CLOEXEC);
     ssize_t received;
     do received = recvmsg(answer[0], &answer_message, keep_open ? 0 : MSG_CMSG_CLOEXEC);
     while (received < 0 && errno == EINTR);
     close(answer[0]);
-    if (received < (ssize_t) sizeof(reply)) return -EIO;
-
-    int passed = -1;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&answer_message); c; c = CMSG_NXTHDR(&answer_message, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len >= CMSG_LEN(sizeof(int))) {
-            memcpy(&passed, CMSG_DATA(c), sizeof(int));
+            memcpy(passed, CMSG_DATA(c), sizeof(int));
         }
     }
-    if ((op == SBX_OPEN || op == SBX_CHDIR) && reply.result >= 0) {
+    if (received < (ssize_t) sizeof(reply)) {
+        if (*passed >= 0) close(*passed);
+        *passed = -1;
+        return -EIO;
+    }
+    return (long) reply.result;
+}
+
+static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const char *path2,
+                    int flags, uint32_t mode, void *out, size_t out_len) {
+    if (path == NULL || (op == SBX_RENAME && path2 == NULL)) return -EFAULT;
+    size_t length = strnlen(path, SBX_PATH_MAX);
+    /* A rename's second name; a utimensat's two times travel in the same place, as bytes. */
+    size_t length2 = op == SBX_RENAME ? strnlen(path2, SBX_PATH_MAX)
+                   : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec) : 0;
+    if (length == SBX_PATH_MAX || length2 == SBX_PATH_MAX) return -ENAMETOOLONG;
+    if (length == 0 || (op == SBX_RENAME && length2 == 0)) return -ENOENT;
+
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = (uint16_t) op;
+    request.flags = flags;
+    request.mode = mode;
+    request.path_len = (uint32_t) length;
+    request.path2_len = (uint32_t) length2;
+    request.tid = (int32_t) syscall(__NR_gettid);
+
+    int extra[2];
+    int count = 0;
+    if (path[0] != '/') {
+        extra[count++] = dirfd == AT_FDCWD ? current_directory() : dirfd;
+        request.dirfd_sent = 1;
+    }
+    if (op == SBX_RENAME && path2[0] != '/') {
+        extra[count++] = dirfd2 == AT_FDCWD ? current_directory() : dirfd2;
+        request.dirfd2_sent = 1;
+    }
+    int passed;
+    long result = exchange(&request, extra, count, path, length, path2, length2, out, out_len,
+                           op == SBX_OPEN && !(flags & O_CLOEXEC), &passed);
+    if ((op == SBX_OPEN || op == SBX_CHDIR) && result >= 0) {
         if (passed < 0) return -EIO;
         return passed;
     }
     if (passed >= 0) close(passed);
-    return (long) reply.result;
+    return result;
 }
 
 /* Makes directory the current one, taking it; closes the one it replaces. */
@@ -630,6 +652,122 @@ static long list_directory(int fd, void *out, unsigned count) {
     return forward(SBX_LIST, fd, ".", 0, NULL, 0, (uint32_t) asked, out, asked);
 }
 
+/*
+ * Sockets, with SBX_LOCK_NET_BROKERED: an inet socket is created, connected,
+ * bound, listened on and accepted from by the broker, under its own
+ * identity (an Android isolated process may create none and may not listen
+ * or accept on one it was given). The handler's own calls to the kernel
+ * carry NET_MARK in the upper half of a 32-bit argument the kernel ignores
+ * (connect's address length, accept4's flags), which the filter lets
+ * through.
+ */
+#define NET_MARK 0x5b3u
+
+static int socket_domain(int fd) {
+    int domain = 0;
+    socklen_t length = sizeof(domain);
+    return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) == 0 ? domain : -errno;
+}
+
+static long net_forward(uint32_t op, int subject, const void *body, size_t body_len, int flags, uint32_t mode,
+                        void *out, size_t out_len, int keep_open, int *passed) {
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = (uint16_t) op;
+    request.flags = flags;
+    request.mode = mode;
+    request.path_len = (uint32_t) body_len;
+    request.tid = (int32_t) syscall(__NR_gettid);
+    request.dirfd_sent = subject >= 0;
+    return exchange(&request, &subject, subject >= 0 ? 1 : 0, body, body_len, NULL, 0, out, out_len, keep_open, passed);
+}
+
+static long net_socket(int domain, int type, int protocol) {
+    int passed;
+    long result = net_forward(SBX_SOCKET, -1, &protocol, sizeof(protocol), domain, (uint32_t) type, NULL, 0,
+                              !(type & SOCK_CLOEXEC), &passed);
+    if (result < 0) {
+        if (passed >= 0) close(passed);
+        return result;
+    }
+    return passed >= 0 ? passed : -EIO;
+}
+
+static long net_connect(int fd, const struct sockaddr *address, socklen_t length) {
+    if (address == NULL) return -EFAULT;
+    if ((int) length <= 0 || length > sizeof(struct sockaddr_storage)) return -EINVAL;
+    int domain = socket_domain(fd);
+    if (domain < 0) return domain;
+    if (domain == AF_UNIX) {
+        const struct sockaddr_un *un = (const struct sockaddr_un *) address;
+        int named = length > offsetof(struct sockaddr_un, sun_path) && un->sun_path[0] != '\0';
+        if (named) {
+            /* A system socket the host named is connected by the broker; the caller's socket becomes that one. */
+            int passed;
+            long result = net_forward(SBX_CONNECT, fd, address, length, 0, 0, NULL, 0, 1, &passed);
+            if (result == 0 && passed >= 0) {
+                int close_on_exec = (fcntl(fd, F_GETFD) & FD_CLOEXEC) ? O_CLOEXEC : 0;
+                long placed = dup3(passed, fd, close_on_exec) < 0 ? -errno : 0;
+                close(passed);
+                return placed;
+            }
+            if (passed >= 0) close(passed);
+            if (result != -ENOSYS) return result;
+        }
+        return kernel(syscall(__NR_connect, fd, address, (unsigned long) length | ((unsigned long) NET_MARK << 32)));
+    }
+    int passed;
+    long result = net_forward(SBX_CONNECT, fd, address, length, 0, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
+static long net_bind(int fd, const struct sockaddr *address, socklen_t length) {
+    if (address == NULL) return -EFAULT;
+    if ((int) length <= 0 || length > sizeof(struct sockaddr_storage)) return -EINVAL;
+    int domain = socket_domain(fd);
+    if (domain < 0) return domain;
+    if (domain == AF_UNIX) return -EACCES;  /* no names in the file system or the abstract namespace */
+    int passed;
+    long result = net_forward(SBX_BIND, fd, address, length, 0, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
+static long net_listen(int fd, int backlog) {
+    int domain = socket_domain(fd);
+    if (domain < 0) return domain;
+    if (domain == AF_UNIX) return -EACCES;  /* an unbound Unix socket would take an abstract name */
+    int passed;
+    long result = net_forward(SBX_LISTEN, fd, &backlog, sizeof(backlog), 0, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
+static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int flags) {
+    int domain = socket_domain(fd);
+    if (domain < 0) return domain;
+    if (domain != AF_INET && domain != AF_INET6) {
+        return kernel(syscall(__NR_accept4, fd, address, length, (unsigned long) (unsigned) flags | ((unsigned long) NET_MARK << 32)));
+    }
+    struct sockaddr_storage peer;
+    int passed;
+    long result = net_forward(SBX_ACCEPT, fd, &flags, sizeof(flags), 0, 0, &peer, sizeof(peer), !(flags & SOCK_CLOEXEC), &passed);
+    if (result < 0) {
+        if (passed >= 0) close(passed);
+        return result;
+    }
+    if (passed < 0) return -EIO;
+    if (address != NULL && length != NULL) {
+        socklen_t room = *length;
+        socklen_t have = (socklen_t) result;
+        memcpy(address, &peer, room < have ? room : have);
+        *length = have;
+    }
+    return passed;
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
@@ -674,6 +812,20 @@ static long dispatch(long nr, ucontext_t *uc) {
         return utimens_path((int) a0, (const char *) a1, (const struct timespec *) a2, (int) a3, buffer);
     case __NR_getdents64:
         return list_directory((int) a0, (void *) a1, (unsigned) a2);
+    case __NR_socket:
+        return net_socket((int) a0, (int) a1, (int) a2);
+    case __NR_connect:
+        return net_connect((int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
+    case __NR_bind:
+        return net_bind((int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
+    case __NR_listen:
+        return net_listen((int) a0, (int) a1);
+    case __NR_accept4:
+        return net_accept((int) a0, (struct sockaddr *) a1, (socklen_t *) a2, (int) a3);
+#ifdef __NR_accept
+    case __NR_accept:
+        return net_accept((int) a0, (struct sockaddr *) a1, (socklen_t *) a2, 0);
+#endif
 #ifdef __NR_open
     case __NR_open:
         return open_path(AT_FDCWD, (const char *) a0, (int) a1, (uint32_t) a2, buffer);
@@ -877,8 +1029,36 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
     rule(__NR_clone3, NOSYS);
+    if (flags & SBX_LOCK_NET_BROKERED) {
+        /* Inet sockets are the broker's; Unix ones the process's own. connect and accept4 pass when marked. */
+        jeq(__NR_socket, 0, 7);
+        load(ARG_LO(0));
+        jeq(AF_INET, 3, 0);
+        jeq(AF_INET6, 2, 0);
+        jeq(AF_UNIX, 0, 2);
+        ret(ALLOW);
+        ret(TRAP);
+        ret(REFUSE);
+        jeq(__NR_connect, 0, 4);
+        load(ARG_HI(2));
+        jeq(NET_MARK, 0, 1);
+        ret(ALLOW);
+        ret(TRAP);
+        jeq(__NR_accept4, 0, 4);
+        load(ARG_HI(3));
+        jeq(NET_MARK, 0, 1);
+        ret(ALLOW);
+        ret(TRAP);
+        rule(__NR_bind, TRAP);
+        rule(__NR_listen, TRAP);
+#ifdef __NR_accept
+        rule(__NR_accept, TRAP);
+#endif
+    }
     /* A Unix datagram socket for the system log, or inet sockets, when asked; no other socket. */
-    if (flags & SBX_LOCK_LOG_SOCKET) {
+    if (flags & SBX_LOCK_NET_BROKERED) {
+        /* decided above */
+    } else if (flags & SBX_LOCK_LOG_SOCKET) {
         jeq(__NR_socket, 0, 7);
         load(ARG_LO(0));
         jeq(AF_UNIX, 0, 4);
@@ -953,8 +1133,8 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
     /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
-    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET))) rule(__NR_connect, REFUSE);
-    if (!(flags & SBX_LOCK_INET)) rule(__NR_bind, REFUSE);
+    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_NET_BROKERED))) rule(__NR_connect, REFUSE);
+    if (!(flags & (SBX_LOCK_INET | SBX_LOCK_NET_BROKERED))) rule(__NR_bind, REFUSE);
     static const unsigned denied[] = {
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
@@ -991,6 +1171,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (unbrokered && pass) return -EINVAL;
     if ((options->flags & SBX_LOCK_INET) && (options->flags & SBX_LOCK_LOG_SOCKET)) return -EINVAL;
+    /* The broker's network needs the broker, and replaces the process's own. */
+    if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;
     if (unbrokered) broker_fd = -1;
     else if (broker_fd < 0) return -EBADF;
     if (options->claim_count > SBX_CLAIMS_MAX || (options->claim_count && !options->claims)) return -EINVAL;

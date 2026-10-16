@@ -69,6 +69,23 @@ extern "C" {
  * socket and so fail here; code that calls the kernel itself (Go) does not.
  */
 #define SBX_LOCK_INET 0x8u
+/*
+ * Network through the broker, for a process that may not create an
+ * internet socket itself (an Android isolated process; see docs/design.md,
+ * "A UID of its own for every confined process"). socket(AF_INET or
+ * AF_INET6) asks the broker, which creates the socket under its own
+ * identity and hands it over; connect, bind, listen and accept on such a
+ * socket are done by the broker, on the same socket, after the grants
+ * (sbx_policy_set_net) and the decider; reads, writes and the rest are the
+ * process's own. Unix sockets are allowed, but may not be bound or
+ * listened on, and a connect to a system socket the host named
+ * (sbx_policy_add_system_socket: the resolver, netd's fwmarkd) is the
+ * broker's, so libc's name lookups and connects work. Every other Unix
+ * connect goes to the kernel. Not with SBX_LOCK_INET or
+ * SBX_LOCK_UNBROKERED. A blocking connect or accept waits in the broker on
+ * a thread of its own, so it holds up no other call.
+ */
+#define SBX_LOCK_NET_BROKERED 0x10u
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
@@ -213,7 +230,8 @@ int sbx_policy_alias(struct sbx_policy *policy, const char *virtual_path, const 
 /* One brokered request, as the decider and the audit see it. */
 struct sbx_access {
     const char *op;        /* "open", "stat", "access", "readlink", "mkdir", "unlink", "rename", "statfs", "chdir",
-                              "getcwd", "list", "chmod", "utimens" */
+                              "getcwd", "list", "chmod", "utimens"; with SBX_LOCK_NET_BROKERED also "socket",
+                              "connect", "bind", "listen", "accept" */
     const char *asked;     /* the path as the confined code named it */
     const char *resolved;  /* the real path the broker would act on ("" when it could not be resolved) */
     unsigned need;         /* SBX_READ, SBX_WRITE, or 0 for a lookup (stat, access F_OK, traversal) */
@@ -234,6 +252,37 @@ struct sbx_access {
 #define SBX_KEEP 1
 typedef int (*sbx_decide_fn)(void *context, const struct sbx_access *access);
 void sbx_policy_set_decider(struct sbx_policy *policy, sbx_decide_fn decide, void *context);
+
+/*
+ * What a process locked down with SBX_LOCK_NET_BROKERED may do on the
+ * network: none by default. The decider sees each socket call as an access
+ * whose op is "socket", "connect", "bind", "listen" or "accept", whose
+ * asked and resolved are the address in words ("203.0.113.5:443",
+ * "[2001:db8::1]:80", "*:8384" for any address, a system socket's path), with
+ * rule_verdict what the grants alone answered; it is asked about refusals,
+ * and about every call when SBX_NET_DECIDE is granted. Sockets are TCP and
+ * UDP only. A UDP sendto to an address names it in memory the broker never
+ * sees: SBX_NET_CONNECT covers every destination of a datagram.
+ */
+#define SBX_NET_CONNECT 0x1u  /* outbound: connect TCP and UDP sockets, to any address the decider allows */
+#define SBX_NET_LISTEN 0x2u   /* inbound: bind a port, listen, accept */
+#define SBX_NET_RESOLVE 0x4u  /* the system resolver's Unix socket */
+#define SBX_NET_DECIDE 0x8u   /* ask the decider about every socket call, not only refusals */
+void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants);
+
+/*
+ * A system service's Unix socket that the broker connects for the process,
+ * under the broker's own identity, when the process holds grant (one of
+ * the SBX_NET_* grants above, or 0 for always): on Android
+ * "/dev/socket/dnsproxyd" for SBX_NET_RESOLVE (name lookups) and
+ * "/dev/socket/fwmarkd" for SBX_NET_CONNECT | SBX_NET_LISTEN (bionic's
+ * connect and accept report each inet socket there first, and an isolated
+ * process may not reach it). The service then sees the broker's UID, with
+ * the broker's permissions. At most SBX_SYSTEM_SOCKETS_MAX. Returns 0 or a
+ * negative errno.
+ */
+#define SBX_SYSTEM_SOCKETS_MAX 8
+int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant);
 
 /* Receives every decision with its result (0 or a negative errno). Defaults to logging refusals on stderr. */
 typedef void (*sbx_audit_fn)(void *context, const struct sbx_access *access, int result);

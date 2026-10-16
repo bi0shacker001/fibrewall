@@ -44,7 +44,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -93,6 +96,10 @@ struct sbx_policy {
     void *decide_context;
     sbx_audit_fn audit;
     void *audit_context;
+    unsigned net;  /* SBX_NET_* grants */
+    char *system_paths[SBX_SYSTEM_SOCKETS_MAX];
+    unsigned system_grants[SBX_SYSTEM_SOCKETS_MAX];
+    unsigned system_count;
 };
 
 static void default_audit(void *context, const struct sbx_access *access, int result) {
@@ -115,6 +122,7 @@ void sbx_policy_free(struct sbx_policy *policy) {
         free(policy->aliases[i].virtual_path);
         free(policy->aliases[i].real_path);
     }
+    for (unsigned i = 0; i < policy->system_count; i++) free(policy->system_paths[i]);
     free(policy->rules);
     free(policy->aliases);
     free(policy);
@@ -513,6 +521,11 @@ static const char *op_name(uint32_t op) {
     case SBX_LIST: return "list";
     case SBX_CHMOD: return "chmod";
     case SBX_UTIMENS: return "utimens";
+    case SBX_SOCKET: return "socket";
+    case SBX_CONNECT: return "connect";
+    case SBX_BIND: return "bind";
+    case SBX_LISTEN: return "listen";
+    case SBX_ACCEPT: return "accept";
     default: return "unknown";
     }
 }
@@ -850,10 +863,262 @@ static void list_one(const struct sbx_policy *policy, const struct sbx_request *
     reply(answer, n, records, (uint32_t) n, -1);
 }
 
+/* ---- Sockets (SBX_LOCK_NET_BROKERED; docs/design.md, "A UID of its own for every confined process") ---- */
+
+void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants) {
+    if (policy) policy->net = grants;
+}
+
+int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant) {
+    if (!policy || !path || path[0] != '/') return -EINVAL;
+    if (strlen(path) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) return -ENAMETOOLONG;
+    if (policy->system_count >= SBX_SYSTEM_SOCKETS_MAX) return -ENOSPC;
+    char *copy = strdup(path);
+    if (!copy) return -ENOMEM;
+    policy->system_paths[policy->system_count] = copy;
+    policy->system_grants[policy->system_count] = grant;
+    policy->system_count++;
+    return 0;
+}
+
+/* An address in words for the decider and the audit: "203.0.113.5:443", "[2001:db8::1]:80", "*:8384", a path. */
+static void address_words(const struct sockaddr *address, socklen_t length, char *out, size_t size) {
+    char host[INET6_ADDRSTRLEN] = "?";
+    if (address->sa_family == AF_INET && length >= (socklen_t) sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *) address;
+        if (in->sin_addr.s_addr == htonl(INADDR_ANY)) strcpy(host, "*");
+        else inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
+        snprintf(out, size, "%s:%u", host, (unsigned) ntohs(in->sin_port));
+    } else if (address->sa_family == AF_INET6 && length >= (socklen_t) sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *) address;
+        if (IN6_IS_ADDR_UNSPECIFIED(&in6->sin6_addr)) snprintf(out, size, "*:%u", (unsigned) ntohs(in6->sin6_port));
+        else {
+            inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
+            snprintf(out, size, "[%s]:%u", host, (unsigned) ntohs(in6->sin6_port));
+        }
+    } else if (address->sa_family == AF_UNIX) {
+        const struct sockaddr_un *un = (const struct sockaddr_un *) address;
+        size_t n = length > (socklen_t) offsetof(struct sockaddr_un, sun_path) ? length - offsetof(struct sockaddr_un, sun_path) : 0;
+        snprintf(out, size, "%.*s", (int) strnlen(un->sun_path, n), un->sun_path);
+    } else {
+        snprintf(out, size, "family %u", (unsigned) address->sa_family);
+    }
+}
+
+static unsigned short port_of(const struct sockaddr *address) {
+    if (address->sa_family == AF_INET) return ntohs(((const struct sockaddr_in *) address)->sin_port);
+    if (address->sa_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *) address)->sin6_port);
+    return 0;
+}
+
+/* The grants' verdict, then the decider's (on a refusal, or on every call with SBX_NET_DECIDE), then the audit. */
+static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict) {
+    struct sbx_access access = {.op = op_name(op), .asked = words, .resolved = words, .pid = pid, .rule_verdict = verdict};
+    int result = verdict;
+    if (policy->decide && (verdict != 0 || (policy->net & SBX_NET_DECIDE))) {
+        int said = policy->decide(policy->decide_context, &access);
+        if (said != SBX_KEEP) result = said > 0 ? 0 : said;
+    }
+    policy->audit(policy->audit_context, &access, result);
+    return result;
+}
+
+/* A blocking connect or accept, on a thread of its own: it holds up no other call, and touches no policy. */
+struct net_wait {
+    uint16_t op;
+    int socket;   /* the process's socket (a duplicate) */
+    int answer;   /* the request's answer socket (a duplicate) */
+    struct sockaddr_storage address;
+    socklen_t length;
+    int flags;
+};
+
+static void *net_wait_thread(void *argument) {
+    struct net_wait *w = argument;
+    if (w->op == SBX_CONNECT) {
+        int r = connect(w->socket, (const struct sockaddr *) &w->address, w->length);
+        reply(w->answer, r == 0 ? 0 : -errno, NULL, 0, -1);
+    } else {
+        struct sockaddr_storage peer;
+        socklen_t length = sizeof(peer);
+        int connection = accept4(w->socket, (struct sockaddr *) &peer, &length, (w->flags & SOCK_NONBLOCK) | SOCK_CLOEXEC);
+        if (connection < 0) reply(w->answer, -errno, NULL, 0, -1);
+        else {
+            if (length > (socklen_t) sizeof(peer)) length = sizeof(peer);
+            reply(w->answer, (int64_t) length, &peer, (uint32_t) length, connection);
+            close(connection);
+        }
+    }
+    close(w->socket);
+    close(w->answer);
+    free(w);
+    return NULL;
+}
+
+static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *address, socklen_t length, int flags) {
+    struct net_wait *w = calloc(1, sizeof(*w));
+    int s = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
+    int a = fcntl(answer, F_DUPFD_CLOEXEC, 0);
+    if (!w || s < 0 || a < 0) {
+        reply(answer, -ENOMEM, NULL, 0, -1);
+        if (s >= 0) close(s);
+        if (a >= 0) close(a);
+        free(w);
+        return;
+    }
+    w->op = op;
+    w->socket = s;
+    w->answer = a;
+    if (address && length > 0) memcpy(&w->address, address, (size_t) length);
+    w->length = length;
+    w->flags = flags;
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    int error = pthread_create(&thread, &attributes, net_wait_thread, w);
+    pthread_attr_destroy(&attributes);
+    if (error != 0) {
+        reply(answer, -error, NULL, 0, -1);
+        close(s);
+        close(a);
+        free(w);
+    }
+}
+
+static int socket_domain(int fd) {
+    int domain = 0;
+    socklen_t length = sizeof(domain);
+    return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) == 0 ? domain : -errno;
+}
+
+static int read_int(const char *body, size_t body_len, int *out) {
+    if (body_len != sizeof(int)) return -EINVAL;
+    memcpy(out, body, sizeof(int));
+    return 0;
+}
+
+static void net_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                    size_t body_len, int *fds, int fd_count, pid_t pid) {
+    int answer = fds[0];
+    if (request->path2_len != 0 || request->path_len != body_len || body_len == 0 ||
+        body_len > sizeof(struct sockaddr_storage) || fd_count != 1 + request->dirfd_sent ||
+        request->dirfd2_sent || request->dirfd_sent != (request->op != SBX_SOCKET)) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    char words[160];
+    if (request->op == SBX_SOCKET) {
+        int protocol;
+        int domain = request->flags;
+        int type = (int) request->mode;
+        int base = type & 0xf;
+        if (read_int(body, body_len, &protocol) != 0) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        snprintf(words, sizeof(words), "%s %s", domain == AF_INET6 ? "inet6" : "inet", base == SOCK_DGRAM ? "udp" : "tcp");
+        int verdict = (domain != AF_INET && domain != AF_INET6) || (base != SOCK_STREAM && base != SOCK_DGRAM) ? -EAFNOSUPPORT
+                    : (policy->net & (SBX_NET_CONNECT | SBX_NET_LISTEN)) ? 0 : -EACCES;
+        if (verdict != -EAFNOSUPPORT) verdict = net_decide(policy, request->op, words, pid, verdict);
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+        int made = socket(domain, base | (type & SOCK_NONBLOCK) | SOCK_CLOEXEC, protocol);
+        if (made < 0) { reply(answer, -errno, NULL, 0, -1); return; }
+        reply(answer, 0, NULL, 0, made);
+        close(made);
+        return;
+    }
+    int subject = fds[1];
+    int domain = socket_domain(subject);
+    if (domain < 0) { reply(answer, domain == -ENOTSOCK ? -ENOTSOCK : domain, NULL, 0, -1); return; }
+    if (request->op == SBX_CONNECT && domain == AF_UNIX) {
+        /* A system socket the process may have is connected here, under the broker's identity; any other path is the caller's own. */
+        struct sockaddr_un un;
+        memset(&un, 0, sizeof(un));
+        memcpy(&un, body, body_len < sizeof(un) ? body_len : sizeof(un));
+        size_t n = body_len > offsetof(struct sockaddr_un, sun_path) ? body_len - offsetof(struct sockaddr_un, sun_path) : 0;
+        if (n > sizeof(un.sun_path)) n = sizeof(un.sun_path);
+        char path[sizeof(un.sun_path) + 1];
+        memcpy(path, un.sun_path, n);
+        path[n] = '\0';
+        int found = -1;
+        for (unsigned i = 0; path[0] == '/' && i < policy->system_count; i++) {
+            if (strcmp(path, policy->system_paths[i]) == 0) found = (int) i;
+        }
+        if (found < 0) { reply(answer, -ENOSYS, NULL, 0, -1); return; }
+        unsigned grant = policy->system_grants[found];
+        int verdict = grant == 0 || (policy->net & grant) ? 0 : -EACCES;
+        verdict = net_decide(policy, request->op, path, pid, verdict);
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+        int type = 0;
+        socklen_t length = sizeof(type);
+        if (getsockopt(subject, SOL_SOCKET, SO_TYPE, &type, &length) != 0) { reply(answer, -errno, NULL, 0, -1); return; }
+        int nonblocking = (fcntl(subject, F_GETFL) & O_NONBLOCK) ? SOCK_NONBLOCK : 0;
+        int made = socket(AF_UNIX, type | nonblocking | SOCK_CLOEXEC, 0);
+        if (made < 0) { reply(answer, -errno, NULL, 0, -1); return; }
+        struct sockaddr_un target = {.sun_family = AF_UNIX};
+        memcpy(target.sun_path, path, strlen(path) + 1);
+        if (connect(made, (struct sockaddr *) &target, sizeof(target)) != 0 && errno != EINPROGRESS) {
+            int error = -errno;
+            close(made);
+            reply(answer, error, NULL, 0, -1);
+            return;
+        }
+        reply(answer, 0, NULL, 0, made);
+        close(made);
+        return;
+    }
+    if (domain != AF_INET && domain != AF_INET6) {
+        /* The process's own Unix socket: not the broker's to bind, listen on or accept from. */
+        reply(answer, -EACCES, NULL, 0, -1);
+        return;
+    }
+    if (request->op == SBX_LISTEN || request->op == SBX_ACCEPT) {
+        int value;
+        if (read_int(body, body_len, &value) != 0) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        struct sockaddr_storage local;
+        socklen_t length = sizeof(local);
+        memset(&local, 0, sizeof(local));
+        if (getsockname(subject, (struct sockaddr *) &local, &length) == 0) address_words((struct sockaddr *) &local, length, words, sizeof(words));
+        else snprintf(words, sizeof(words), "unbound");
+        int verdict = net_decide(policy, request->op, words, pid, (policy->net & SBX_NET_LISTEN) ? 0 : -EACCES);
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+        if (request->op == SBX_LISTEN) {
+            reply(answer, listen(subject, value) == 0 ? 0 : -errno, NULL, 0, -1);
+            return;
+        }
+        net_wait_start(SBX_ACCEPT, subject, answer, NULL, 0, value);
+        return;
+    }
+    /* connect or bind: an inet address of the socket's own family. */
+    struct sockaddr_storage address;
+    memset(&address, 0, sizeof(address));
+    memcpy(&address, body, body_len);
+    socklen_t length = (socklen_t) body_len;
+    int fits = (address.ss_family == AF_INET && length >= (socklen_t) sizeof(struct sockaddr_in)) ||
+               (address.ss_family == AF_INET6 && length >= (socklen_t) sizeof(struct sockaddr_in6)) ||
+               (request->op == SBX_CONNECT && address.ss_family == AF_UNSPEC);
+    if (!fits) { reply(answer, address.ss_family == AF_UNSPEC ? -EINVAL : -EAFNOSUPPORT, NULL, 0, -1); return; }
+    address_words((struct sockaddr *) &address, length, words, sizeof(words));
+    int verdict;
+    if (request->op == SBX_BIND) {
+        /* A port of the system's choosing (0) is what a client binds; a named port is listening. */
+        unsigned need = port_of((struct sockaddr *) &address) == 0 ? (SBX_NET_CONNECT | SBX_NET_LISTEN) : SBX_NET_LISTEN;
+        verdict = net_decide(policy, request->op, words, pid, (policy->net & need) ? 0 : -EACCES);
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+        reply(answer, bind(subject, (struct sockaddr *) &address, length) == 0 ? 0 : -errno, NULL, 0, -1);
+        return;
+    }
+    verdict = net_decide(policy, request->op, words, pid, (policy->net & SBX_NET_CONNECT) ? 0 : -EACCES);
+    if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+    net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0);
+}
+
 static void serve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
                       size_t body_len, int *fds, int fd_count, pid_t pid) {
     if (fd_count < 1) return;
     int answer = fds[0];
+    if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {
+        net_one(policy, request, body, body_len, fds, fd_count, pid);
+        return;
+    }
     if (request->version != SBX_PROTOCOL_VERSION ||
         (size_t) request->path_len + request->path2_len != body_len || request->path_len == 0 ||
         request->path_len >= SBX_PATH_MAX || request->path2_len >= SBX_PATH_MAX ||
