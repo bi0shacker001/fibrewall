@@ -33,13 +33,13 @@ pointer names, so it cannot tell one path from another. Paths therefore go
 to a **broker** in another process, as in Chromium's
 `sandbox/linux/syscall_broker`.
 
-## A UID of its own for every confined process (design, 2026-10-16)
+## A UID of its own: an opt-in mode per process (design, 2026-10-16)
 
 Code running under the host's own UID is not confined from the host: Android
 lets it reach every component of the host's package, exported or not, and
 every permission the host holds, whatever the host checks, and binder
-cannot be filtered by seccomp. So the library confines every process under
-an **isolated UID** (`android:isolatedProcess`, `bindIsolatedService` from
+cannot be filtered by seccomp. So a host can choose, per process, to run
+confined code under an **isolated UID** (`android:isolatedProcess`, `bindIsolatedService` from
 API 29, UIDs 90000-99999, SELinux domain `isolated_app`), and the host grants
 what the code may do through the broker, never by sharing its UID. What the
 platform allows an isolated process, from AOSP (sepolicy and frameworks as
@@ -56,6 +56,15 @@ of Android 8.0 to 15; read from LineageOS's byte-identical mirrors, branch
 | Call a system binder the host hands over | the call is made, as the **isolated** UID: permission, AppOps and calling-package checks fail | `ActivityManager.checkComponentPermission`: "Isolated processes don't get any permissions"; `enforceNotIsolatedCaller` |
 | Read and write a file descriptor the host opened | **yes** (no open, no execute, no ioctl; no `map` on 8.1) | `isolated_app_all.te`: `allow isolated_app_all { app_data_file ... }:file { append read write getattr lock map }` |
 | Hold an Android permission, or a Shizuku grant | **never** | isolated UIDs have no package; Shizuku's `attachApplication` requires `getPackagesForUid(callingUid)` to contain the caller's package |
+
+**Which hosts use it.** The isolated UID is opt-in, not the library's default.
+droidtop runs every plugin under one (owner, 2026-10-16: "every plugin is
+isolated, regardless of access"). A host whose code needs the GPU does not:
+Enginehost's cores and windowcast keep their app's own UID and SELinux domain,
+open their GPU device before the lockdown (`own_opens`), and are confined by
+seccomp and the broker alone (owner, 2026-10-16: "For things that NEED gpu, in
+other applications, we can forego android's isolation. But nothing in droidtop
+will need that").
 
 Two other mechanisms were weighed and set aside. An **app zygote**
 (`useAppZygote`, API 29) gives isolated children the same `isolated_app`
