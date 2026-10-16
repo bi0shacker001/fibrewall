@@ -714,6 +714,51 @@ static int passthrough_check(void) {
             close(fd);
         }
 
+        /* chmod and utimensat: a claimed path goes to the broker, any other to the kernel. */
+        EXPECT(chmod("/sandbox-test/data/p.txt", 0640) == 0, "passthrough: chmod of a claimed alias");
+        snprintf(path, sizeof(path), "%s/p.txt", save);
+        EXPECT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0640, "passthrough: the real file has the mode");
+        EXPECT(fchmodat(AT_FDCWD, "/sandbox-test/data/p.txt", 04755, 0) == 0 && stat(path, &st) == 0 &&
+                   (st.st_mode & 07777) == 0755,
+               "passthrough: the broker keeps permission bits only");
+        struct timespec times[2] = {{1000, 0}, {2000, 0}};
+        EXPECT(utimensat(AT_FDCWD, "/sandbox-test/data/p.txt", times, 0) == 0, "passthrough: utimensat of a claimed alias");
+        EXPECT(stat(path, &st) == 0 && st.st_mtime == 2000 && st.st_atime == 1000, "passthrough: the real file has the times");
+        EXPECT(utimensat(AT_FDCWD, "/sandbox-test/data/p.txt", NULL, 0) == 0 && stat(path, &st) == 0 && st.st_mtime > 2000,
+               "passthrough: utimensat to now");
+        fd = open("/sandbox-test/data/p.txt", O_RDONLY);
+        EXPECT(fd >= 0 && futimens(fd, times) == 0, "passthrough: futimens on a descriptor");
+        if (fd >= 0) close(fd);
+        snprintf(path, sizeof(path), "%s/data.txt", game);
+        EXPECT(chmod(path, 0644) == 0, "passthrough: chmod of an unclaimed path from the kernel");
+        snprintf(path, sizeof(path), "%s/key", secret);
+        errno = 0;
+        EXPECT(refused(chmod(path, 0666)), "passthrough: chmod of a claimed path with no rule is refused");
+        errno = 0;
+        EXPECT(refused(utimensat(AT_FDCWD, path, NULL, 0)), "passthrough: utimensat of a claimed path with no rule is refused");
+
+        /* Listing: getdents64 traps in passthrough; the handler's own call lists what the kernel lets it. */
+        DIR *listing = opendir("/sandbox-test/data");
+        int seen = 0;
+        if (listing) {
+            struct dirent *entry;
+            while ((entry = readdir(listing)) != NULL) seen |= strcmp(entry->d_name, "p.txt") == 0;
+            rewinddir(listing);
+            int again = 0;
+            while ((entry = readdir(listing)) != NULL) again |= strcmp(entry->d_name, "p.txt") == 0;
+            seen &= again;
+            closedir(listing);
+        }
+        EXPECT(seen, "passthrough: a claimed folder lists, and lists again after rewinddir");
+        listing = opendir(game);
+        seen = 0;
+        if (listing) {
+            struct dirent *entry;
+            while ((entry = readdir(listing)) != NULL) seen |= strcmp(entry->d_name, "data.txt") == 0;
+            closedir(listing);
+        }
+        EXPECT(seen, "passthrough: an unclaimed folder lists");
+
         EXPECT(chdir(game) == 0, "passthrough: chdir into an unclaimed folder");
         fd = open("data.txt", O_RDONLY);
         EXPECT(fd >= 0, "passthrough: a relative path from there goes to the kernel");
@@ -764,6 +809,86 @@ static int passthrough_check(void) {
     int status = 0;
     waitpid(child, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+/*
+ * SBX_LIST, asked of the broker directly, as the handler asks it for a
+ * folder the kernel would not list for the confined process (which this
+ * test, one user throughout, cannot make happen).
+ */
+static long ask_list(int broker_fd, int dir, char *out, size_t out_len) {
+    int answer[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, answer) != 0) return -errno;
+    struct {
+        uint16_t version, op;
+        int32_t flags;
+        uint32_t mode, path_len, path2_len;
+        int32_t tid;
+        uint8_t dirfd_sent, dirfd2_sent, reserved[6];
+    } request = {.version = 1, .op = 11 /* SBX_LIST */, .mode = (uint32_t) out_len, .path_len = 1,
+                 .tid = (int32_t) syscall(__NR_gettid), .dirfd_sent = 1};
+    struct iovec parts[2] = {{&request, sizeof(request)}, {(void *) ".", 1}};
+    int fds[2] = {answer[1], dir};
+    union {
+        char buffer[CMSG_SPACE(sizeof(fds))];
+        struct cmsghdr align;
+    } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr message = {.msg_iov = parts, .msg_iovlen = 2, .msg_control = control.buffer,
+                             .msg_controllen = sizeof(control.buffer)};
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(fds));
+    memcpy(CMSG_DATA(header), fds, sizeof(fds));
+    long sent = sendmsg(broker_fd, &message, 0);
+    close(answer[1]);
+    if (sent < 0) { close(answer[0]); return -errno; }
+    struct { int64_t result; uint32_t data_len, reserved; } reply;
+    struct iovec back[2] = {{&reply, sizeof(reply)}, {out, out_len}};
+    struct msghdr answer_message = {.msg_iov = back, .msg_iovlen = 2};
+    long got = recvmsg(answer[0], &answer_message, 0);
+    close(answer[0]);
+    if (got < (long) sizeof(reply)) return -EIO;
+    return (long) reply.result;
+}
+
+static int names(const char *records, long n, const char *name) {
+    for (long at = 0; at < n;) {
+        const struct { uint64_t ino; int64_t off; unsigned short reclen; unsigned char type; char name[]; } *d =
+            (const void *) (records + at);
+        if (strcmp(d->name, name) == 0) return 1;
+        if (d->reclen == 0) break;
+        at += d->reclen;
+    }
+    return 0;
+}
+
+static int list_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, save, SBX_READ);
+    if (sbx_broker_prepare(pair[0]) != 0 || sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char records[4096];
+    int dir = open(save, O_RDONLY | O_DIRECTORY);
+    long n = dir >= 0 ? ask_list(pair[1], dir, records, sizeof(records)) : -EBADF;
+    EXPECT(n > 0 && names(records, n, "revoked.txt"), "SBX_LIST: the broker lists a folder under a read rule");
+    long more = dir >= 0 ? ask_list(pair[1], dir, records, sizeof(records)) : -EBADF;
+    EXPECT(more == 0, "SBX_LIST: from the same position, so the next read is the end");
+    if (dir >= 0) {
+        lseek(dir, 0, SEEK_SET);
+        n = ask_list(pair[1], dir, records, sizeof(records));
+        EXPECT(n > 0 && names(records, n, "revoked.txt"), "SBX_LIST: and again after a rewind");
+        close(dir);
+    }
+    dir = open(secret, O_RDONLY | O_DIRECTORY);
+    n = dir >= 0 ? ask_list(pair[1], dir, records, sizeof(records)) : -EBADF;
+    errno = n < 0 ? (int) -n : 0;
+    EXPECT(n == -EACCES, "SBX_LIST: a folder outside the rules is refused");
+    if (dir >= 0) close(dir);
+    close(pair[1]);
+    return failures ? 1 : 0;
 }
 
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
@@ -889,7 +1014,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check();
+    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

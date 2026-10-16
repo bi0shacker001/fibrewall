@@ -26,6 +26,8 @@
 
 #define SBX_PROTOCOL_VERSION 1
 #define SBX_PATH_MAX 4096
+/* The most one SBX_LIST reply carries; a larger read is answered short, as the kernel may. */
+#define SBX_LIST_MAX 32768
 
 enum sbx_op {
     SBX_OPEN = 1,      /* flags = open flags, mode = creation mode */
@@ -38,6 +40,11 @@ enum sbx_op {
     SBX_STATFS = 8,    /* data = struct statfs */
     SBX_CHDIR = 9,     /* the reply carries an O_PATH descriptor of the directory */
     SBX_GETCWD = 10,   /* path = "."; mode = the caller's buffer size; data = the directory's name */
+    SBX_LIST = 11,     /* path = "."; the directory's own descriptor is sent; mode = the caller's buffer size;
+                          data = linux_dirent64 records read from that descriptor (its position moves) */
+    SBX_CHMOD = 12,    /* mode = the new mode (the broker keeps 0777 of it) */
+    SBX_UTIMENS = 13,  /* flags = AT_SYMLINK_NOFOLLOW or 0; path2 = two struct timespec (atime, mtime), or
+                          empty for "now" */
 };
 
 struct sbx_request {

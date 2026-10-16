@@ -510,6 +510,9 @@ static const char *op_name(uint32_t op) {
     case SBX_STATFS: return "statfs";
     case SBX_CHDIR: return "chdir";
     case SBX_GETCWD: return "getcwd";
+    case SBX_LIST: return "list";
+    case SBX_CHMOD: return "chmod";
+    case SBX_UTIMENS: return "utimens";
     default: return "unknown";
     }
 }
@@ -773,6 +776,29 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         close(parent2);
         break;
     }
+    case SBX_CHMOD: {
+        error = decide(&c, base, path, request->path_len, SBX_WRITE, 1, 0);
+        if (error != 0) break;
+        const char *name;
+        int parent = open_parent(&c, SBX_WRITE, &name);
+        if (parent < 0) { error = parent; break; }
+        /* The name is the resolved file's own (no link is left to follow); the mode keeps permission bits only. */
+        error = fchmodat(parent, name, (mode_t) (request->mode & 0777), 0) == 0 ? 0 : -errno;
+        close(parent);
+        break;
+    }
+    case SBX_UTIMENS: {
+        error = decide(&c, base, path, request->path_len, SBX_WRITE, !(request->flags & AT_SYMLINK_NOFOLLOW), 0);
+        if (error != 0) break;
+        struct timespec times[2];
+        if (request->path2_len) memcpy(times, path2, sizeof(times));
+        const char *name;
+        int parent = open_parent(&c, SBX_WRITE, &name);
+        if (parent < 0) { error = parent; break; }
+        error = utimensat(parent, name, request->path2_len ? times : NULL, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
+        close(parent);
+        break;
+    }
     case SBX_STATFS: {
         error = decide(&c, base, path, request->path_len, LOOKUP, 1, 0);
         if (error != 0) break;
@@ -791,6 +817,39 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
     reply(answer, error, NULL, 0, -1);
 }
 
+/*
+ * SBX_LIST: the confined process could not list a folder it holds (an
+ * Android isolated process may not read a folder its app opened for it).
+ * The descriptor itself came with the request; it is listed here only when
+ * the folder it names may be read, and from that same open file
+ * description, so the position the process sees moves with it.
+ */
+static void list_one(const struct sbx_policy *policy, const struct sbx_request *request, int *fds, pid_t pid,
+                     int answer) {
+    char base[SBX_PATH_MAX];
+    if (!request->dirfd_sent || request->path_len != 1 || fd_path(fds[1], base) != 0 || base[0] != '/') {
+        reply(answer, -EBADF, NULL, 0, -1);
+        return;
+    }
+    struct check c;
+    c.policy = policy;
+    c.op = request->op;
+    c.pid = pid;
+    c.tid = request->tid;
+    c.flags = 0;
+    int error = decide(&c, base, ".", 1, SBX_READ, 1, 0);
+    if (error != 0) { reply(answer, error, NULL, 0, -1); return; }
+    if (strcmp(c.real, base) != 0) {
+        /* The folder moved under its name after it was opened: decide on what the descriptor holds. */
+        if (!permits(allowed(policy, base, pid), SBX_READ)) { reply(answer, -EACCES, NULL, 0, -1); return; }
+    }
+    static __thread char records[SBX_LIST_MAX];
+    size_t asked = request->mode < SBX_LIST_MAX ? request->mode : SBX_LIST_MAX;
+    long n = syscall(__NR_getdents64, fds[1], records, asked);
+    if (n < 0) { reply(answer, -errno, NULL, 0, -1); return; }
+    reply(answer, n, records, (uint32_t) n, -1);
+}
+
 static void serve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
                       size_t body_len, int *fds, int fd_count, pid_t pid) {
     if (fd_count < 1) return;
@@ -799,7 +858,10 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         (size_t) request->path_len + request->path2_len != body_len || request->path_len == 0 ||
         request->path_len >= SBX_PATH_MAX || request->path2_len >= SBX_PATH_MAX ||
         fd_count != 1 + request->dirfd_sent + request->dirfd2_sent ||
-        (request->op == SBX_RENAME) != (request->path2_len != 0)) {
+        request->path2_len != (request->op == SBX_RENAME ? request->path2_len
+                               : request->op == SBX_UTIMENS ? (request->path2_len ? 2 * sizeof(struct timespec) : 0)
+                               : 0) ||
+        (request->op == SBX_RENAME && request->path2_len == 0)) {
         reply(answer, -EINVAL, NULL, 0, -1);
         return;
     }
@@ -814,6 +876,10 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         size_t length = strlen(name) + 1;
         if (length > request->mode) { reply(answer, -ERANGE, NULL, 0, -1); return; }
         reply(answer, (int64_t) length, name, (uint32_t) length, -1);
+        return;
+    }
+    if (request->op == SBX_LIST) {
+        list_one(policy, request, fds, pid, answer);
         return;
     }
     char base[SBX_PATH_MAX] = "/";

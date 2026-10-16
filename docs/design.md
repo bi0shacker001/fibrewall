@@ -48,10 +48,14 @@ The filter:
 
 - **Traps to the broker.** open, creat, stat/lstat/newfstatat, access and
   faccessat(2), readlink(at), mkdir(at), unlink(at), rmdir, rename(at/at2),
-  statfs, chdir, fchdir, getcwd.
-- **Refuses with ENOSYS, so callers fall back.** statx, openat2, clone3.
+  statfs, chdir, fchdir, getcwd, chmod/fchmodat (the broker keeps the
+  permission bits, `0777`, under a write rule) and utimensat with a path
+  (its two times travel in the request; `futimens`, on a descriptor, is
+  untouched).
+- **Refuses with ENOSYS, so callers fall back.** statx, openat2, clone3,
+  fchmodat2.
 - **Refuses with EACCES.** Any other path call: truncate, link, symlink,
-  mknod, chmod/chown, utimes on a path, xattrs on a path, inotify and
+  mknod, chown, utime/utimes/futimesat, xattrs on a path, inotify and
   fanotify marks, file handles. Also execve(at), socket (a Unix datagram
   socket for the system log can be allowed with `SBX_LOCK_LOG_SOCKET`, or
   inet sockets with `SBX_LOCK_INET`), bind and connect (open again with
@@ -108,9 +112,24 @@ directory) and carry a directory argument that is no descriptor, the one
 value the filter lets through untrapped. Code that uses that value itself
 gets only what the kernel would give the process anyway. A relative path
 is claimed when the folder it lands in is (the directory's name from
-`/proc/self/fd`, joined to it). truncate, link, chmod, xattrs and the
-other path calls the broker does not make go to the kernel, as in the
-unbrokered mode.
+`/proc/self/fd`, joined to it). chmod and utimensat with a path follow
+the same split (droidtop's Android `FileUtils.setPermissions` on a claimed
+alias got `ENOENT` from the kernel before they did). truncate, link,
+xattrs and the other path calls the broker does not make go to the
+kernel, as in the unbrokered mode.
+
+**Listing in passthrough.** getdents64 names no path, but an Android
+isolated process may not read a folder its app opened for it (`avc:
+denied { read } ... isolated_app`), so a folder the broker handed over
+could be opened and not listed. In passthrough getdents64 traps. The
+handler lists the folder itself first, its own call marked in the upper
+half of the count (which the kernel ignores, `unsigned int count`) so the
+filter lets it through; only when the kernel refuses it (`EACCES`) does it
+send the descriptor to the broker (`SBX_LIST`), which lists it when the
+folder it names may be read, from that same open file description: the
+position moves for both, and `lseek`/`rewinddir` work as before. One reply
+carries at most `SBX_LIST_MAX` (32 KiB) of records; a longer read is
+answered short, as the kernel may answer it.
 
 **Network** (`SBX_LOCK_INET`) is for a process that talks to the network
 itself, such as droidtop's Syncthing plugin (Droidtop/tracker#553): it

@@ -202,7 +202,8 @@ int sbx_policy_alias(struct sbx_policy *policy, const char *virtual_path, const 
 
 /* One brokered request, as the decider and the audit see it. */
 struct sbx_access {
-    const char *op;        /* "open", "stat", "access", "readlink", "mkdir", "unlink", "rename", "statfs", "chdir", "getcwd" */
+    const char *op;        /* "open", "stat", "access", "readlink", "mkdir", "unlink", "rename", "statfs", "chdir",
+                              "getcwd", "list", "chmod", "utimens" */
     const char *asked;     /* the path as the confined code named it */
     const char *resolved;  /* the real path the broker would act on ("" when it could not be resolved) */
     unsigned need;         /* SBX_READ, SBX_WRITE, or 0 for a lookup (stat, access F_OK, traversal) */

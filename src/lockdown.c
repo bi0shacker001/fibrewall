@@ -295,7 +295,9 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
                     int flags, uint32_t mode, void *out, size_t out_len) {
     if (path == NULL || (op == SBX_RENAME && path2 == NULL)) return -EFAULT;
     size_t length = strnlen(path, SBX_PATH_MAX);
-    size_t length2 = op == SBX_RENAME ? strnlen(path2, SBX_PATH_MAX) : 0;
+    /* A rename's second name; a utimensat's two times travel in the same place, as bytes. */
+    size_t length2 = op == SBX_RENAME ? strnlen(path2, SBX_PATH_MAX)
+                   : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec) : 0;
     if (length == SBX_PATH_MAX || length2 == SBX_PATH_MAX) return -ENAMETOOLONG;
     if (length == 0 || (op == SBX_RENAME && length2 == 0)) return -ENOENT;
 
@@ -577,6 +579,38 @@ static long get_directory(char *out, size_t size) {
     return n + 1;
 }
 
+static long chmod_path(int dirfd, const char *path, uint32_t mode, char *buffer) {
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_fchmodat, PASS_DIRFD, where, mode));
+    return forward(SBX_CHMOD, dirfd, path, 0, NULL, 0, mode, NULL, 0);
+}
+
+static long utimens_path(int dirfd, const char *path, const struct timespec *times, int flags, char *buffer) {
+    const char *where = NULL;
+    long to = route(dirfd, path, buffer, &where);
+    if (to < 0) return to;
+    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_utimensat, PASS_DIRFD, where, times, flags));
+    return forward(SBX_UTIMENS, dirfd, path, 0, (const char *) times, flags & AT_SYMLINK_NOFOLLOW, 0, NULL, 0);
+}
+
+/*
+ * getdents64, which traps in passthrough. The handler lists the folder
+ * itself first (its own call carries LIST_MARK in the upper half of the
+ * count, which the kernel ignores and the filter lets through); a folder
+ * the kernel refuses to list (an Android isolated process may not read a
+ * folder its app opened for it) goes to the broker with its descriptor,
+ * which lists it from the same open file description when it may read it.
+ */
+#define LIST_MARK 0x5b2u
+static long list_directory(int fd, void *out, unsigned count) {
+    long n = syscall(__NR_getdents64, fd, out, (unsigned long) count | ((unsigned long) LIST_MARK << 32));
+    if (n >= 0 || errno != EACCES) return kernel(n);
+    size_t asked = count < SBX_LIST_MAX ? count : SBX_LIST_MAX;
+    return forward(SBX_LIST, fd, ".", 0, NULL, 0, (uint32_t) asked, out, asked);
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
@@ -614,6 +648,13 @@ static long dispatch(long nr, ucontext_t *uc) {
         return change_directory_fd((int) a0);
     case __NR_getcwd:
         return get_directory((char *) a0, (size_t) a1);
+    case __NR_fchmodat:
+        return chmod_path((int) a0, (const char *) a1, (uint32_t) a2, buffer);
+    case __NR_utimensat:
+        /* Only a call with a path traps; utimensat(fd, NULL, ...) is futimens, on a descriptor. */
+        return utimens_path((int) a0, (const char *) a1, (const struct timespec *) a2, (int) a3, buffer);
+    case __NR_getdents64:
+        return list_directory((int) a0, (void *) a1, (unsigned) a2);
 #ifdef __NR_open
     case __NR_open:
         return open_path(AT_FDCWD, (const char *) a0, (int) a1, (uint32_t) a2, buffer);
@@ -635,6 +676,8 @@ static long dispatch(long nr, ucontext_t *uc) {
         return unlink_path(AT_FDCWD, (const char *) a0, AT_REMOVEDIR, buffer);
     case __NR_rename:
         return rename_path(AT_FDCWD, (const char *) a0, AT_FDCWD, (const char *) a1, 0, buffer);
+    case __NR_chmod:
+        return chmod_path(AT_FDCWD, (const char *) a0, (uint32_t) a1, buffer);
 #endif
     default:
         return -ENOSYS;
@@ -758,8 +801,25 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     if (pass) {
         static const unsigned one[] = {
             __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat, __NR_unlinkat,
+            __NR_fchmodat,
         };
         for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) passthrough_block(one[i], 0);
+        /* utimensat: futimens (no path) is a descriptor call; with a path, the handler's own calls pass. */
+        jeq(__NR_utimensat, 0, 8);
+        load(ARG_LO(1));
+        jeq(0, 0, 2);
+        load(ARG_HI(1));
+        jeq(0, 2, 0);
+        load(ARG_LO(0));
+        jeq((unsigned) PASS_DIRFD, 0, 1);
+        ret(ALLOW);
+        ret(TRAP);
+        /* getdents64 names no path, but an isolated process may be refused a brokered folder's listing (list_directory). */
+        jeq(__NR_getdents64, 0, 4);
+        load(ARG_HI(2));
+        jeq(LIST_MARK, 0, 1);
+        ret(ALLOW);
+        ret(TRAP);
         passthrough_block(__NR_renameat2, 1);
 #ifdef __NR_renameat
         passthrough_block(__NR_renameat, 1);
@@ -768,13 +828,13 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     /* Brokered. */
     static const unsigned brokered[] = {
         __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
-        __NR_unlinkat, __NR_renameat2, __NR_statfs, __NR_chdir, __NR_fchdir, __NR_getcwd,
+        __NR_unlinkat, __NR_renameat2, __NR_statfs, __NR_chdir, __NR_fchdir, __NR_getcwd, __NR_fchmodat,
 #ifdef __NR_renameat
         __NR_renameat,
 #endif
 #ifdef __NR_open
         __NR_open, __NR_creat, __NR_stat, __NR_lstat, __NR_access, __NR_readlink, __NR_mkdir, __NR_unlink,
-        __NR_rmdir, __NR_rename,
+        __NR_rmdir, __NR_rename, __NR_chmod,
 #endif
     };
     if (!unbrokered) {
@@ -782,16 +842,19 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         /* Callers fall back to the brokered forms. */
         rule(__NR_statx, NOSYS);
         rule(__NR_openat2, NOSYS);
+#ifdef __NR_fchmodat2
+        rule(__NR_fchmodat2, NOSYS);
+#endif
     }
     if (!unbrokered && !pass) {
-        /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it is refused. */
+        /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it goes to the broker. */
         jeq(__NR_utimensat, 0, 6);
         load(ARG_LO(1));
         jeq(0, 0, 3);
         load(ARG_HI(1));
         jeq(0, 0, 1);
         ret(ALLOW);
-        ret(REFUSE);
+        ret(TRAP);
     }
     /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
     rule(__NR_clone3, NOSYS);
@@ -851,12 +914,12 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     /* Refused: other paths (the kernel's own checks decide them when there is no broker, and in passthrough). */
     static const unsigned refused_paths[] = {
-        __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchmodat, __NR_fchownat,
+        __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchownat,
         __NR_inotify_add_watch, __NR_fanotify_mark, __NR_name_to_handle_at, __NR_open_by_handle_at,
         __NR_setxattr, __NR_lsetxattr, __NR_getxattr, __NR_lgetxattr, __NR_listxattr, __NR_llistxattr,
         __NR_removexattr, __NR_lremovexattr,
 #ifdef __NR_open
-        __NR_link, __NR_symlink, __NR_mknod, __NR_chmod, __NR_chown, __NR_lchown, __NR_utime, __NR_utimes,
+        __NR_link, __NR_symlink, __NR_mknod, __NR_chown, __NR_lchown, __NR_utime, __NR_utimes,
         __NR_futimesat, __NR_uselib,
 #endif
     };
