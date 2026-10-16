@@ -135,6 +135,16 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);
  */
 int sbx_local_add(const char *path, int fd);
 
+/*
+ * sbx_local_add with a mode: SBX_READ, or SBX_READ | SBX_WRITE for a file
+ * the host opened for writing and hands over to be written by name (an
+ * open asking to write is then answered too, and O_TRUNC empties the
+ * file). Every open of the path is a duplicate of the one descriptor, so
+ * they share one position; the open's other flags are not applied.
+ * Adding the same path again replaces both the descriptor and the mode.
+ */
+int sbx_local_add_mode(const char *path, int fd, unsigned mode);
+
 /* ---- Starting a sandboxed program (the native kind) ---- */
 
 #define SBX_SPAWN_FDS_MAX 16

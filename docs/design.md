@@ -94,7 +94,13 @@ needs binder seals those descriptors instead.
 a name of the host's choosing, read only: an open of exactly that path gets
 a duplicate, and stat and access answer from the descriptor, in the
 handler, with no broker and no rule. It works before or after lockdown, so
-a host can hand over code and data as it loads them. Own-opened devices are
+a host can hand over code and data as it loads them.
+`sbx_local_add_mode(path, fd, SBX_READ | SBX_WRITE)` hands over a file the
+host opened for writing, to be written by name (droidtop's `open` for a
+Flutter plugin, whose `dart:io` can only open paths): every open of the
+path is a duplicate of that one descriptor, sharing its position, and
+`O_TRUNC` empties the file; adding the path again replaces the descriptor
+and the mode, which is how the host lets one go. Own-opened devices are
 local files too (read and written). This is how droidtop's isolated plugin
 processes see the files it hands them as descriptors at virtual paths:
 every library that opens a path is covered, not only the ones a PLT hook

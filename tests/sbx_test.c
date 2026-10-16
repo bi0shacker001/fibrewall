@@ -669,6 +669,9 @@ static int passthrough_check(void) {
     char local_path[400];
     snprintf(local_path, sizeof(local_path), "%s/local.txt", root);
     write_file(local_path, "local");
+    char rw_seed[500];
+    snprintf(rw_seed, sizeof(rw_seed), "%s/rw.txt", root);
+    write_file(rw_seed, "old contents");
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -798,6 +801,33 @@ static int passthrough_check(void) {
         EXPECT(refused(access("/sandbox-local/lib.so", W_OK)), "a local file is not writable (access)");
         errno = 0;
         EXPECT(refused(open("/sandbox-local/lib.so", O_RDWR)), "a local file is not writable (open)");
+
+        /* A writable local file (sbx_local_add_mode), as droidtop hands over a file it opened for writing. */
+        char rw_path[500];
+        snprintf(rw_path, sizeof(rw_path), "%s/rw.txt", root);
+        int rw = open(rw_path, O_RDWR);
+        added = rw >= 0 ? sbx_local_add_mode("/sandbox-local/rw.txt", rw, SBX_READ | SBX_WRITE) : -EBADF;
+        errno = -added;
+        EXPECT(added == 0, "sbx_local_add_mode read and write");
+        fd = open("/sandbox-local/rw.txt", O_WRONLY | O_TRUNC);
+        EXPECT(fd >= 0, "a writable local file opens for writing");
+        if (fd >= 0) {
+            EXPECT(write(fd, "new", 3) == 3, "and writes");
+            close(fd);
+        }
+        fd = open("/sandbox-local/rw.txt", O_RDONLY);
+        EXPECT(fd >= 0, "and opens again for reading");
+        if (fd >= 0) {
+            read_word(fd, word, sizeof(word));
+            EXPECT(strcmp(word, "new") == 0, "O_TRUNC emptied it and the write is there");
+            close(fd);
+        }
+        fd = open(local_path, O_RDONLY);
+        EXPECT(sbx_local_add_mode("/sandbox-local/rw.txt", fd, SBX_WRITE) == -EINVAL, "sbx_local_add_mode: write alone is no mode");
+        fd = open(local_path, O_RDONLY);
+        EXPECT(sbx_local_add_mode("/sandbox-local/rw.txt", fd, SBX_READ) == 0, "a local file replaced read only");
+        errno = 0;
+        EXPECT(refused(open("/sandbox-local/rw.txt", O_WRONLY)), "takes the new mode: no longer writable");
 
         errno = 0;
         EXPECT(refused(socket(AF_INET, SOCK_STREAM, 0)), "passthrough: socket(AF_INET) refused");

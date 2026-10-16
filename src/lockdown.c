@@ -140,7 +140,8 @@ static struct sigaction previous;
  * Local files: paths the handler answers itself from a descriptor, with no
  * broker. Two kinds: devices this process opened just before lockdown
  * (sbx_lockdown_options.own_opens), read and written; and files the host
- * hands over under names of its choosing (sbx_local_add), read only.
+ * hands over under names of its choosing (sbx_local_add), read only, or
+ * read and written when the host says so (sbx_local_add_mode).
  * Entries are added from ordinary code, before or after lockdown, under a
  * spin lock; the handler reads them without one, because an entry is
  * complete before the count that publishes it is stored.
@@ -182,6 +183,13 @@ static long local_open(const char *path, int flags) {
     if (fd < 0) return -errno;
     /* A handed-over file reads from its start (the duplicate shares its offset with every other one). */
     if (!(locals[i].mode & LOCAL_DEVICE)) lseek((int) fd, 0, SEEK_SET);
+    /* The one open flag a shared description can still honour for a writable file: it is the same file. */
+    if ((flags & O_TRUNC) && (locals[i].mode & SBX_WRITE) && !(locals[i].mode & LOCAL_DEVICE) &&
+        syscall(__NR_ftruncate, (int) fd, 0) != 0) {
+        long error = -errno;
+        close((int) fd);
+        return error;
+    }
     return fd;
 }
 
@@ -214,6 +222,7 @@ static int add_local(const char *path, int fd, unsigned mode) {
     unsigned count = local_count;
     for (unsigned i = 0; i < count; i++) {
         if (strcmp(path, locals[i].path) == 0) {
+            __atomic_store_n(&locals[i].mode, mode, __ATOMIC_RELEASE);
             int old = __atomic_exchange_n(&locals[i].fd, fd, __ATOMIC_ACQ_REL);
             unlock_locals();
             close(old);
@@ -239,6 +248,16 @@ static int add_local(const char *path, int fd, unsigned mode) {
 
 int sbx_local_add(const char *path, int fd) {
     int added = add_local(path, fd, SBX_READ);
+    if (added != 0 && fd >= 0) close(fd);
+    return added;
+}
+
+int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
+    if (mode != SBX_READ && mode != (SBX_READ | SBX_WRITE)) {
+        if (fd >= 0) close(fd);
+        return -EINVAL;
+    }
+    int added = add_local(path, fd, mode);
     if (added != 0 && fd >= 0) close(fd);
     return added;
 }
@@ -951,6 +970,11 @@ int sbx_local_add(const char *path, int fd) {
     (void) path;
     if (fd >= 0) close(fd);
     return -ENOSYS;
+}
+
+int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
+    (void) mode;
+    return sbx_local_add(path, fd);
 }
 #endif
 
