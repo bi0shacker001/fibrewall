@@ -319,6 +319,599 @@ the rules refuse, such as a document the person just picked. It can refuse
 what the rules allow, such as a folder whose grant was revoked. It runs on
 the broker's thread, and the confined call waits for it.
 
+## Layers, containment, and Wine and proot under the broker (design, 2026-10-22, Droidtop/tracker#584)
+
+Status: design only, nothing here is built. It adds three things to the
+broker above and no second mechanism: the policy (rules, aliases, decider)
+stays the one place that decides, and every enforcement point described
+below evaluates that same policy.
+
+Why: droidtop's Wine prefix is a whole directory tree that is copied per
+prefix, and Wine and proot run with the app's full reach (an incident on
+2026-09-02 emptied internal storage through a prefix's `dosdevices/z:`
+link; droidtop's SPEC 5b "Destructive-operation audit"). Owner,
+2026-10-17: "using the sandbox broker actually isn't a bad idea. It gives us
+more containment as well. Something running in a wine or proot context
+couldn't, say, suddenly nuke the entire internal storage (still angry about
+that)." And: "We also need some deduplication system for it, too."
+
+Constraints that shape it (all from the platform section above and
+droidtop's targets):
+
+- No kernel copy-on-write without root. ext4 and f2fs have no reflinks;
+  overlayfs needs mount rights; there are no user namespaces on the
+  Retroid Pocket 5. Layers are therefore the broker's own, in user space.
+  overlayfs may be used as an optional speed-up where the host already has
+  root (never required, never the only path; see "Optional kernel help").
+- The broker only sees what the filter traps. A layer is a view the broker
+  builds, so every process that must see it is brokered.
+- Android's own isolation stays on top where it exists. This section is the
+  library's own wall, and it applies whether or not Android's applies
+  (owner: "Our sandbox always applies").
+
+### 1. Copy-on-write layers
+
+#### Model
+
+A **layered tree** is mounted at a virtual path (for Wine, the prefix path
+the program was told: `WINEPREFIX`). It has one **upper** directory (the
+game's layer, read-write) and an ordered list of up to 8 **lowers**
+(read-only bases, topmost first). For Wine: lower 0 is the base prefix of
+one Wine build; a second lower may later hold a component set (a DXVK
+version) shared by several games. The policy call is
+
+    sbx_policy_add_layer(policy, virtual_root, lowers, lower_count, upper, flags)
+
+Rules apply to the real paths, as for an alias (see "The broker"): the
+upper is granted `SBX_READ | SBX_WRITE`, every lower `SBX_READ`. The
+confined process never sees a real path of either. Flags:
+`SBX_LAYER_CASE_INSENSITIVE` (the broker folds case against the merged
+listing, which is what Wine's slow path does itself by scanning a directory),
+`SBX_LAYER_BASE_MODES` (see "Modes").
+
+A name resolves top-down: upper, then each lower in order. The first layer
+that has the name answers, unless the entry there is a **whiteout**, in
+which case the name does not exist. A directory exists in the merged tree
+if any layer has it as a directory; its contents are the union, unless the
+upper's copy is **opaque**, which hides the lowers' contents.
+
+A lower is immutable while any layer refers to it: the broker never opens
+it for writing, and the host marks its files read-only (mode `0444`, `0555`
+for directories) so that the host's own code cannot write into it by
+accident either. Layers that have no lower are an ordinary directory; the
+mount is a no-op, so an existing full prefix keeps working unchanged.
+
+#### On-disk representation
+
+Nothing depends on extended attributes (Android's SELinux policy and f2fs
+make them unreliable for app files).
+
+- **Whiteout**: a symbolic link in the upper, named as the deleted entry,
+  whose target is the reserved string `.sbx-whiteout`. There is exactly one
+  directory entry per name, so a delete and a re-create replace it with one
+  `rename(2)`, which is atomic. A confined process cannot make a symlink
+  with that target (`EINVAL`), and the merged view never shows one:
+  `lstat` answers `ENOENT`, listings omit it.
+- **Opaque directory**: a file `.sbx-opaque` inside the upper's directory.
+  Names beginning `.sbx-` are the broker's: a confined process may not
+  create, rename or remove one, and listings hide them.
+- **Copy-up temporary**: `.sbx-tmp.<boot-id>.<n>` in the destination
+  directory (same file system as the final name, so the rename is atomic).
+- **Layer record**: `.sbx-layer` at the upper's root: format version and the
+  identity (id and content hash) of each lower. A layer whose lower is
+  missing or different is not mounted (the host reports it; see droidtop
+  SPEC 5b), never mounted wrongly.
+
+#### Lookup and the merged view
+
+The broker already resolves a path component by component with `readlink`
+alone and acts relative to an `O_PATH` parent (see "The broker"). With
+layers, each component is looked up in the layers in order using
+`fstatat(AT_SYMLINK_NOFOLLOW)` on the layer's own parent descriptor; this
+is the broker's stat of its own files, not on the confined code's behalf,
+so the rule above ("never stats on the confined code's behalf") is about
+asked-for paths and stays true.
+
+A symlink found in a lower is resolved in the merged tree, not in the
+lower: an absolute target is looked up from the confined process's virtual
+root, a relative one from the link's merged directory, so a link in a base
+that points at another base file reaches the layer's copy if there is one.
+The resolved path is then checked against the rules as before (a link out of
+the layered tree is judged where it lands; this is how `dosdevices/z: -> /`
+is refused when the device root is not granted).
+
+Results are cached per layered tree (a dentry cache keyed by the merged
+path: positive, negative and whiteout entries), invalidated per directory by
+any mutation made through the broker, and dropped when the host calls
+`sbx_layer_changed()`. The host edits an upper directly only before a launch
+(see droidtop SPEC 5b), so no cross-process invalidation is needed at run
+time.
+
+**Identity.** `st_dev` is one synthetic value for the whole layered tree;
+`st_ino` is the file's own when the layers share a file system, else a hash
+of (source device, inode). The prefix root is the upper's directory, so
+wineserver, which names its server directory from the prefix's device and
+inode, gets a distinct, stable name per layer. An inode changes when a file
+is copied up (overlayfs without `xino` does the same); nothing in Wine
+keeps an identity across a write-open of a file.
+
+**Modes.** With `SBX_LAYER_BASE_MODES` the broker reports a lower's regular
+files as `mode | 0200` and directories as `mode | 0300`, since the host made
+them read-only on disk, and a copy-up gives the copy that mode. `access(W_OK)`
+on a lower file therefore answers yes, as it would on a normal prefix, and
+the write succeeds by copy-up.
+
+#### Copy-up
+
+Triggers (the first of these on a name that exists only in a lower):
+`open` for writing, with `O_TRUNC` or `O_CREAT` or neither; `truncate`;
+`chmod`; `utimensat`; `rename` or `unlink` or `rmdir` of it (see below);
+`link` with it as the source.
+
+Procedure, for a file `F` in directory `D`, under a lock held for the path
+(striped by hash, so two processes writing the same file wait for each
+other and the second finds the copy):
+
+1. Make every missing ancestor in the upper (`mkdirat`, with the lower's
+   mode and times). An ancestor that is a whiteout makes this `ENOENT`.
+2. Open the lower's file read-only.
+3. Create `.sbx-tmp.*` in the upper's `D` with `O_EXCL`.
+4. Copy the data (`copy_file_range`, falling back to `sendfile` and then
+   read/write; holes preserved with `SEEK_DATA`/`SEEK_HOLE`), then mode and
+   times. With `O_TRUNC` nothing is copied.
+5. `fsync` the temporary file.
+6. `renameat` it over `F` in the upper. If `F` is a whiteout this replaces
+   it, which is the re-create case.
+7. Open the final name as the caller asked and hand that descriptor over.
+
+Crash safety: before step 6 the upper has no `F` (the merged view still
+shows the lower's, unchanged); after it the upper's `F` is complete,
+because the data was flushed first. The only debris is a `.sbx-tmp.*`,
+removed the next time any copy-up enters that directory (the boot-id in the
+name tells a stale one from a live one), and when the host opens a layer.
+Directory fsync is not done by default (a lost rename is the same as the
+crash before step 6); `SBX_LAYER_DURABLE` adds it for hosts that need the
+write to survive power loss.
+
+A write-open of a large lower file copies it all, because the broker only
+learns that the descriptor will be written when it is asked to open it. The
+wanted layout keeps bases small (Wine's own files; no game data), and the
+broker logs and counts every copy-up with its size (`op` "copyup" in the
+audit), so a host finds a surprising one in its rig.
+
+#### mmap
+
+The descriptor handed over for a read-only open of a lower file is the
+lower's own file. `mmap` of it works unchanged: `PROT_READ`, `PROT_EXEC` (a
+DLL or `.so` loaded from the base) and `MAP_PRIVATE` with `PROT_WRITE`
+(kernel copy-on-write of the mapping; the file is not changed). A writable
+`MAP_SHARED` mapping needs a descriptor opened for writing, and that open
+copied the file up first, so it maps the upper's copy. A descriptor opened
+before a copy-up keeps showing the lower's bytes after another open has
+written the upper's copy; this is overlayfs's documented behaviour and is
+accepted. The filter does not need to change for any of this: `mmap` is
+untouched except on sealed descriptors.
+
+#### Unlink, rmdir
+
+- Name only in the upper: `unlinkat` it.
+- Name in a lower (alone or also in the upper): atomically replace the
+  upper's entry with a whiteout (create the whiteout with a temporary
+  name, `rename` it over the name). No copy-up of the data.
+- `rmdir` of a merged directory is allowed only when the merged listing is
+  empty. The upper's directory then holds only whiteouts and `.sbx-opaque`;
+  the broker unlinks those named entries one at a time (never a tree walk,
+  never following a link), removes the directory, and leaves a whiteout if a
+  lower has it. A crash between these steps leaves a directory that is
+  still empty in the merged view.
+- A directory removed and made again at the same name gets `.sbx-opaque`
+  before it becomes visible (made under a temporary name, then renamed; a
+  whiteout is removed first, so a crash there leaves the name deleted).
+
+#### Rename
+
+- File, name in the upper only: `renameat` in the upper.
+- File with a lower copy: copy-up of the source, `renameat` in the upper,
+  then a whiteout at the old name, in that order. A crash after the rename
+  and before the whiteout shows the file at both names (a duplicate, never
+  a loss). The other order (whiteout first) could lose the file, so it is
+  not used.
+- Directory that exists in a lower: overlayfs answers `EXDEV` and leaves
+  the caller to copy. Wine does not retry, so the broker copies the
+  directory up first (a copy, never a delete) when it has at most
+  `SBX_LAYER_RENAME_MAX` entries (default 4096), renames it, and leaves a
+  whiteout; above the limit it answers `EXDEV`. The destination, if it
+  exists, follows `rename(2)` (a directory only over an empty directory).
+- Flags: `RENAME_NOREPLACE` and `RENAME_EXCHANGE` are applied to the merged
+  view's answer (`EEXIST`, `ENOENT`); `RENAME_EXCHANGE` of two names that
+  need copy-up copies both up first.
+
+#### Hard links, symlinks, truncate
+
+The filter refuses `link`, `symlink` and path `truncate` today
+(`src/lockdown.c:1116-1121`, reply `EACCES`), and Wine uses all three
+(`dosdevices` links, `NtSetInformationFile` link and rename information,
+`SetEndOfFile` on a name). A new flag `SBX_LOCK_PATHOPS` makes them trap to
+the broker as `SBX_LINK`, `SBX_SYMLINK` and `SBX_TRUNCATE`; without it they
+stay refused as now, so no existing host changes behaviour.
+
+- `link(old, new)`: copy-up of `old` if it is only in a lower, then `linkat`
+  inside the upper. Both names then share the upper's inode. Two names that
+  were hard links inside a lower are separate files after a copy-up of
+  either (a prefix has none that matter; stated so it is not a surprise).
+  A link to a file outside the layered tree is refused as a cross-rule link.
+- `symlink(target, new)`: created in the upper. The target is stored as
+  given, never rewritten, and judged when followed (a link to a place the
+  rules do not grant is a link that cannot be followed).
+- `truncate(path, n)`: copy-up (without data when `n == 0`), then
+  `truncate` of the upper's copy by the broker.
+
+Not brokered, still refused: `mknod`, `chown` and friends, xattrs on a path,
+`inotify`/`fanotify` marks (Wine's change notifications fail with the same
+error it already handles when `inotify` is unavailable; a later
+`SBX_WATCH` could add a mark on an `inotify` descriptor the process hands
+over, as the socket calls do).
+
+#### Directory listing
+
+`getdents64` names no path, so the filter lets it through, and a merged
+directory cannot be listed by the kernel. The design reuses the mechanism
+that passthrough listing already has (see "Listing in passthrough"; the
+handler in `src/lockdown.c` lists a folder itself first and falls back to
+`SBX_LIST` when the kernel refuses):
+
+- For a directory that exists in a lower as well as the upper (or only in a
+  lower), the broker hands over an `O_PATH` descriptor of the upper's
+  directory (or of the lower's) instead of a readable one. `openat`,
+  `fstatat`, `fchdir` and `fstat` work on it; `getdents64` on it fails with
+  `EBADF` in the kernel.
+- The handler already tries the kernel first. With `SBX_LOCK_PATHOPS` it
+  forwards `SBX_LIST` on `EBADF` as well as on `EACCES`.
+- The broker builds the merged list once per open directory description (a
+  snapshot: layers in order, a name seen in a higher layer hiding the same
+  name below it, whiteouts and `.sbx-` names dropped, `d_type` and a
+  synthetic `d_ino` filled in, opaque upper directories not descending).
+  The snapshot is served in `SBX_LIST_MAX` pieces; the read position is
+  kept in the descriptor's own file position, which the broker sets to the
+  index of the next record, so `lseek(fd, 0, SEEK_SET)` and `rewinddir`
+  restart the snapshot with no new request type. (To be checked on ext4 and
+  f2fs with 4.19 and 6.1 kernels: that `lseek` on a directory descriptor
+  accepts small arbitrary offsets there. If one refuses, the snapshot is
+  keyed by the description's inode and a `getdents` at position 0 starts a
+  new one.)
+- A directory that exists only in the upper, and has no lower counterpart,
+  is handed over as an ordinary readable descriptor: its listing is the
+  kernel's own and costs nothing. Most of what a running game touches (its
+  saves, its temporary files) is of this kind.
+- The snapshot is shared by all descriptors of the same directory until a
+  mutation of that directory through the broker drops it, because Wine
+  scans a directory again for each case-mismatched lookup.
+
+#### Cost of the layers themselves
+
+On disk: a layer holds only what the game changed (registry hives, files
+it installed, its drive links and the components droidtop wrote for it) plus
+one symlink per whiteout. Copy-up is the one-off cost of a first write per
+file. Reads of base files are the lower's own descriptors: no copy, no
+broker work after the open. The per-open cost is the broker's lookup, one
+`fstatat` per layer per component on a cache miss.
+
+### 2. Path containment
+
+The broker's rules already refuse every path not granted (modes and
+longest-match rule, "The broker"; a refusal is `EACCES`; unlink and rename
+need `SBX_WRITE` on the resolved path). What this section adds is the
+**granted set** a host builds for a program such as Wine, and the rule about
+wide grants. The library takes no side on which folders; droidtop builds the
+list (droidtop SPEC 5a).
+
+A process that holds nothing but the following can reach nothing else, so
+it cannot delete or rewrite anything else:
+
+1. **Its prefix**: the layered tree (upper `SBX_READ | SBX_WRITE`, lowers
+   `SBX_READ`).
+2. **The runtime it executes**: the Wine build, the emulators, the
+   graphics drivers it loads and the system files Android gives every app,
+   all `SBX_READ`. The writable parts of the runtime are named one by one
+   (the guest's temporary directory, the sockets, the shared-memory files
+   for controllers, the shader caches), `SBX_WRITE`. No other part of the
+   host's private folder is granted. In particular **another game's layer and
+   the host's databases, keys and settings are outside the set**, so one
+   game cannot read or rewrite another's.
+3. **The game's folder**, `SBX_READ | SBX_WRITE` (a game writes its saves
+   and patches next to itself), unless the host grants it read-only.
+4. **The shares the person declared**, each with the mode the person chose.
+5. **Device nodes the process opens before the filter** (`own_opens`, see
+   "Process-bound devices"): the GPU nodes of the platform.
+
+The set is learned before it is enforced. A host can run a launch with the
+decider returning allow and writing every access the rules would have
+refused to its log (`rule_verdict` is already in `struct sbx_access`), play
+through the game's start, and fix the list from that. droidtop does this
+first for Wine on the rig and on the BlueStacks emulator and records the
+list in its SPEC; only then are the rules enforcing.
+
+#### Wide grants
+
+A **wide grant** is a rule that covers a place the process would not
+otherwise reach and that holds things beyond the program's own: the device
+root `/`, an internal-storage volume root (`/storage/emulated/N`,
+`/sdcard`), a removable volume root, or any directory above the host's own
+private folder or above another granted set. The library cannot know which
+those are for a host; droidtop classifies them (droidtop SPEC 5a) and the
+library provides the one thing both sides need: a rule can be given a
+**revocable tag** (`sbx_policy_add_tagged(policy, path, mode, tag)`) and the
+decider is asked about every access under it (the rule is `SBX_DECIDE`
+implicitly), so a grant switched off while the game runs stops working at
+once, and the audit names the tag a refusal came from.
+
+Two rules for wide grants, which the library enforces and the host cannot
+forget:
+
+- A wide grant never overrides a deny. A rule `SBX_DENY` on a longer path
+  wins (the longest rule decides), so a host that grants `/storage/emulated/0`
+  can still deny its own private folder under it, or another game's layer.
+  droidtop always adds those denies; "everything on the device's storage"
+  never means droidtop's own secrets.
+- A symlink never widens a grant. A link is judged by where it resolves,
+  which is why `z: -> /` in a prefix does nothing when `/` is not granted.
+  The broker never follows a link out of a granted tree on the host's
+  behalf. (The 2026-09-02 incident was a host-side delete that followed
+  `z:`. A host's own recursive operations on a prefix still need their own
+  fence; the library offers the layer operations in section 4, which never
+  follow a link.)
+
+### 3. Wine and proot under the broker
+
+#### What changes on the confined side
+
+Today a confined process cannot run another program, cannot use Unix
+sockets, and cannot ptrace, and the SIGSYS handler is set once in the
+process that called `sbx_lockdown` (see "The confined side"). Wine is a
+tree of processes that talk over Unix sockets and exec each other, and
+proot is a ptrace tracer. Three additions, each a flag, so no existing host
+changes behaviour:
+
+1. **`SBX_LOCK_EXEC`**: `execve` and `execveat` are allowed. The filter
+   cannot read the path, so it does not check it, and this is safe by the
+   model above: the filter is inherited across `exec` and `PR_SET_NO_NEW_PRIVS`
+   keeps it, so an image the process runs is confined exactly as the
+   process was, and everything it does that names a path still traps. What
+   is lost across `exec` is the handler, not the filter: signal handlers
+   are reset. An image without the handler dies with SIGSYS at its first
+   path call (fails closed).
+2. **`libsbx_child.so` and `sbx_attach_from_environment()`**: a small
+   library whose constructor reads `SBX_BROKER` (the path of a Unix socket
+   the host's broker listens on, in a directory only the host's UID can
+   enter) and `SBX_TOKEN` (a random token for this launch), connects, and
+   calls `sbx_lockdown` with the flags in `SBX_FLAGS` before `main` of the
+   image. The broker accepts a connection only from the host's own UID
+   (`SO_PEERCRED`) with the token. Put on `LD_PRELOAD`, it re-installs the
+   handler in every dynamically linked image the tree starts, including
+   after `exec`, with no change to the program. An image that drops
+   `LD_PRELOAD` (or is static) fails closed as above. Many processes share
+   one broker, each with its own connection and own pid in `SCM_CREDENTIALS`;
+   the broker serves them from a small pool of threads (default 4), with a
+   lock per directory for mutations and the copy-up lock above.
+3. **`SBX_LOCK_UNIX`**: `socket(AF_UNIX, SOCK_STREAM or SOCK_DGRAM)`,
+   `bind` and `connect` to a **path or abstract name** trap to the broker as
+   `SBX_BIND`/`SBX_CONNECT` (already defined for sockets, with the Unix
+   address as the body). The broker checks the socket path against the
+   rules (a path must be writable to bind and readable to connect) or the
+   abstract name against `sbx_policy_add_unix_name(policy, name, mode)`, and
+   does the call on the process's own socket, which travels to it as a
+   descriptor, as the inet calls already do. `socketpair` stays as it is. This
+   is what lets wineserver's socket, the X server, PulseAudio and the host's
+   renderer sockets exist.
+
+`SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
+four is "a program tree": it can run its own helpers and talk to the
+sockets the host named, and nothing else.
+
+Signal handlers: Wine builds that use Syscall User Dispatch for Windows
+programs that call the kernel directly install their own `SIGSYS` handler,
+which the filter refuses (a new `SIGSYS` handler gets `EPERM`). The library
+keeps the handler and records the program's `rt_sigaction(SIGSYS)` request
+(answered success), calling it for any `SIGSYS` that is not a seccomp trap
+(`si_code` `SYS_USER_DISPATCH`). Needed for an x86_64 Wine on an x86_64
+device (the BlueStacks rig) only; whether it arises on arm64 (Box64 and
+FEXCore emulate the guest's system calls in user space) is checked first.
+
+#### What goes through the broker (Wine)
+
+Through the broker, one round trip each: `openat`, `newfstatat`/`fstatat`,
+`faccessat`, `readlink`, `mkdirat`, `unlinkat`, `renameat2`, `statfs`,
+`chdir`, `getcwd`, `fchmodat`, `utimensat` with a path, and, with
+`SBX_LOCK_PATHOPS`, `linkat`, `symlinkat`, `truncate`; with `SBX_LOCK_UNIX`,
+`socket`, `bind`, `connect` on Unix sockets; `getdents64` only on the
+merged directories above. `statx` and `openat2` keep answering `ENOSYS`
+(libc falls back; the failed call costs a filter return, no round trip).
+
+Untouched: everything on a descriptor (`read`, `write`, `pread`, `mmap`,
+`ioctl`, `fcntl` and `flock`, `fstat`, `ftruncate`, `futimens`, `sendmsg`,
+`recvmsg`, `poll`), the clock and futex calls, `clone` without namespace
+flags, and `execve` (checked by nothing but the inherited filter). So a game
+that opens its assets once and reads them pays at open only.
+
+Still refused, with the effects to expect: `inotify` marks (directory change
+notification in Wine; games that rely on it, rare, see "Hard links, symlinks,
+truncate"), `ptrace`, `process_vm_*`, raw and netlink sockets.
+
+Wine's `libredirect-bionic-wx.so` (droidtop SPEC 5b: every guest process
+preloads it) redirects paths such as `/usr` and `/tmp` into the guest root
+in user space, before the system call. The broker sees the redirected,
+real path. The redirect is a convenience of the runtime, not a wall; the
+broker is the wall, and its rules are written against real paths.
+
+GPU: Vortek and VirGL render in the host process behind a Unix socket the
+rules grant, so the Wine process needs no GPU node. A Wrapper (Turnip,
+Qualcomm) driver runs in the Wine process and opens `/dev/kgsl-3d0` (or
+the platform's node), which is an `own_opens` entry opened by the
+constructor before the filter, as Enginehost does; the driver `.so` files
+are granted read-only (they are loaded from paths in the host's private
+files). The Android isolated UID is not used for Wine, since Wine needs
+the GPU (see "A UID of its own"); the broker and filter are its whole
+wall.
+
+#### Performance
+
+Nothing has been measured; these are the expectations to confirm, and the
+budget that decides whether the design stands.
+
+- A trapped call is a signal, two `sendmsg`/`recvmsg` pairs through a
+  socketpair made for the call, a path resolution, and (for an open) a
+  descriptor over `SCM_RIGHTS`. With the dentry cache a repeat lookup does
+  no file-system work. The first-launch cost is dominated by Wine loading
+  DLLs and walking its prefix: thousands of opens and stats once.
+- **Budget**: cold start of a game's first Wine process at most 10 percent
+  slower than unconfined; frame time unchanged (frames do not open files);
+  a game that opens or stats per frame is measured separately and gets a
+  `sbx_local_add` for the hot immutable files if needed.
+- To measure (in `tests/`, `bench_layers.c`, run on the rig and the
+  emulator by `sbx_test`): per-call latency of `open` and `stat` brokered
+  against plain, on a layered and an unlayered tree, 1 and 8 threads; a
+  prefix walk of 20 000 files; copy-up of 1 KB, 1 MB and 64 MB files;
+  merged listing of a 3 000-entry directory, first and repeated.
+- The handler-side shortcut that the passthrough mode has (making the call
+  itself, with the kernel deciding) is **not** used here: that mode is safe
+  only where another wall (an isolated UID) already holds, and the code
+  could use the same escape value itself.
+
+#### proot
+
+proot is the other half of droidtop's runtime (no-root Linux containers,
+`ProotRuntime`). It is a ptrace tracer that rewrites the paths of the
+processes it traces, so the filter cannot go on proot itself (it would lose
+`ptrace`). The design puts the wall on the traced processes, which are the
+guest's, and leaves proot, which droidtop starts, unconfined:
+
+1. droidtop's proot build already carries patches
+   (`build-scripts/proot-patches/`, droidtop SPEC 3 "The no-root backend").
+   One more: in the child proot forks for a traced program, after
+   `PTRACE_TRACEME` and before `execve`, call `sbx_attach_from_environment()`
+   with `SBX_LOCK_EXEC | SBX_LOCK_PATHOPS | SBX_LOCK_UNIX`. The filter is then
+   on every guest process and, by inheritance, on all they start.
+2. Ordering. On the kernels this must be checked on (Android's 4.19 and
+   later; arm64 and x86_64), a ptrace syscall-enter stop is reported
+   before seccomp runs. proot rewrites the guest's path to the host path
+   at that stop, then the filter traps, and the handler sends the
+   **already translated** path to the broker, which is what its rules
+   are written against. This is the first thing to prove (a spike, below).
+3. Results that proot translates back at the syscall-exit stop
+   (`readlink`, `getcwd`, `/proc/self/exe`) will not be translated for a
+   call the handler answered. The broker therefore translates them: the
+   container's binds are given to the policy as aliases (`sbx_policy_alias`
+   already maps a virtual folder to a real one and answers `getcwd` with the
+   virtual name) and the broker applies the reverse mapping to a link target
+   it returns.
+4. Static guest binaries (Go programs, some musl tools) have no preload
+   and would die at the first path call. proot already rewrites every
+   `execve` it sees; the patch in item 1 also makes proot's own loader
+   (which maps the program in the child) install the handler before the
+   program's entry. To be confirmed that the loader is used for every
+   `execve` in droidtop's build; if not, static binaries are the known gap.
+5. The fake root (`--root-id`), `--link2symlink` and `--sysvipc` are
+   proot's and unchanged. `link` of a guest hard link arrives as a
+   symlink creation by proot's own rewrite and is brokered like any other.
+
+The proot guest's granted set is: the container's rootfs (read-write; this
+is its own storage), the binds `EnvironmentMounts.binds` lists (home,
+shared storage, extra folders, with the modes the person set), the
+sockets droidtop binds (`ContainerLayout.SOCKET_DIR`), and the device
+nodes it opens. Layers for the rootfs (one base per image, a thin upper per
+container, the OCI layers as lowers) fit the same model and are the way to
+dedupe containers later; they are not part of this design.
+
+**Fallback if the spike fails.** If the ordering in item 2 does not hold on
+a target kernel, the same policy is evaluated in proot itself after it
+translates a path (the library's policy engine linked into the proot
+patch, `sbx_policy_check(path, need)`). That keeps one policy and one
+audit, but it is only as strong as proot's own call coverage and it can be
+raced by a multi-threaded guest changing the path between the check and the
+call. Containment against accident and against ordinary software, not
+against code that races; the owner decides whether that is acceptable
+(Droidtop/tracker#584, open question).
+
+#### What the host changes (droidtop)
+
+The library does not know droidtop. For orientation, the host side of this
+design is in droidtop's SPEC 5a and 5b: the launcher passes the broker's
+socket and token through the guest's environment (the launcher component
+already takes an environment map, `WineXSession.kt:240-244`), a shared
+binding of the library replaces the plugin host's private one, and the
+prefix is created as a layer.
+
+### 4. Library API summary (additions)
+
+Broker side:
+
+    sbx_policy_add_layer(policy, virtual_root, lowers, n, upper, flags)
+    sbx_policy_add_tagged(policy, path, mode, tag)        /* revocable; decider sees it */
+    sbx_policy_add_unix_name(policy, name, mode)          /* abstract Unix sockets */
+    sbx_broker_listen(policy, socket_path, token)         /* many connections, one policy, a thread pool */
+    sbx_layer_changed(policy, virtual_root)               /* host edited the upper; drop caches */
+
+Host-side layer operations, the same code the broker uses, callable by the
+host with no confined process (the host needs them to prepare and to
+manage a layer without a second implementation): `sbx_layer_open(mount, path,
+flags, mode)` (merged view, copy-up), `sbx_layer_copy_up(mount, path)`,
+`sbx_layer_unlink(mount, path)` (writes a whiteout), `sbx_layer_list(mount,
+path)`, `sbx_layer_check(upper)` (record and stale temporaries),
+`sbx_layer_forget(upper)` (see below).
+
+Confined side: flags `SBX_LOCK_EXEC`, `SBX_LOCK_PATHOPS`, `SBX_LOCK_UNIX`;
+`sbx_attach_from_environment()` and `libsbx_child.so`.
+
+`sbx_layer_forget` removes a layer: it unlinks the upper's entries one by
+one with `unlinkat` (never `rmdir` of a non-empty tree, never following a
+link, never leaving the upper's directory, and refusing a directory that
+is a mount point or has a different device from the upper's root) and
+reports the first failure. The same hazard class as the 2026-09-02 incident
+is what this function exists to prevent.
+
+### 5. Optional kernel help
+
+On a device where the host already has root (Shizuku or Sui, never `su`;
+droidtop SPEC 5b), an overlayfs mount of the same base and upper is a faster
+path to the same view, because the kernel then serves the merge. It would
+mean a Wine process outside the broker's view of the prefix, so the
+broker's own checks (the granted set) still apply and the layer format on
+disk is the broker's: overlayfs needs `trusted.overlay.*` attributes that
+the broker's whiteout symlinks are not, so the two are not interchangeable
+by pointing one at the other's directory. Not built, not required, and
+nothing in section 1 or 3 waits on it.
+
+### 6. Tests
+
+`tests/sbx_test.c` already runs each escape twice (unconfined, then
+confined). The same pattern covers: whiteout and re-create across a crash
+(a process killed between each step of copy-up and unlink, by hooks in the
+broker under a test flag, then the merged view checked); opaque
+directories; rename of a file, a directory and over a whiteout; hard link
+from a lower; mmap of a lower's file executable and private-writable;
+`ENOENT` for a whiteout and `EINVAL` for creating one; a listing of
+3 000 names before and after a mutation; two processes copying up the same
+file; a symlink in a lower that points outside (refused); a wide grant with
+a deny underneath; a tagged grant revoked mid-run; `exec` of a program
+without the handler (dies, nothing leaked); proot ordering spike on the
+emulator at API 28 and 34.
+
+### 7. Order of work
+
+1. Layers and the new broker operations, tested on Linux CI.
+2. The proot ordering spike on the emulator and the rig (item 2 above
+   decides proot's design).
+3. `SBX_LOCK_EXEC`, `SBX_LOCK_UNIX`, `libsbx_child.so` with a plain Wine on
+   the emulator, audit-only, to learn the granted set.
+4. Enforce; benchmark against the budget.
+
+### Open questions (for droidtop's owner, kept in Droidtop/tracker#584)
+
+See the issue; they concern policy, not the library: whether Wine may ever
+run without the wall, which proot fallback is acceptable, and what the
+"everything on the device" grant leaves out.
+
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the
@@ -374,3 +967,6 @@ adb shell 'cd /data/local/tmp && chmod 755 sbx_test-arm64-v8a gpu_probe-arm64-v8
 - **An Android AAR** with a Kotlin API over the same C core.
 - **Desktop-only hardening**: Landlock and namespaces, under the same
   broker.
+- **Layers, path containment and a tree of confined programs** (Wine and
+  proot under the broker), designed in "Layers, containment, and Wine and
+  proot under the broker"; nothing of it is built.
