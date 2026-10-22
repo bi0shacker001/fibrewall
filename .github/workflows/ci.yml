@@ -97,6 +97,8 @@ jobs:
             adb shell 'cd /data/local/tmp && ./gpu_probe; echo "probe_exit=$?"' || true
             adb shell 'cd /data/local/tmp && ./gpu_probe --no-seal; echo "probe_exit=$?"' || true
             adb logcat -d | grep -iE 'gpu_probe|binder|gralloc|mapper|F DEBUG|F libc|seccomp|avc' | tail -60 || true
+            adb shell 'grep -E "^(Sig|Shd)" /proc/self/status' | sed 's/^/::warning::shell /' || true
+            grep -E '^(FAIL|exit=)' result.txt | head -40 | sed 's/^/::error::/' || true
             grep -q '^exit=0' result.txt
 
   probe-binaries:
