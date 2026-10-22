@@ -1197,6 +1197,7 @@ int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
 }
 #endif
 
+#ifdef SBX_ARCH
 /*
  * Whether any thread of this process has SIGSYS blocked, from each
  * thread's SigBlk line in /proc/self/task/<tid>/status. Answered before the
@@ -1226,6 +1227,7 @@ static int sigsys_blocked_somewhere(void) {
     closedir(tasks);
     return found;
 }
+#endif
 
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
 #ifndef SBX_ARCH
