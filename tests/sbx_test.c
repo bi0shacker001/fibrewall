@@ -605,6 +605,115 @@ static int sigsys_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- Learning: nothing refused, everything that would have been recorded. ---- */
+
+long sbx_learn_call(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+
+struct learned {
+    int syscalls;      /* "syscall" records */
+    int socket_eacces; /* socket, recorded with EACCES */
+    int kill_eperm;    /* kill of another process, recorded with EPERM */
+    int unshare_eperm;
+    int path_refused;  /* a path the rules refused, which the decider let through */
+};
+
+static void learn_audit(void *context, const struct sbx_access *access, int result) {
+    struct learned *seen = context;
+    (void) result;
+    if (strcmp(access->op, "syscall") == 0) {
+        seen->syscalls++;
+        if (strncmp(access->asked, "socket(", 7) == 0 && access->rule_verdict == -EACCES) seen->socket_eacces++;
+        if (strncmp(access->asked, "kill(", 5) == 0 && access->rule_verdict == -EPERM) seen->kill_eperm++;
+        if (strncmp(access->asked, "unshare(", 8) == 0 && access->rule_verdict == -EPERM) seen->unshare_eperm++;
+    }
+}
+
+/* A learning host's decider: record what the rules refused, allow it. */
+static int learn_decide(void *context, const struct sbx_access *access) {
+    struct learned *seen = context;
+    if (access->rule_verdict < 0) seen->path_refused++;
+    return 0;
+}
+
+static int learn_check(void) {
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    char folder[PATH_MAX], file[PATH_MAX + 32];
+    snprintf(folder, sizeof(folder), "%s/sbx-learn-XXXXXX", tmp);
+    if (!mkdtemp(folder)) return 1;
+    snprintf(file, sizeof(file), "%s/not-in-the-rules", folder);
+    int made = open(file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (made < 0) return 1;
+    close(made);
+    int failed = 0;
+    static struct learned seen;
+    memset(&seen, 0, sizeof(seen));
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_set_audit(policy, learn_audit, &seen);
+    sbx_policy_set_decider(policy, learn_decide, &seen);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child == 0) {
+        struct sbx_lockdown_options learning = {.flags = SBX_LOCK_LEARN | SBX_LOCK_UNBROKERED};
+        EXPECT(sbx_lockdown(-1, &learning) == -EINVAL, "learn: not without the broker");
+        learning.flags = SBX_LOCK_LEARN;
+        EXPECT(sbx_lockdown(pair[1], &learning) == 0, "learn: lockdown");
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT(s >= 0 || errno == EAFNOSUPPORT, "learn: socket made, not refused");
+        if (s >= 0) close(s);
+        EXPECT(kill(parent, 0) == 0, "learn: a signal to another process is sent");
+        EXPECT(unshare(0) == 0, "learn: unshare made");
+        EXPECT(open(file, O_RDONLY) >= 0, "learn: a path the rules refuse is opened (the decider allowed it)");
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_IGN;
+        errno = 0;
+        EXPECT(sigaction(SIGSYS, &action, NULL) < 0 && errno == EPERM, "learn: a new SIGSYS handler is still refused");
+        errno = 0;
+        EXPECT(syscall(__NR_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0) < 0 && errno == EPERM,
+               "learn: clone into a new namespace is still refused");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = 1;
+    if (WIFSIGNALED(status)) printf("FAIL learn: the learning process died by signal %d\n", WTERMSIG(status));
+    usleep(100000);  /* the broker's thread audits each record before it answers; let the last land */
+    int socket_ok = seen.socket_eacces >= 1;
+    printf("%s learn: socket recorded with EACCES (%d)\n", socket_ok ? "ok  " : "FAIL", seen.socket_eacces);
+    printf("%s learn: kill of another process recorded with EPERM (%d)\n", seen.kill_eperm >= 1 ? "ok  " : "FAIL", seen.kill_eperm);
+    printf("%s learn: unshare recorded with EPERM (%d)\n", seen.unshare_eperm >= 1 ? "ok  " : "FAIL", seen.unshare_eperm);
+    printf("%s learn: the refused path reached the decider (%d)\n", seen.path_refused >= 1 ? "ok  " : "FAIL", seen.path_refused);
+    failed |= !socket_ok || seen.kill_eperm < 1 || seen.unshare_eperm < 1 || seen.path_refused < 1;
+
+    /* A real lockdown refuses the same calls, and does not let the trampoline through. */
+    int real_pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, real_pair) != 0) return 1;
+    if (sbx_broker_start(sbx_policy_new(), real_pair[0]) != 0) return 1;
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        EXPECT(sbx_lockdown(real_pair[1], NULL) == 0, "learn control: a real lockdown");
+        errno = 0;
+        EXPECT(socket(AF_INET, SOCK_STREAM, 0) < 0 && errno == EACCES, "learn control: socket refused");
+        errno = 0;
+        EXPECT(unshare(0) < 0 && errno == EPERM, "learn control: unshare refused");
+        EXPECT(sbx_learn_call(__NR_socket, AF_INET, SOCK_STREAM, 0, 0, 0, 0) == -EACCES,
+               "learn control: the trampoline is refused like any other call");
+        _exit(failures ? 1 : 0);
+    }
+    close(real_pair[1]);
+    waitpid(child, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = 1;
+    unlink(file);
+    rmdir(folder);
+    return failed;
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -1300,7 +1409,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

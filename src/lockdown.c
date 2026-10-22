@@ -132,6 +132,60 @@ static const int x86_args[6] = {REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_
 
 /* SECCOMP_RET_DATA of our traps, which tells them from anyone else's SIGSYS. */
 #define SBX_TRAP_DATA 0x5b0
+/* SBX_LOCK_LEARN's traps: a call a real lockdown refuses with EACCES, or with EPERM. */
+#define SBX_TRAP_LEARN_EACCES 0x5b1
+#define SBX_TRAP_LEARN_EPERM 0x5b2
+
+/*
+ * The learning trampoline: sbx_learn_call(nr, a0..a5) makes system call
+ * nr and answers its raw result (-errno on failure).
+ * sbx_learn_call_after is the instruction after its syscall, the address
+ * the kernel shows a learning filter (seccomp_data.instruction_pointer), so
+ * that filter can let exactly these calls through.
+ */
+long sbx_learn_call(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+extern const char sbx_learn_call_after[];
+#if defined(__x86_64__)
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".globl sbx_learn_call\n"
+        ".hidden sbx_learn_call\n"
+        ".type sbx_learn_call,@function\n"
+        "sbx_learn_call:\n"
+        "  mov %rdi, %rax\n"
+        "  mov %rsi, %rdi\n"
+        "  mov %rdx, %rsi\n"
+        "  mov %rcx, %rdx\n"
+        "  mov %r8, %r10\n"
+        "  mov %r9, %r8\n"
+        "  mov 8(%rsp), %r9\n"
+        "  syscall\n"
+        ".globl sbx_learn_call_after\n"
+        ".hidden sbx_learn_call_after\n"
+        "sbx_learn_call_after:\n"
+        "  ret\n"
+        ".size sbx_learn_call, .-sbx_learn_call\n");
+#elif defined(__aarch64__)
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".globl sbx_learn_call\n"
+        ".hidden sbx_learn_call\n"
+        ".type sbx_learn_call,%function\n"
+        "sbx_learn_call:\n"
+        "  mov x8, x0\n"
+        "  mov x0, x1\n"
+        "  mov x1, x2\n"
+        "  mov x2, x3\n"
+        "  mov x3, x4\n"
+        "  mov x4, x5\n"
+        "  mov x5, x6\n"
+        "  svc #0\n"
+        ".globl sbx_learn_call_after\n"
+        ".hidden sbx_learn_call_after\n"
+        "sbx_learn_call_after:\n"
+        "  ret\n"
+        ".size sbx_learn_call, .-sbx_learn_call\n");
+#endif
 
 static int broker = -1;
 static int locked;
@@ -803,6 +857,30 @@ static long sigmask_call(ucontext_t *uc, int how, const void *set, void *old, un
     return 0;
 }
 
+/*
+ * SBX_LOCK_LEARN: a call a real lockdown refuses with errno would. The
+ * broker records it (SBX_LEARN, answered before the call is made, so the
+ * records keep their order), then the call is made as asked, through the
+ * trampoline the learning filter lets through.
+ */
+static long learn_call(long nr, ucontext_t *uc, int would) {
+    struct sbx_learn_record record;
+    memset(&record, 0, sizeof(record));
+    record.nr = nr;
+    for (int i = 0; i < 6; i++) record.args[i] = ARG(uc, i);
+    record.would = would;
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = SBX_LEARN;
+    request.path_len = sizeof(record);
+    request.tid = (int32_t) syscall(__NR_gettid);
+    int passed;
+    exchange(&request, NULL, 0, &record, sizeof(record), NULL, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return sbx_learn_call(nr, ARG(uc, 0), ARG(uc, 1), ARG(uc, 2), ARG(uc, 3), ARG(uc, 4), ARG(uc, 5));
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
@@ -893,6 +971,15 @@ static long dispatch(long nr, ucontext_t *uc) {
 }
 
 static void on_sigsys(int signal_number, siginfo_t *info, void *context) {
+    int learning = info->si_code == SYS_SECCOMP &&
+                   (info->si_errno == SBX_TRAP_LEARN_EACCES || info->si_errno == SBX_TRAP_LEARN_EPERM);
+    if (learning) {
+        int saved_errno = errno;
+        ucontext_t *uc = (ucontext_t *) context;
+        SET_RESULT(uc, learn_call(info->si_syscall, uc, info->si_errno == SBX_TRAP_LEARN_EPERM ? EPERM : EACCES));
+        errno = saved_errno;
+        return;
+    }
     if (info->si_code != SYS_SECCOMP || info->si_errno != SBX_TRAP_DATA) {
         /* Not ours (the platform's own filter traps too): hand it on as if we were not here. */
         if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction != NULL) {
@@ -939,8 +1026,18 @@ static void rule(unsigned nr, unsigned action) {
 }
 
 #define TRAP (SECCOMP_RET_TRAP | SBX_TRAP_DATA)
-#define REFUSE (SECCOMP_RET_ERRNO | EACCES)
-#define DENY (SECCOMP_RET_ERRNO | EPERM)
+/*
+ * A refusal, or under SBX_LOCK_LEARN a trap that records the call and makes
+ * it (learn_call); the trap data says which errno a real lockdown answers.
+ * The _ALWAYS forms stay refusals in learning too.
+ */
+#define REFUSE_ALWAYS (SECCOMP_RET_ERRNO | EACCES)
+#define DENY_ALWAYS (SECCOMP_RET_ERRNO | EPERM)
+#define LEARN_EACCES (SECCOMP_RET_TRAP | SBX_TRAP_LEARN_EACCES)
+#define LEARN_EPERM (SECCOMP_RET_TRAP | SBX_TRAP_LEARN_EPERM)
+static unsigned refuse_action = REFUSE_ALWAYS, deny_action = DENY_ALWAYS;
+#define REFUSE refuse_action
+#define DENY deny_action
 #define NOSYS (SECCOMP_RET_ERRNO | ENOSYS)
 #define ALLOW SECCOMP_RET_ALLOW
 
@@ -995,15 +1092,32 @@ static void passthrough_block(unsigned nr, int two_directories) {
 
 static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
+    int learn = (flags & SBX_LOCK_LEARN) != 0;
+    refuse_action = learn ? LEARN_EACCES : REFUSE_ALWAYS;
+    deny_action = learn ? LEARN_EPERM : DENY_ALWAYS;
     load(offsetof(struct seccomp_data, arch));
     jeq(SBX_ARCH, 1, 0);
-    ret(REFUSE);
+    ret(REFUSE_ALWAYS);
     load(offsetof(struct seccomp_data, nr));
 #ifdef __x86_64__
     /* x32 calls share the architecture but set this bit. */
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1));
-    ret(REFUSE);
+    ret(REFUSE_ALWAYS);
 #endif
+    if (learn) {
+        /*
+         * The learning handler makes a recorded call through its own
+         * trampoline, which only a learning filter lets through: anything
+         * at that address would get past a real one.
+         */
+        uint64_t after = (uint64_t) (uintptr_t) sbx_learn_call_after;
+        load(offsetof(struct seccomp_data, instruction_pointer));
+        jeq((unsigned) after, 0, 3);
+        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+        jeq((unsigned) (after >> 32), 0, 1);
+        ret(ALLOW);
+        load(offsetof(struct seccomp_data, nr));
+    }
     int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (pass) {
@@ -1122,14 +1236,14 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     jeq(__NR_clone, 0, 4);
     load(ARG_LO(0));
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x7e020000u /* CLONE_NEW* */, 0, 1));
-    ret(DENY);
+    ret(DENY_ALWAYS);  /* even learning: a clone made from the handler would run the child on its stack */
     ret(ALLOW);
     if (!unbrokered) {
         /* The SIGSYS handler stays ours. */
         jeq(__NR_rt_sigaction, 0, 4);
         load(ARG_LO(0));
         jeq(SIGSYS, 0, 1);
-        ret(DENY);
+        ret(DENY_ALWAYS);  /* even learning: without our handler nothing after it would be recorded */
         ret(ALLOW);
         /* And SIGSYS stays open on every thread: the handler makes the call (sigmask_call). */
         rule(__NR_rt_sigprocmask, TRAP);
@@ -1241,6 +1355,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (unbrokered && pass) return -EINVAL;
+    /* Learning sends every record to the broker. */
+    if ((options->flags & SBX_LOCK_LEARN) && unbrokered) return -EINVAL;
     if ((options->flags & SBX_LOCK_INET) && (options->flags & SBX_LOCK_LOG_SOCKET)) return -EINVAL;
     /* The broker's network needs the broker, and replaces the process's own. */
     if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;

@@ -87,6 +87,21 @@ extern "C" {
  */
 #define SBX_LOCK_NET_BROKERED 0x10u
 
+/*
+ * Learning mode, for training a policy (docs/design.md, "Learning mode"):
+ * nothing the filter would refuse with EACCES or EPERM is refused. Each
+ * such call is sent to the broker as a record, which reaches the host's
+ * audit function as an access whose op is "syscall", whose asked is the
+ * call's name and first arguments, and whose rule_verdict is the errno a
+ * real lockdown answers; then the call is made. Three refusals stay: a
+ * call through another architecture's entry, a new SIGSYS handler, and
+ * clone with namespace flags. Paths still go through the broker, whose
+ * decider a learning host makes record and allow. A learning process has
+ * NO protection: never a default, and a host says so every time. Needs the
+ * broker (not with SBX_LOCK_UNBROKERED).
+ */
+#define SBX_LOCK_LEARN 0x20u
+
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
 #define SBX_CLAIMS_MAX 32
@@ -232,7 +247,8 @@ int sbx_policy_alias(struct sbx_policy *policy, const char *virtual_path, const 
 /* One brokered request, as the decider and the audit see it. */
 struct sbx_access {
     const char *op;        /* "open", "stat", "access", "readlink", "mkdir", "unlink", "rename", "statfs", "chdir",
-                              "getcwd", "list", "chmod", "utimens"; with SBX_LOCK_NET_BROKERED also "socket",
+                              "getcwd", "list", "chmod", "utimens"; with SBX_LOCK_LEARN "syscall"; with
+                              SBX_LOCK_NET_BROKERED also "socket",
                               "connect", "bind", "listen", "accept" */
     const char *asked;     /* the path as the confined code named it */
     const char *resolved;  /* the real path the broker would act on ("" when it could not be resolved) */

@@ -60,6 +60,16 @@ enum sbx_op {
     SBX_LISTEN = 17,   /* body = int backlog */
     SBX_ACCEPT = 18,   /* body = int accept4 flags; the reply carries the connection, data = the peer's
                           address, result = its length */
+    SBX_LEARN = 19,    /* SBX_LOCK_LEARN: body = struct sbx_learn_record, a call the filter would have refused;
+                          the broker audits it and answers 0, and the handler then makes the call */
+};
+
+/* One call a learning lockdown let through: its number, its arguments, and the errno it would have had. */
+struct sbx_learn_record {
+    int64_t nr;
+    int64_t args[6];
+    int32_t would;
+    int32_t reserved;
 };
 
 struct sbx_request {

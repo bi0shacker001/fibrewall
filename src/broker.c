@@ -1111,10 +1111,83 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
     net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0);
 }
 
+/* The name of a call a learning lockdown may record: the ones its filter refuses. */
+static const char *syscall_name(long nr) {
+    switch (nr) {
+#define NAME(call) case __NR_##call: return #call;
+#ifdef __NR_execve
+    NAME(execve)
+#endif
+#ifdef __NR_execveat
+    NAME(execveat)
+#endif
+    NAME(socket) NAME(connect) NAME(bind) NAME(ptrace) NAME(process_vm_readv) NAME(process_vm_writev)
+    NAME(bpf) NAME(perf_event_open) NAME(unshare) NAME(setns) NAME(mount) NAME(umount2) NAME(pivot_root)
+    NAME(chroot) NAME(add_key) NAME(request_key) NAME(keyctl) NAME(kcmp) NAME(tkill) NAME(kill) NAME(tgkill)
+    NAME(rt_sigqueueinfo) NAME(rt_tgsigqueueinfo) NAME(truncate) NAME(linkat) NAME(symlinkat) NAME(mknodat)
+    NAME(fchownat) NAME(setxattr) NAME(lsetxattr) NAME(getxattr) NAME(lgetxattr) NAME(listxattr)
+    NAME(llistxattr) NAME(removexattr) NAME(lremovexattr) NAME(inotify_add_watch) NAME(fanotify_mark)
+    NAME(name_to_handle_at) NAME(open_by_handle_at) NAME(ioctl) NAME(fcntl) NAME(dup) NAME(dup3) NAME(mmap)
+#ifdef __NR_link
+    NAME(link) NAME(symlink) NAME(mknod) NAME(chown) NAME(lchown) NAME(utime) NAME(utimes) NAME(futimesat)
+#endif
+#ifdef __NR_dup2
+    NAME(dup2)
+#endif
+#ifdef __NR_io_uring_setup
+    NAME(io_uring_setup) NAME(io_uring_enter) NAME(io_uring_register)
+#endif
+#ifdef __NR_pidfd_open
+    NAME(pidfd_open) NAME(pidfd_send_signal) NAME(pidfd_getfd)
+#endif
+#ifdef __NR_process_madvise
+    NAME(process_madvise)
+#endif
+#ifdef __NR_open_tree
+    NAME(open_tree) NAME(move_mount) NAME(fsopen) NAME(fsconfig) NAME(fsmount) NAME(fspick)
+#endif
+#undef NAME
+    default: return NULL;
+    }
+}
+
+/*
+ * A call a learning lockdown let through (SBX_LOCK_LEARN): audited as the
+ * access "syscall", named with its first three arguments, with the errno a
+ * real lockdown answers as the rules' verdict. Answered 0, after which the
+ * handler makes the call.
+ */
+static void learn_one(const struct sbx_policy *policy, const char *body, size_t body_len, pid_t pid, int answer) {
+    struct sbx_learn_record record;
+    if (body_len != sizeof(record)) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+    memcpy(&record, body, sizeof(record));
+    char asked[160];
+    const char *name = syscall_name((long) record.nr);
+    if (name) {
+        snprintf(asked, sizeof(asked), "%s(%#llx, %#llx, %#llx)", name, (unsigned long long) record.args[0],
+                 (unsigned long long) record.args[1], (unsigned long long) record.args[2]);
+    } else {
+        snprintf(asked, sizeof(asked), "syscall %lld(%#llx, %#llx, %#llx)", (long long) record.nr,
+                 (unsigned long long) record.args[0], (unsigned long long) record.args[1],
+                 (unsigned long long) record.args[2]);
+    }
+    struct sbx_access access = {
+        .op = "syscall", .asked = asked, .resolved = "", .need = 0, .flags = 0, .pid = pid,
+        .rule_verdict = -record.would,
+    };
+    policy->audit(policy->audit_context, &access, 0);
+    reply(answer, 0, NULL, 0, -1);
+}
+
 static void serve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
                       size_t body_len, int *fds, int fd_count, pid_t pid) {
     if (fd_count < 1) return;
     int answer = fds[0];
+    if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_LEARN) {
+        if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        learn_one(policy, body, body_len, pid, answer);
+        return;
+    }
     if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {
         net_one(policy, request, body, body_len, fds, fd_count, pid);
         return;

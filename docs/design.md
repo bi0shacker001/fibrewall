@@ -964,7 +964,7 @@ platform read-only list is the library's and shared with Enginehost.
 Open: a stronger mechanism for proot than the spike's outcomes (section 3).
 
 
-## Learning mode (design, 2026-10-22, Droidtop/tracker#550)
+## Learning mode (built 2026-10-22, Droidtop/tracker#550)
 
 The owner, 2026-10-22: "we need something like a permissive mode to train
 the sandbox". Like SELinux permissive or AppArmor complain mode: a process
@@ -1008,11 +1008,16 @@ The trampoline is allowed only in a learning filter. In a real lockdown an
 address the filter trusts would be a way around it, but a learning run has
 no protection to get around. The broker passes each record to the host's
 audit function as an access whose `op` is `"syscall"`, `asked` is the
-call's name for the architecture ("execve", "socket inet raw"...), and
-`rule_verdict` is the errno it would have had.
+call's name and first three arguments (`socket(0x2, 0x1, 0)`, or `syscall
+<number>(...)` for one the library has no name for), and `rule_verdict` is
+the errno it would have had. The record is answered before the call is
+made, so records arrive in order.
 
-A new SIGSYS handler is the one call that is recorded and still refused:
-the library's handler must stay in place, or nothing after it is recorded.
+Three refusals stay refusals, unrecorded, as in a real lockdown: a call
+through another architecture's entry, a new SIGSYS handler (the library's
+handler must stay in place, or nothing after it is recorded), and clone
+with namespace flags (a clone made from inside the handler would run the
+child on the handler's stack).
 An exec is recorded and allowed, but the new program keeps the filter and
 not the handler, so it dies by SIGSYS on its first trapped call: a learning
 run shows that a core execs, not what the program it runs would need.
