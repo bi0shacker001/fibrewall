@@ -612,14 +612,24 @@ it cannot delete or rewrite anything else:
    `SBX_READ`).
 2. **The runtime it executes**: the Wine build, the emulators, the
    graphics drivers it loads and the system files Android gives every app,
-   all `SBX_READ`. The writable parts of the runtime are named one by one
+   all `SBX_READ`. The Android part (system, vendor, apex, the device nodes
+   a graphics driver opens) is a **platform preset**,
+   `sbx_policy_add_platform_readonly(policy, platform)`, one list in the
+   library that Enginehost's rules and droidtop's Wine rules both use
+   (owner, 2026-10-22, "8: Yes"), so the list is written once; a host adds
+   only what is its own. The writable parts of the runtime are named one by one
    (the guest's temporary directory, the sockets, the shared-memory files
    for controllers, the shader caches), `SBX_WRITE`. No other part of the
    host's private folder is granted. In particular **another game's layer and
    the host's databases, keys and settings are outside the set**, so one
    game cannot read or rewrite another's.
-3. **The game's folder**, `SBX_READ | SBX_WRITE` (a game writes its saves
-   and patches next to itself), unless the host grants it read-only.
+3. **The game's folder**, `SBX_READ` only, with the subfolders the host
+   names writable (droidtop: any folder called `saves` or `savegames`, and
+   the folders the person adds per game; owner, 2026-10-22: "Determinant? A
+   folder named 'saves' or 'savegames', yes. Users can configure it
+   otherwise"). A longer `SBX_WRITE` rule under a `SBX_READ` one is the
+   existing longest-match behaviour; nothing new is needed. The audit shows
+   a refused write by path, which is how a host finds a folder to add.
 4. **The shares the person declared**, each with the mode the person chose.
 5. **Device nodes the process opens before the filter** (`own_opens`, see
    "Process-bound devices"): the GPU nodes of the platform.
@@ -829,8 +839,11 @@ patch, `sbx_policy_check(path, need)`). That keeps one policy and one
 audit, but it is only as strong as proot's own call coverage and it can be
 raced by a multi-threaded guest changing the path between the check and the
 call. Containment against accident and against ordinary software, not
-against code that races; the owner decides whether that is acceptable
-(Droidtop/tracker#584, open question).
+against code that races. Owner, 2026-10-22: "Yes, but we need a better
+solution": the spike goes ahead, this check is a **stopgap** for a failed
+spike and not the answer, and **a stronger mechanism for proot is an open
+item** (Droidtop/tracker#584). Nothing here may be described as equal to
+the filter.
 
 #### What the host changes (droidtop)
 
@@ -869,7 +882,16 @@ is a mount point or has a different device from the upper's root) and
 reports the first failure. The same hazard class as the 2026-09-02 incident
 is what this function exists to prevent.
 
-### 5. Optional kernel help
+### 5. Real copy-on-write where it exists, and optional kernel help
+
+The layers are for devices without kernel copy-on-write. Where a base and a
+new prefix sit on a file system with reflinks (`FICLONE`), the host makes
+the new prefix as a whole copy-on-write copy of the base and mounts no layer
+(owner, 2026-10-22: "If we have CoW, it's a whole new prefix. If we don't,
+we want a layer system"); the library supplies the probe,
+`sbx_fs_can_reflink(dir)` (clone a small file inside `dir`, report, remove
+it), so hosts do not each write one. Containment (section 2) is the same
+either way; only the dedup mechanism differs.
 
 On a device where the host already has root (Shizuku or Sui, never `su`;
 droidtop SPEC 5b), an overlayfs mount of the same base and upper is a faster
@@ -905,11 +927,16 @@ emulator at API 28 and 34.
    the emulator, audit-only, to learn the granted set.
 4. Enforce; benchmark against the budget.
 
-### Open questions (for droidtop's owner, kept in Droidtop/tracker#584)
+### Decided and open (Droidtop/tracker#584)
 
-See the issue; they concern policy, not the library: whether Wine may ever
-run without the wall, which proot fallback is acceptable, and what the
-"everything on the device" grant leaves out.
+Decided by droidtop's owner on 2026-10-22: Wine has no prompt and no "run
+anyway"; running unprotected is only a gated, never-recommended toggle in
+the host, so the library needs nothing for it beyond a host choosing not
+to lock a process down. The proot ordering spike goes ahead. A wide
+storage grant leaves out the host's private folders and other prefixes. The
+platform read-only list is the library's and shared with Enginehost.
+
+Open: a stronger mechanism for proot than the spike's outcomes (section 3).
 
 
 ## What it does not stop
