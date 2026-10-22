@@ -538,6 +538,64 @@ static int sealed_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- SIGSYS stays open: a blocked SIGSYS used to kill the process on its next trap. ---- */
+
+static void *block_sigsys_and_wait(void *arg) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGSYS);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    volatile int *go = (volatile int *) arg;
+    while (!*go) usleep(1000);
+    return NULL;
+}
+
+static int sigsys_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, "/etc", SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        /* A thread that blocked SIGSYS before lockdown: refused, not half-installed. */
+        static volatile int go = 0;
+        pthread_t blocker;
+        pthread_create(&blocker, NULL, block_sigsys_and_wait, (void *) &go);
+        usleep(50000);
+        EXPECT(sbx_lockdown(pair[1], NULL) == -EDEADLK, "sigsys: lockdown refused while a thread has SIGSYS blocked");
+        go = 1;
+        pthread_join(blocker, NULL);
+        EXPECT(sbx_lockdown(pair[1], NULL) == 0, "sigsys: lockdown once no thread blocks SIGSYS");
+        sigset_t set, old, now;
+        sigemptyset(&set);
+        sigaddset(&set, SIGSYS);
+        sigaddset(&set, SIGUSR1);
+        EXPECT(pthread_sigmask(SIG_BLOCK, &set, &old) == 0, "sigsys: blocking SIGSYS and SIGUSR1 answers success");
+        EXPECT(!sigismember(&old, SIGUSR1), "sigsys: the old mask comes back");
+        pthread_sigmask(SIG_BLOCK, NULL, &now);
+        EXPECT(sigismember(&now, SIGUSR1), "sigsys: SIGUSR1 is blocked as asked");
+        EXPECT(!sigismember(&now, SIGSYS), "sigsys: SIGSYS stays open");
+        int fd = open("/etc/hostname", O_RDONLY);
+        if (fd < 0) fd = open("/etc/passwd", O_RDONLY);
+        EXPECT(fd >= 0, "sigsys: a trapped open after trying to block SIGSYS still works");
+        sigfillset(&set);
+        EXPECT(pthread_sigmask(SIG_SETMASK, &set, NULL) == 0, "sigsys: setting a full mask answers success");
+        pthread_sigmask(SIG_BLOCK, NULL, &now);
+        EXPECT(sigismember(&now, SIGUSR1) && !sigismember(&now, SIGSYS), "sigsys: a full mask leaves SIGSYS out");
+        EXPECT(open("/etc/passwd", O_RDONLY) >= 0, "sigsys: and a trapped open still works");
+        errno = 0;
+        EXPECT(syscall(__NR_rt_sigprocmask, 99, &set, NULL, 8) < 0 && errno == EINVAL, "sigsys: a bad how is EINVAL");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (WIFSIGNALED(status)) printf("FAIL sigsys: the confined process died by signal %d\n", WTERMSIG(status));
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -1233,7 +1291,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

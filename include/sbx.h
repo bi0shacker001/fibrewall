@@ -133,7 +133,9 @@ struct sbx_lockdown_options {
  * Unix socket whose other end a broker serves; the process keeps it.
  * options may be NULL for the defaults. Returns 0 when every thread is
  * confined, or a negative errno when nothing was installed (never
- * half-installed). A caller that gets an error must not go on to run the
+ * half-installed); -EDEADLK means a thread has SIGSYS blocked, which would
+ * kill the process on its first trapped call (once confined, no thread can
+ * block it). A caller that gets an error must not go on to run the
  * code it meant to confine.
  */
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);

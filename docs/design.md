@@ -164,10 +164,35 @@ The filter:
   - The keyring, kcmp, the pidfd calls, tkill.
   - kill, tgkill and the sigqueue calls aimed at any process but this one.
   - A new SIGSYS handler.
+- **Traps and makes it on the thread's saved mask:** `rt_sigprocmask`, with
+  SIGSYS always left open ("SIGSYS stays open", below).
 - **Allows everything else,** including every call on a descriptor.
 
 Android's own app filter stays underneath. Filters stack, and the most
 restrictive answer wins.
+
+**SIGSYS stays open** (2026-10-22). A trapped call on a thread that has
+SIGSYS blocked does not reach the handler: the kernel resets SIGSYS to its
+default action and the whole process dies by signal 31, with no tombstone,
+since debuggerd's handler is reset too. Enginehost's LÖVE core died exactly
+this way about 40 ms after lockdown, 143 times in a row on BlueStacks
+(Droidtop/tracker#550), and a plain Linux reproduction (block SIGSYS, then
+open an allowed file) dies the same way. Libraries block signals on their
+threads routinely, often all of them. So:
+
+- `rt_sigprocmask` traps, and the handler makes the call on the interrupted
+  thread's saved mask (`uc_sigmask`), which the kernel installs when the
+  handler returns: the effect of the call, with SIGSYS always left out.
+  `pthread_sigmask`, bionic's own thread start and a library that blocks
+  "everything" all go through it. The old mask comes back as asked; a bad
+  `how` or size is `EINVAL`, as from the kernel.
+- `sbx_lockdown` answers `-EDEADLK` when a thread already has SIGSYS blocked
+  (read from each thread's `SigBlk` before the filter goes on), since that
+  thread would kill the process on its first trapped call. Nothing is
+  installed. A thread that blocks it between that check and the filter is
+  the one gap left.
+- A process locked down `SBX_LOCK_UNBROKERED` traps nothing and is
+  unaffected.
 
 The handler is **not** the trust boundary. Code that replaces it, or calls
 the kernel directly, only loses its own file access. The broker decides.

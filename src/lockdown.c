@@ -50,6 +50,8 @@
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
 #include <sys/uio.h>
+#include <dirent.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
@@ -768,10 +770,45 @@ static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int 
     return passed;
 }
 
+/* SIGSYS as a bit of the kernel's 64-bit signal mask. */
+#define SIGSYS_BIT (1ULL << (SIGSYS - 1))
+
+/*
+ * rt_sigprocmask, made on the interrupted thread's saved mask rather than
+ * with the call itself: the kernel restores that mask when the handler
+ * returns, so this is the call's effect, with SIGSYS always left open. A
+ * trap on a thread that has SIGSYS blocked kills the whole process (the
+ * kernel resets the handler to the default to deliver it), so no thread
+ * may block it once the filter is on (docs/design.md, "SIGSYS stays
+ * open").
+ */
+static long sigmask_call(ucontext_t *uc, int how, const void *set, void *old, unsigned long size) {
+    if (size != sizeof(uint64_t)) return -EINVAL;
+    uint64_t current;
+    memcpy(&current, &uc->uc_sigmask, sizeof(current));
+    uint64_t next = current;
+    if (set != NULL) {
+        uint64_t asked;
+        memcpy(&asked, set, sizeof(asked));
+        switch (how) {
+        case SIG_BLOCK: next = current | asked; break;
+        case SIG_UNBLOCK: next = current & ~asked; break;
+        case SIG_SETMASK: next = asked; break;
+        default: return -EINVAL;
+        }
+    }
+    if (old != NULL) memcpy(old, &current, sizeof(current));
+    next &= ~SIGSYS_BIT;
+    memcpy(&uc->uc_sigmask, &next, sizeof(next));
+    return 0;
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
     switch (nr) {
+    case __NR_rt_sigprocmask:
+        return sigmask_call(uc, (int) a0, (const void *) a1, (void *) a2, (unsigned long) a3);
     case __NR_openat:
         return open_path((int) a0, (const char *) a1, (int) a2, (uint32_t) a3, buffer);
     case __NR_newfstatat: {
@@ -1094,6 +1131,8 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         jeq(SIGSYS, 0, 1);
         ret(DENY);
         ret(ALLOW);
+        /* And SIGSYS stays open on every thread: the handler makes the call (sigmask_call). */
+        rule(__NR_rt_sigprocmask, TRAP);
     }
     /* Signals only to this process. */
     own_process_only(__NR_kill, pid);
@@ -1158,6 +1197,36 @@ int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
 }
 #endif
 
+/*
+ * Whether any thread of this process has SIGSYS blocked, from each
+ * thread's SigBlk line in /proc/self/task/<tid>/status. Answered before the
+ * filter goes on; afterwards no thread can block it (sigmask_call).
+ */
+static int sigsys_blocked_somewhere(void) {
+    DIR *tasks = opendir("/proc/self/task");
+    if (!tasks) return 0;
+    int found = 0;
+    struct dirent *entry;
+    while (!found && (entry = readdir(tasks)) != NULL) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char path[sizeof("/proc/self/task//status") + sizeof(entry->d_name)];
+        snprintf(path, sizeof(path), "/proc/self/task/%s/status", entry->d_name);
+        FILE *status = fopen(path, "re");
+        if (!status) continue;
+        char line[256];
+        while (fgets(line, sizeof(line), status)) {
+            unsigned long long blocked;
+            if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
+                found = (blocked & SIGSYS_BIT) != 0;
+                break;
+            }
+        }
+        fclose(status);
+    }
+    closedir(tasks);
+    return found;
+}
+
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
 #ifndef SBX_ARCH
     (void) broker_fd;
@@ -1185,6 +1254,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     for (unsigned k = 0; k < options->sealed_count; k++) {
         if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
     }
+    /* A thread that has SIGSYS blocked would kill the process on its first trapped call. */
+    if (!unbrokered && sigsys_blocked_somewhere()) return -EDEADLK;
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) return built;
     if (unbrokered) {
