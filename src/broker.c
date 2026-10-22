@@ -1113,6 +1113,8 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
 
 /* The name of a call a learning lockdown may record: the ones its filter refuses. */
 static const char *syscall_name(long nr) {
+#if defined(__x86_64__) || defined(__aarch64__)
+    /* Only these architectures lock down, so only their records arrive (32-bit ARM has no mmap, for one). */
     switch (nr) {
 #define NAME(call) case __NR_##call: return #call;
 #ifdef __NR_execve
@@ -1149,6 +1151,10 @@ static const char *syscall_name(long nr) {
 #undef NAME
     default: return NULL;
     }
+#else
+    (void) nr;
+    return NULL;
+#endif
 }
 
 /*
