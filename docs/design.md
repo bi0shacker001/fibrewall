@@ -964,6 +964,79 @@ platform read-only list is the library's and shared with Enginehost.
 Open: a stronger mechanism for proot than the spike's outcomes (section 3).
 
 
+## Learning mode (design, 2026-10-22, Droidtop/tracker#550)
+
+The owner, 2026-10-22: "we need something like a permissive mode to train
+the sandbox". Like SELinux permissive or AppArmor complain mode: a process
+runs with nothing refused, and everything that would have been refused is
+recorded, so a host can build and review a policy for code it did not write
+before it confines that code for real. It is a debugging and training mode.
+It is never a default, and a host must say plainly, every time, that a
+learning run has no protection.
+
+**What stays the same.** The filter, the handler and the broker run as in a
+real lockdown. Paths still go through the broker, so every path the code
+names is seen with its operation, flags and resolved form. The calls that
+fall back with `ENOSYS` (statx, openat2, clone3, fchmodat2) still do: they
+exist to steer path calls through the broker, and allowing them would hide
+the paths a profile is for. SIGSYS stays open ("SIGSYS stays open", above),
+which learning needs as much as a real run: a thread with SIGSYS blocked
+would otherwise die on its first recorded call.
+
+**Paths: the decider.** The broker already asks the host's decider about
+every request the rules refuse (`rule_verdict` < 0). A learning host gives
+a decider that records the access and returns 0. No library change is
+needed for files, folders, listing or the brokered network. The record
+carries `op`, `asked`, `resolved`, `need`, `flags` and `rule_verdict`, which
+is everything a rule needs.
+
+**Calls the filter refuses: `SBX_LOCK_LEARN`.** A lockdown flag. With it,
+every action that would refuse a call outright (`EACCES` or `EPERM`: exec,
+sockets beyond the flags given, ptrace, namespaces, mount, the keyring,
+signals to other processes, a new SIGSYS handler, sealed-descriptor calls,
+another architecture's entry) traps instead, with its own trap data
+(`SBX_TRAP_LEARN`). The handler then:
+
+1. sends the broker a record: the call's number, its six arguments and the
+   errno the real filter would have answered (`SBX_LEARN`, one message, no
+   reply);
+2. makes the call through the library's own syscall trampoline, which the
+   learning filter lets through by instruction pointer;
+3. returns the call's real result.
+
+The trampoline is allowed only in a learning filter. In a real lockdown an
+address the filter trusts would be a way around it, but a learning run has
+no protection to get around. The broker passes each record to the host's
+audit function as an access whose `op` is `"syscall"`, `asked` is the
+call's name for the architecture ("execve", "socket inet raw"...), and
+`rule_verdict` is the errno it would have had.
+
+A new SIGSYS handler is the one call that is recorded and still refused:
+the library's handler must stay in place, or nothing after it is recorded.
+An exec is recorded and allowed, but the new program keeps the filter and
+not the handler, so it dies by SIGSYS on its first trapped call: a learning
+run shows that a core execs, not what the program it runs would need.
+
+**What the library does not do.** It does not deduplicate, count, name
+the game's folders, or write files. Those depend on what the host knows (its
+game, save and cache folders, the core's build) and belong to the host: a
+learning decider and audit function see every record in order, on the
+broker's thread.
+
+**A profile, then a policy.** A host turns its records into a reviewable
+profile per core build. Paths are generalised to the host's folders (the
+game folder, the save folder, the cache, the core's own files), calls are
+named, and each entry carries a count. A tool proposes a policy diff from
+the profiles for a person to review. Nothing a learning run records is ever
+applied by itself.
+
+**Tests.** `sbx_test.c` runs a learning lockdown and checks, for exec,
+socket, ptrace, unshare and a path the rules refuse: the call succeeds as it
+would unconfined, exactly one record arrives with the call and the errno a
+real lockdown answers, and a new SIGSYS handler is still refused. A real
+lockdown in the same run still refuses all of them, and the trampoline is
+not let through by its filter.
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the
