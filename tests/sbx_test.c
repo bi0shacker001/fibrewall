@@ -551,10 +551,19 @@ static void *block_sigsys_and_wait(void *arg) {
 }
 
 static int sigsys_check(void) {
+    /* A file of the test's own: /etc/hostname and /etc/passwd are missing on Android 9's emulator. */
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    char folder[PATH_MAX], file[PATH_MAX + 16];
+    snprintf(folder, sizeof(folder), "%s/sbx-sigsys-XXXXXX", tmp);
+    if (!mkdtemp(folder)) return 1;
+    snprintf(file, sizeof(file), "%s/allowed", folder);
+    int made = open(file, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (made < 0) return 1;
+    close(made);
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
     struct sbx_policy *policy = sbx_policy_new();
-    sbx_policy_add(policy, "/etc", SBX_READ);
+    sbx_policy_add(policy, folder, SBX_READ);
     if (sbx_broker_start(policy, pair[0]) != 0) return 1;
     fflush(stdout);
     pid_t child = fork();
@@ -577,14 +586,12 @@ static int sigsys_check(void) {
         pthread_sigmask(SIG_BLOCK, NULL, &now);
         EXPECT(sigismember(&now, SIGUSR1), "sigsys: SIGUSR1 is blocked as asked");
         EXPECT(!sigismember(&now, SIGSYS), "sigsys: SIGSYS stays open");
-        int fd = open("/etc/hostname", O_RDONLY);
-        if (fd < 0) fd = open("/etc/passwd", O_RDONLY);
-        EXPECT(fd >= 0, "sigsys: a trapped open after trying to block SIGSYS still works");
+        EXPECT(open(file, O_RDONLY) >= 0, "sigsys: a trapped open after trying to block SIGSYS still works");
         sigfillset(&set);
         EXPECT(pthread_sigmask(SIG_SETMASK, &set, NULL) == 0, "sigsys: setting a full mask answers success");
         pthread_sigmask(SIG_BLOCK, NULL, &now);
         EXPECT(sigismember(&now, SIGUSR1) && !sigismember(&now, SIGSYS), "sigsys: a full mask leaves SIGSYS out");
-        EXPECT(open("/etc/passwd", O_RDONLY) >= 0, "sigsys: and a trapped open still works");
+        EXPECT(open(file, O_RDONLY) >= 0, "sigsys: and a trapped open still works");
         errno = 0;
         EXPECT(syscall(__NR_rt_sigprocmask, 99, &set, NULL, 8) < 0 && errno == EINVAL, "sigsys: a bad how is EINVAL");
         _exit(failures ? 1 : 0);
@@ -593,6 +600,8 @@ static int sigsys_check(void) {
     int status = 0;
     waitpid(child, &status, 0);
     if (WIFSIGNALED(status)) printf("FAIL sigsys: the confined process died by signal %d\n", WTERMSIG(status));
+    unlink(file);
+    rmdir(folder);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
