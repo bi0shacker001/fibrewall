@@ -717,6 +717,109 @@ static int learn_decide(void *context, const struct sbx_access *access) {
     return 0;
 }
 
+/* Answers one path slowly, so a signal can arrive while the handler waits for the broker. */
+static int slow_decide(void *context, const struct sbx_access *access) {
+    (void) context;
+    if (strcmp(access->asked, "/sbx-trace-slow") == 0) usleep(1000000);
+    return access->rule_verdict;
+}
+
+static void open_during_sigsys(int signal_number) {
+    (void) signal_number;
+    int opened = open("/sbx-trace-in-handler", O_RDONLY);
+    if (opened >= 0) close(opened);
+}
+
+/* The trace ring: each trapped call noted entered, then left, in a file another process reads. */
+static int trace_check(void) {
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    char ring_file[PATH_MAX];
+    snprintf(ring_file, sizeof(ring_file), "%s/sbx-trace-XXXXXX", tmp);
+    int ring_fd = mkstemp(ring_file);
+    if (ring_fd < 0) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    if (sbx_broker_start(sbx_policy_new(), pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        EXPECT(sbx_trace(ring_fd, 8) == -EINVAL, "trace: too few slots refused");
+        EXPECT(sbx_trace(ring_fd, 64) == 0, "trace: ring set up");
+        EXPECT(sbx_trace(ring_fd, 64) == -EALREADY, "trace: only once");
+        close(ring_fd);
+        struct sbx_lockdown_options audited = {.flags = SBX_LOCK_AUDIT};
+        EXPECT(sbx_lockdown(pair[1], &audited) == 0, "trace: lockdown with the kernel's audit");
+        int opened = open("/sbx-trace-no-such-file", O_RDONLY);
+        if (opened >= 0) close(opened);
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+    struct sbx_trace_header header;
+    int got = pread(ring_fd, &header, sizeof(header), 0) == (ssize_t) sizeof(header);
+    int header_ok = got && header.magic == SBX_TRACE_MAGIC && header.version == SBX_TRACE_VERSION &&
+                    header.slots == 64 && header.pid == child && header.locked == 1 && header.next >= 1;
+    printf("%s trace: the header names the process, locked, with %u entries\n", header_ok ? "ok  " : "FAIL",
+           got ? header.next : 0);
+    int found = 0;
+    for (uint32_t i = 0; header_ok && i < header.next && i < header.slots; i++) {
+        struct sbx_trace_entry entry;
+        if (pread(ring_fd, &entry, sizeof(entry), (off_t) (sizeof(header) + i * sizeof(entry))) != (ssize_t) sizeof(entry)) break;
+#ifdef __NR_open
+        int is_open = entry.nr == __NR_openat || entry.nr == __NR_open;
+#else
+        int is_open = entry.nr == __NR_openat;
+#endif
+        if (is_open && entry.seq != 0 && (entry.state & 0xff) == SBX_TRACE_LEFT && entry.tid == child &&
+            entry.ip != 0 && (entry.state >> 8) == 0x5b0)
+            found = 1;
+    }
+    printf("%s trace: the open was noted, entered and left, with its thread, address and trap data\n",
+           found ? "ok  " : "FAIL");
+
+    /*
+     * A death inside the handler: while it waits for the broker, another
+     * signal's handler makes a trapped call. SIGSYS is blocked while the
+     * handler runs, so the kernel ends the process with signal 31 and
+     * nothing else; the ring still says which call was being handled.
+     */
+    int slow_pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, slow_pair) != 0) return 1;
+    struct sbx_policy *slow = sbx_policy_new();
+    sbx_policy_set_decider(slow, slow_decide, NULL);
+    if (sbx_broker_start(slow, slow_pair[0]) != 0) return 1;
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        signal(SIGUSR1, open_during_sigsys);
+        if (sbx_trace(ring_fd, 64) != 0 || sbx_lockdown(slow_pair[1], NULL) != 0) _exit(2);
+        int opened = open("/sbx-trace-slow", O_RDONLY);
+        if (opened >= 0) close(opened);
+        _exit(3);
+    }
+    close(slow_pair[1]);
+    usleep(300000);
+    kill(child, SIGUSR1);
+    waitpid(child, &status, 0);
+    int killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS;
+    printf("%s trace: a trapped call in a signal handler that interrupted the handler ends the process with SIGSYS "
+           "(status %#x)\n", killed ? "ok  " : "FAIL", status);
+    int stuck = 0;
+    got = pread(ring_fd, &header, sizeof(header), 0) == (ssize_t) sizeof(header);
+    for (uint32_t i = 0; got && i < header.next && i < header.slots; i++) {
+        struct sbx_trace_entry entry;
+        if (pread(ring_fd, &entry, sizeof(entry), (off_t) (sizeof(header) + i * sizeof(entry))) != (ssize_t) sizeof(entry)) break;
+        if (entry.seq != 0 && (entry.state & 0xff) == SBX_TRACE_ENTERED && entry.tid == child) stuck++;
+    }
+    printf("%s trace: the ring shows the call it died handling, entered and never left (%d)\n",
+           stuck == 1 ? "ok  " : "FAIL", stuck);
+    close(ring_fd);
+    unlink(ring_file);
+    return failed | !header_ok | !found | !killed | (stuck != 1);
+}
+
 static int learn_check(void) {
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     char folder[PATH_MAX], file[PATH_MAX + 32];
@@ -2031,7 +2134,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | exec_helper_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | exec_helper_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
