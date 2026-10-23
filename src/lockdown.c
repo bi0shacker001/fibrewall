@@ -1556,7 +1556,16 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = on_sigsys;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    /*
+     * SA_NODEFER: SIGSYS stays deliverable while this handler runs. Without
+     * it the kernel blocks SIGSYS for the handler's duration, and a trapped
+     * call made meanwhile by another signal's handler on the same thread
+     * (ART's signal chain calls sigprocmask, which traps) kills the process
+     * with signal 31. Such a call now enters this handler again: each
+     * request has its own answer socket, the handler takes no lock, and
+     * errno is kept per entry.
+     */
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&action.sa_mask);
     if (error != 0) {
         /* Nothing installed yet. */
