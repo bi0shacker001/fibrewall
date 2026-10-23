@@ -1328,11 +1328,20 @@ static int sigsys_blocked_somewhere(void) {
         snprintf(path, sizeof(path), "/proc/self/task/%s/status", entry->d_name);
         FILE *status = fopen(path, "re");
         if (!status) continue;
+        /*
+         * A thread that has exited (Z, X) can still be listed for a moment
+         * after pthread_join returns, with its last mask; it makes no calls.
+         * State comes before SigBlk in the file.
+         */
         char line[256];
+        int exited = 0;
         while (fgets(line, sizeof(line), status)) {
+            char state;
             unsigned long long blocked;
-            if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
-                found = (blocked & SIGSYS_BIT) != 0;
+            if (sscanf(line, "State: %c", &state) == 1) {
+                exited = state == 'Z' || state == 'X';
+            } else if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
+                found = !exited && (blocked & SIGSYS_BIT) != 0;
                 break;
             }
         }

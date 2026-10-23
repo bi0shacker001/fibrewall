@@ -189,8 +189,9 @@ threads routinely, often all of them. So:
 - `sbx_lockdown` answers `-EDEADLK` when a thread already has SIGSYS blocked
   (read from each thread's `SigBlk` before the filter goes on), since that
   thread would kill the process on its first trapped call. Nothing is
-  installed. A thread that blocks it between that check and the filter is
-  the one gap left.
+  installed. A thread that has exited is skipped: it can still be listed,
+  with its last mask, for a moment after `pthread_join` returns. A thread
+  that blocks SIGSYS between that check and the filter is the one gap left.
 - A process locked down `SBX_LOCK_UNBROKERED` traps nothing and is
   unaffected.
 
