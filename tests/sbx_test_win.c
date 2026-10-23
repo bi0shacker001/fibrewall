@@ -538,7 +538,9 @@ int main(int argc, char **argv) {
         if (spawned == 0) {
             check_count = collect(read_end, confined, &confined_count, checks, 64);
             int code = -1;
-            EXPECT(sbx_process_wait(&process, &code) == 0 && code == 0, "the confined child exits cleanly");
+            int waited = sbx_process_wait(&process, &code);
+            printf("     the confined child's exit code: 0x%08x\n", (unsigned) code);
+            EXPECT(waited == 0 && code == 0, "the confined child exits cleanly");
         }
         CloseHandle(read_end);
     }

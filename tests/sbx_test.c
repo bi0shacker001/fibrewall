@@ -819,9 +819,10 @@ static int pathops_check(void) {
     /* The control: some hosts refuse hard links to everyone (Android's SELinux for the shell and apps). */
     write_file(source, "probe");
     int host_links = link(source, hard) == 0;
+    int link_error = errno;
     unlink(hard);
     unlink(source);
-    if (!host_links) printf("skip pathops: link between writable names (the host refuses it unconfined: %s)\n", strerror(errno));
+    if (!host_links) printf("skip pathops: link between writable names (the host refuses it unconfined: %s)\n", strerror(link_error));
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -924,16 +925,31 @@ static int unix_try(int bind_it, const char *path, int abstract) {
     return error;
 }
 
+/* The control for socket files: 0 when the host lets this process make one in folder, else the errno. */
+static int host_socket_files(const char *folder) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s/probe.sock", folder);
+    int s = unix_listener(path);
+    int error = s >= 0 ? 0 : errno;
+    if (s >= 0) close(s);
+    unlink(path);
+    return error;
+}
+
 static int unix_check(void) {
     char inside[400], outside[400], sock_link[400], made[400];
+    /* Some hosts let no one make socket files here (Android's shell in /data/local/tmp): those checks are skipped. */
+    int files_error = host_socket_files(save);
+    int files = files_error == 0;
+    if (!files) printf("skip unix: socket files (the host refuses them unconfined: %s)\n", strerror(files_error));
     snprintf(inside, sizeof(inside), "%s/server.sock", game);
     snprintf(outside, sizeof(outside), "%s/server.sock", secret);
     snprintf(sock_link, sizeof(sock_link), "%s/sock-link", save);
     snprintf(made, sizeof(made), "%s/child.sock", save);
-    int inside_server = unix_listener(inside), outside_server = unix_listener(outside);
+    int inside_server = files ? unix_listener(inside) : -1, outside_server = files ? unix_listener(outside) : -1;
     unlink(sock_link);
-    if (inside_server < 0 || outside_server < 0 || symlink(outside, sock_link) != 0) {
-        printf("FAIL unix: could not set up the servers\n");
+    if (files && (inside_server < 0 || outside_server < 0 || symlink(outside, sock_link) != 0)) {
+        printf("FAIL unix: could not set up the servers (%s)\n", strerror(errno));
         return 1;
     }
     int pair[2];
@@ -965,15 +981,18 @@ static int unix_check(void) {
         int seq = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
         EXPECT(seq >= 0, "unix: a seqpacket socket");
         if (seq >= 0) close(seq);
-        EXPECT(unix_try(0, inside, 0) == 0, "unix: connect to a socket in a readable rule");
-        EXPECT(unix_try(0, outside, 0) == -EACCES, "unix: connect to a socket outside the rules is refused");
-        EXPECT(unix_try(0, sock_link, 0) == -EACCES, "unix: connect through a link leading out is refused");
+        if (files) {
+            EXPECT(unix_try(0, inside, 0) == 0, "unix: connect to a socket in a readable rule");
+            EXPECT(unix_try(0, outside, 0) == -EACCES, "unix: connect to a socket outside the rules is refused");
+            EXPECT(unix_try(0, sock_link, 0) == -EACCES, "unix: connect through a link leading out is refused");
+        }
         EXPECT(unix_try(1, inside, 0) == -EACCES, "unix: bind in a read-only rule is refused");
         EXPECT(unix_try(1, "sbx-test-other", 1) == -EACCES, "unix: bind of an abstract name the policy lacks is refused");
         EXPECT(unix_try(0, "sbx-test-other", 1) == -EACCES, "unix: connect to one is refused");
 
         /* A server of its own in the writable rule, and a client of it. */
-        int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        int server = files ? socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) : -1;
+        if (files) {
         struct sockaddr_un address = {.sun_family = AF_UNIX};
         sun_path_set(&address, made);
         EXPECT(server >= 0 && bind(server, (struct sockaddr *) &address, sizeof(address)) == 0, "unix: bind in the writable rule");
@@ -988,6 +1007,7 @@ static int unix_check(void) {
         if (client >= 0) close(client);
         if (server >= 0) close(server);
         EXPECT(chdir(save) == 0 && unix_try(1, "relative.sock", 0) == 0, "unix: bind of a relative path in the writable rule");
+        }
         int named = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         struct sockaddr_un abstract = {.sun_family = AF_UNIX};
         memcpy(abstract.sun_path + 1, "sbx-test-name", 13);
@@ -1014,8 +1034,8 @@ static int unix_check(void) {
     close(pair[1]);
     int status = 0;
     waitpid(child, &status, 0);
-    close(inside_server);
-    close(outside_server);
+    if (inside_server >= 0) close(inside_server);
+    if (outside_server >= 0) close(outside_server);
     unlink(inside);
     unlink(outside);
     unlink(sock_link);
@@ -1198,6 +1218,12 @@ static int listen_check(const char *self) {
     snprintf(slash + 1, sizeof(library) - (size_t) (slash + 1 - library), "libsbx_child.so");
     char broker_path[400];
     snprintf(broker_path, sizeof(broker_path), "%s/broker.sock", root);
+    int files_error = host_socket_files(root);
+    if (files_error != 0) {
+        /* A host app makes the socket in its own data folder; this shell may make none here. */
+        printf("skip listen: the broker's socket file (the host refuses them unconfined: %s)\n", strerror(files_error));
+        return 0;
+    }
     struct sbx_listener *listener = NULL;
     struct sbx_policy *small = sbx_policy_new();
     EXPECT(sbx_broker_listen(small, broker_path, "short", &listener) == -EINVAL, "listen: a short token is refused");
