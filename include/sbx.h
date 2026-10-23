@@ -130,9 +130,10 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * such call is sent to the broker as a record, which reaches the host's
  * audit function as an access whose op is "syscall", whose asked is the
  * call's name and first arguments, and whose rule_verdict is the errno a
- * real lockdown answers; then the call is made. Three refusals stay: a
- * call through another architecture's entry, a new SIGSYS handler, and
- * clone with namespace flags. Paths still go through the broker, whose
+ * real lockdown answers; then the call is made. Exec is recorded and
+ * refused, since the new program would keep the filter but not the
+ * handler. Three refusals stay: a call through another architecture's
+ * entry, a new SIGSYS handler, and clone with namespace flags. Paths still go through the broker, whose
  * decider a learning host makes record and allow. A learning process has
  * NO protection: never a default, and a host says so every time. Needs the
  * broker (not with SBX_LOCK_UNBROKERED).
