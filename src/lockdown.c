@@ -881,10 +881,37 @@ static long learn_call(long nr, ucontext_t *uc, int would) {
     return sbx_learn_call(nr, ARG(uc, 0), ARG(uc, 1), ARG(uc, 2), ARG(uc, 3), ARG(uc, 4), ARG(uc, 5));
 }
 
+/* The kernel's struct sigaction for rt_sigaction, the same on x86_64 and arm64 (both have sa_restorer). */
+struct kernel_sigaction {
+    void *handler;
+    unsigned long flags;
+    void *restorer;
+    uint64_t mask;
+};
+
+/*
+ * rt_sigaction, made with SIGSYS left out of the new handler's mask: while
+ * a handler runs the kernel blocks its mask, and a trapped call made there
+ * with SIGSYS blocked kills the process (docs/design.md, "SIGSYS stays
+ * open"). The filter has already refused a new SIGSYS handler; the call is
+ * made through the trampoline, which a real filter lets through for this
+ * call alone.
+ */
+static long sigaction_call(long signal_number, const void *action, void *old, unsigned long size) {
+    if (size != sizeof(uint64_t)) return -EINVAL;
+    if (action == NULL) return sbx_learn_call(__NR_rt_sigaction, signal_number, 0, (long) old, (long) size, 0, 0);
+    struct kernel_sigaction copy;
+    memcpy(&copy, action, sizeof(copy));
+    copy.mask &= ~SIGSYS_BIT;
+    return sbx_learn_call(__NR_rt_sigaction, signal_number, (long) &copy, (long) old, (long) size, 0, 0);
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
     switch (nr) {
+    case __NR_rt_sigaction:
+        return sigaction_call(a0, (const void *) a1, (void *) a2, (unsigned long) a3);
     case __NR_rt_sigprocmask:
         return sigmask_call(uc, (int) a0, (const void *) a1, (void *) a2, (unsigned long) a3);
     case __NR_openat:
@@ -1239,12 +1266,22 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     ret(DENY_ALWAYS);  /* even learning: a clone made from the handler would run the child on its stack */
     ret(ALLOW);
     if (!unbrokered) {
-        /* The SIGSYS handler stays ours. */
-        jeq(__NR_rt_sigaction, 0, 4);
+        /*
+         * The SIGSYS handler stays ours. Any other handler is installed by our
+         * handler (sigaction_call), with SIGSYS left out of its mask, through
+         * the trampoline, which is let through here for rt_sigaction alone.
+         */
+        uint64_t after = (uint64_t) (uintptr_t) sbx_learn_call_after;
+        jeq(__NR_rt_sigaction, 0, 9);
         load(ARG_LO(0));
         jeq(SIGSYS, 0, 1);
         ret(DENY_ALWAYS);  /* even learning: without our handler nothing after it would be recorded */
+        load(offsetof(struct seccomp_data, instruction_pointer));
+        jeq((unsigned) after, 0, 3);
+        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+        jeq((unsigned) (after >> 32), 0, 1);
         ret(ALLOW);
+        ret(TRAP);
         /* And SIGSYS stays open on every thread: the handler makes the call (sigmask_call). */
         rule(__NR_rt_sigprocmask, TRAP);
     }
@@ -1312,6 +1349,23 @@ int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
 #endif
 
 #ifdef SBX_ARCH
+/*
+ * Takes SIGSYS out of every installed handler's mask, read and written with
+ * the raw call: ART's sigchain interposes sigaction(), and what blocks
+ * SIGSYS while a handler runs is the mask the kernel holds. Before the filter
+ * goes on; after it, sigaction_call keeps SIGSYS out of every new one.
+ */
+static void open_sigsys_in_handlers(void) {
+    for (int signal_number = 1; signal_number <= 64; signal_number++) {
+        if (signal_number == SIGKILL || signal_number == SIGSTOP || signal_number == SIGSYS) continue;
+        struct kernel_sigaction action;
+        if (syscall(__NR_rt_sigaction, signal_number, NULL, &action, sizeof(uint64_t)) != 0) continue;
+        if (action.handler == SIG_DFL || action.handler == SIG_IGN || !(action.mask & SIGSYS_BIT)) continue;
+        action.mask &= ~SIGSYS_BIT;
+        syscall(__NR_rt_sigaction, signal_number, &action, NULL, sizeof(uint64_t));
+    }
+}
+
 /*
  * Whether any thread of this process has SIGSYS blocked, from each
  * thread's SigBlk line in /proc/self/task/<tid>/status. Answered before the
@@ -1383,6 +1437,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     /* A thread that has SIGSYS blocked would kill the process on its first trapped call. */
     if (!unbrokered && sigsys_blocked_somewhere()) return -EDEADLK;
+    /* So would a handler whose mask blocks it, for any trapped call made while it runs. */
+    if (!unbrokered) open_sigsys_in_handlers();
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) return built;
     if (unbrokered) {

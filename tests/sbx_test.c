@@ -540,7 +540,28 @@ static int sealed_check(void) {
 
 /* ---- SIGSYS stays open: a blocked SIGSYS used to kill the process on its next trap. ---- */
 
+/* A handler that makes trapped calls; installed with every signal masked. */
+static const char *handler_file;
+static volatile int handler_opened = -2;
+static void open_in_handler(int signal_number) {
+    (void) signal_number;
+    sigset_t none;
+    sigemptyset(&none);
+    pthread_sigmask(SIG_BLOCK, &none, NULL);
+    handler_opened = open(handler_file, O_RDONLY | O_CLOEXEC);
+}
+
+static void install_masked(int signal_number) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = open_in_handler;
+    sigfillset(&action.sa_mask);
+    sigaction(signal_number, &action, NULL);
+}
+
 /* go[0]: set by the thread once SIGSYS is blocked; go[1]: set by the test to let it end. */
+long sbx_learn_call(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+
 static void *block_sigsys_and_wait(void *arg) {
     sigset_t set;
     sigemptyset(&set);
@@ -579,7 +600,26 @@ static int sigsys_check(void) {
         EXPECT(sbx_lockdown(pair[1], NULL) == -EDEADLK, "sigsys: lockdown refused while a thread has SIGSYS blocked");
         go[1] = 1;
         pthread_join(blocker, NULL);
+        handler_file = file;
+        install_masked(SIGUSR1);
         EXPECT(sbx_lockdown(pair[1], NULL) == 0, "sigsys: lockdown once no thread blocks SIGSYS");
+        raise(SIGUSR1);
+        EXPECT(handler_opened >= 0, "sigsys: a handler installed before lockdown with every signal masked makes trapped calls");
+        install_masked(SIGUSR2);
+        handler_opened = -2;
+        raise(SIGUSR2);
+        EXPECT(handler_opened >= 0, "sigsys: one installed after lockdown with every signal masked makes them too");
+        struct sigaction now_action;
+        sigaction(SIGUSR2, NULL, &now_action);
+        EXPECT(!sigismember(&now_action.sa_mask, SIGSYS) && sigismember(&now_action.sa_mask, SIGTERM),
+               "sigsys: its mask is the one asked, with SIGSYS left out");
+        struct sigaction sys_action;
+        memset(&sys_action, 0, sizeof(sys_action));
+        sys_action.sa_handler = SIG_IGN;
+        errno = 0;
+        EXPECT(sigaction(SIGSYS, &sys_action, NULL) < 0 && errno == EPERM, "sigsys: a new SIGSYS handler is still refused");
+        EXPECT(sbx_learn_call(__NR_rt_sigaction, SIGSYS, (long) &sys_action, 0, 8, 0, 0) == -EPERM,
+               "sigsys: and refused through the trampoline too");
         sigset_t set, old, now;
         sigemptyset(&set);
         sigaddset(&set, SIGSYS);

@@ -192,6 +192,19 @@ threads routinely, often all of them. So:
   installed. A thread that has exited is skipped: it can still be listed,
   with its last mask, for a moment after `pthread_join` returns. A thread
   that blocks SIGSYS between that check and the filter is the one gap left.
+- **Handler masks** (2026-10-23). While a signal handler runs, the kernel
+  blocks the signals in its mask, and libraries install handlers with every
+  signal masked (ART's signal chain among them). A trapped call made inside
+  one, or an `rt_sigprocmask` there, killed the process by signal 31 just
+  the same: Enginehost's LÖVE core still looped on it with the thread masks
+  fixed, and learning recorded nothing, since the record travels through the
+  same trap. So `sbx_lockdown` first takes SIGSYS out of every installed
+  handler's mask (raw `rt_sigaction`, since ART interposes `sigaction()`).
+  After it, `rt_sigaction` traps, and the handler installs the new handler
+  with SIGSYS left out of its mask, through the library's trampoline, which
+  the filter lets through for `rt_sigaction` alone, after refusing a new
+  SIGSYS handler. A handler whose mask SIGSYS was taken from can now be
+  interrupted by SIGSYS, which only ever comes from our own traps.
 - A process locked down `SBX_LOCK_UNBROKERED` traps nothing and is
   unaffected.
 
@@ -1005,9 +1018,10 @@ another architecture's entry) traps instead, with its own trap data
    learning filter lets through by instruction pointer;
 3. returns the call's real result.
 
-The trampoline is allowed only in a learning filter. In a real lockdown an
-address the filter trusts would be a way around it, but a learning run has
-no protection to get around. The broker passes each record to the host's
+A learning filter lets the trampoline make any call. A real filter lets it
+make `rt_sigaction` alone, after refusing a new SIGSYS handler ("SIGSYS stays
+open"): code that jumps there can install a handler, which it could do
+anyway, and nothing else. The broker passes each record to the host's
 audit function as an access whose `op` is `"syscall"`, `asked` is the
 call's name and first three arguments (`socket(0x2, 0x1, 0)`, or `syscall
 <number>(...)` for one the library has no name for), and `rule_verdict` is
