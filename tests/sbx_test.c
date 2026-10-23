@@ -816,6 +816,12 @@ static int pathops_check(void) {
     snprintf(followed, sizeof(followed), "%s/p-followed", save);
     snprintf(data, sizeof(data), "%s/data.txt", game);
     snprintf(key, sizeof(key), "%s/key", secret);
+    /* The control: some hosts refuse hard links to everyone (Android's SELinux for the shell and apps). */
+    write_file(source, "probe");
+    int host_links = link(source, hard) == 0;
+    unlink(hard);
+    unlink(source);
+    if (!host_links) printf("skip pathops: link between writable names (the host refuses it unconfined: %s)\n", strerror(errno));
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
@@ -828,9 +834,11 @@ static int pathops_check(void) {
         int fd = open(source, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
         EXPECT(fd >= 0 && write(fd, "four", 4) == 4, "pathops: a file in the writable rule");
         if (fd >= 0) close(fd);
-        EXPECT(link(source, hard) == 0, "pathops: link between two writable names");
         struct stat a, b;
-        EXPECT(stat(source, &a) == 0 && stat(hard, &b) == 0 && a.st_ino == b.st_ino, "pathops: and both name one file");
+        if (host_links) {
+            EXPECT(link(source, hard) == 0, "pathops: link between two writable names");
+            EXPECT(stat(source, &a) == 0 && stat(hard, &b) == 0 && a.st_ino == b.st_ino, "pathops: and both name one file");
+        }
         errno = 0;
         EXPECT(refused(link(data, stolen)), "pathops: link of a read-only file into a writable rule is refused");
         errno = 0;
