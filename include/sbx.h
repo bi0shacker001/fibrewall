@@ -330,6 +330,13 @@ struct sbx_trace_entry {
 int sbx_trace(int fd, unsigned slots);
 
 /*
+ * The name of a system call the lockdown traps or refuses, for a trace or
+ * a learning record ("openat", "rt_sigprocmask"); NULL for any other, and
+ * on an architecture that does not lock down.
+ */
+const char *sbx_syscall_name(long nr);
+
+/*
  * sbx_local_add with a mode: SBX_READ, or SBX_READ | SBX_WRITE for a file
  * the host opened for writing and hands over to be written by name (an
  * open asking to write is then answered too, and O_TRUNC empties the
