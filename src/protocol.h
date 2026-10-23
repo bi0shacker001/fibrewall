@@ -78,6 +78,20 @@ enum sbx_op {
      * opened read-only, and the broker answers the sender's /proc/<pid>/exe with it from then on.
      */
     SBX_EXEC = 25,
+    /* SBX_LOCK_SIGNAL_TREE: body = struct sbx_signal_request; the broker sends the signal when the target is the tree's */
+    SBX_SIGNAL = 26,
+};
+
+/* The calls SBX_SIGNAL carries. */
+enum sbx_signal_kind { SBX_SIG_KILL, SBX_SIG_TGKILL, SBX_SIG_TKILL, SBX_SIG_QUEUEINFO, SBX_SIG_TGQUEUEINFO };
+
+/* A signal for the broker to send: kill(tgid), tgkill(tgid, tid), tkill(tid), and the sigqueueinfo pair with info. */
+struct sbx_signal_request {
+    int32_t kind;
+    int32_t tgid;
+    int32_t tid;
+    int32_t signal;
+    uint8_t info[128];
 };
 
 /* One call a learning lockdown let through: its number, its arguments, and the errno it would have had. */

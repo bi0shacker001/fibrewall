@@ -824,8 +824,22 @@ were never refused. What the preset still refuses, whatever the flags:
 flags, `unshare`, `setns`), mounts and the new mount API, `chroot`,
 `pivot_root`, `bpf`, `perf_event_open`, `io_uring`, module loading, the
 keyring, `kcmp` and the pidfd calls. Judged variants stay opt-in: with
-`SBX_LOCK_UNIX` the broker judges Unix `bind` and `connect`, and a
-brokered signal-tree check can follow. What the outright flags give up is
+`SBX_LOCK_UNIX` the broker judges Unix `bind` and `connect`, and
+`SBX_LOCK_SIGNAL_TREE` (instead of `SBX_LOCK_SIGNALS`) has the broker judge
+signals.
+
+**`SBX_LOCK_SIGNAL_TREE` (built 2026-10-23, #584 item 5, opt-in).** A
+signal to the pid the lockdown saw still goes to the kernel. `kill`,
+`tgkill`, `tkill` and the sigqueue calls to any other target trap to
+the broker (`SBX_SIGNAL`). The broker sends the signal itself when the
+target is the sender (a forked child signalling itself, the case the
+baked pid refuses), or when it is in the tree. The tree is every process
+that has made a request to a broker of the policy, recorded with its start
+time so a reused pid does not count, together with their descendants
+(found through `/proc/<pid>/stat`). Anything else is refused with `EPERM`,
+unless the decider allows the `"signal"` access. Process groups stay
+refused. The receiver sees the broker's pid in `si_pid`. Recording costs a
+scan per request, and a `/proc` read only for a pid not seen before. What the outright flags give up is
 stated where they are declared (`include/sbx.h`): with `SBX_LOCK_SOCKETS`
 the process can reach any socket of its UID, the host's own included, and
 create socket files wherever the UID may write.

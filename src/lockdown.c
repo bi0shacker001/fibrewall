@@ -1032,6 +1032,27 @@ static long sigaction_call(long signal_number, const void *action, void *old, un
     return through(__NR_rt_sigaction, signal_number, (long) &copy, (long) old, (long) size, 0, 0);
 }
 
+/* A signal the filter sent to the broker (SBX_LOCK_SIGNAL_TREE): the broker decides and sends it. */
+static long signal_call(int kind, long tgid, long tid, long signal_number, const void *info) {
+    struct sbx_signal_request body;
+    memset(&body, 0, sizeof(body));
+    body.kind = kind;
+    body.tgid = (int32_t) tgid;
+    body.tid = (int32_t) tid;
+    body.signal = (int32_t) signal_number;
+    if (info) memcpy(body.info, info, sizeof(body.info));
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = SBX_SIGNAL;
+    request.path_len = sizeof(body);
+    request.tid = (int32_t) syscall(__NR_gettid);
+    int passed;
+    long result = exchange(&request, NULL, 0, &body, sizeof(body), NULL, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
 /* value in decimal into out (at least 12 bytes), with no stdio in the handler. */
 static char *decimal(char *out, unsigned value) {
     char digits[12];
@@ -1143,6 +1164,16 @@ static long dispatch(long nr, ucontext_t *uc) {
         return sigmask_call(uc, (int) a0, (const void *) a1, (void *) a2, (unsigned long) a3);
     case __NR_openat:
         return open_path((int) a0, (const char *) a1, (int) a2, (uint32_t) a3, buffer);
+    case __NR_kill:
+        return signal_call(SBX_SIG_KILL, a0, 0, a1, NULL);
+    case __NR_tgkill:
+        return signal_call(SBX_SIG_TGKILL, a0, a1, a2, NULL);
+    case __NR_tkill:
+        return signal_call(SBX_SIG_TKILL, 0, a0, a1, NULL);
+    case __NR_rt_sigqueueinfo:
+        return signal_call(SBX_SIG_QUEUEINFO, a0, 0, a1, (const void *) a2);
+    case __NR_rt_tgsigqueueinfo:
+        return signal_call(SBX_SIG_TGQUEUEINFO, a0, a1, a2, (const void *) a3);
     case __NR_execve:
         return exec_call(AT_FDCWD, (const char *) a0, (char *const *) a1, (char *const *) a2, 0);
     case __NR_execveat:
@@ -1377,14 +1408,14 @@ static unsigned refuse_action = REFUSE_ALWAYS, deny_action = DENY_ALWAYS;
  */
 
 /* nr is allowed only when its first argument is this process. */
-static void own_process_only(unsigned nr, pid_t pid) {
+static void own_process_only(unsigned nr, pid_t pid, unsigned otherwise) {
     jeq(nr, 0, 6);
     load(ARG_LO(0));
     jeq((unsigned) pid, 0, 3);
     load(ARG_HI(0));
     jeq(0, 0, 1);
     ret(ALLOW);
-    ret(DENY);
+    ret(otherwise);
 }
 
 /* nr is refused when its argument arg is one of the sealed descriptors (compared as the kernel reads an fd: 32 bits). */
@@ -1674,10 +1705,13 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     /* Signals only to this process, unless SBX_LOCK_SIGNALS leaves them to the kernel. */
     if (!(flags & SBX_LOCK_SIGNALS)) {
-        own_process_only(__NR_kill, pid);
-        own_process_only(__NR_tgkill, pid);
-        own_process_only(__NR_rt_sigqueueinfo, pid);
-        own_process_only(__NR_rt_tgsigqueueinfo, pid);
+        /* With SBX_LOCK_SIGNAL_TREE, any other target goes to the broker (signal_call). */
+        unsigned otherwise = (flags & SBX_LOCK_SIGNAL_TREE) ? TRAP : DENY;
+        own_process_only(__NR_kill, pid, otherwise);
+        own_process_only(__NR_tgkill, pid, otherwise);
+        own_process_only(__NR_rt_sigqueueinfo, pid, otherwise);
+        own_process_only(__NR_rt_tgsigqueueinfo, pid, otherwise);
+        if (flags & SBX_LOCK_SIGNAL_TREE) rule(__NR_tkill, TRAP);
     }
     /* Sealed descriptors: kept, but no longer used. */
     if (sealed_count > 0) {
@@ -1738,7 +1772,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_pidfd_send_signal, __NR_tkill, __NR_init_module, __NR_finit_module, __NR_delete_module,
     };
     for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) {
-        if (denied[i] == __NR_tkill && (flags & SBX_LOCK_SIGNALS)) continue;
+        if (denied[i] == __NR_tkill && (flags & (SBX_LOCK_SIGNALS | SBX_LOCK_SIGNAL_TREE))) continue;
         rule(denied[i], DENY);
     }
     ret(ALLOW);
@@ -1842,6 +1876,10 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     /* Brokered Unix sockets need the broker, and are not the brokered network's (which has its own Unix rules). */
     if ((options->flags & SBX_LOCK_UNIX) && (options->flags & (SBX_LOCK_UNBROKERED | SBX_LOCK_NET_BROKERED))) {
+        return -EINVAL;
+    }
+    /* Signals left to the kernel, or judged by the broker: one or the other, and judging needs the broker. */
+    if ((options->flags & SBX_LOCK_SIGNAL_TREE) && (options->flags & (SBX_LOCK_SIGNALS | SBX_LOCK_UNBROKERED))) {
         return -EINVAL;
     }
     /* The process's own sockets, or the broker's: one or the other. */

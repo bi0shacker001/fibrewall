@@ -1304,6 +1304,79 @@ static int contain_check(const char *self) {
     return failed;
 }
 
+/* ---- SBX_LOCK_SIGNAL_TREE: signals judged by the broker, within the tree it serves. ---- */
+
+static int signal_tree_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    pid_t outside = getpid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_SIGNAL_TREE | SBX_LOCK_SIGNALS};
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "signal tree: not with SBX_LOCK_SIGNALS");
+        options.flags = SBX_LOCK_SIGNAL_TREE;
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "signal tree: lockdown");
+        if (locked != 0) _exit(1);
+        /* A request of its own makes this process a member of the tree. */
+        char data[400];
+        snprintf(data, sizeof(data), "%s/data.txt", game);
+        int fd = open(data, O_RDONLY);
+        if (fd >= 0) close(fd);
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &action, NULL);
+        pid_t member = getpid();
+        int ready[2];
+        if (pipe(ready) != 0) _exit(1);
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            close(ready[0]);
+            usr1_seen = 0;
+            errno = 0;
+            EXPECT(kill(getpid(), SIGUSR1) == 0 && usr1_seen, "signal tree: a forked child signals itself");
+            errno = 0;
+            EXPECT(kill(member, 0) == 0, "signal tree: and the process it came from (a member)");
+            errno = 0;
+            EXPECT(kill(outside, 0) < 0 && errno == EPERM, "signal tree: a process outside the tree refused (EPERM)");
+            errno = 0;
+            EXPECT(kill(0, 0) < 0 && errno == EPERM, "signal tree: its process group refused (EPERM)");
+            errno = 0;
+            EXPECT(syscall(__NR_tkill, (pid_t) syscall(__NR_gettid), 0) == 0, "signal tree: tkill of its own thread");
+            fflush(stdout);
+            (void) !write(ready[1], "r", 1);
+            pause();
+            _exit(failures ? 1 : 0);
+        }
+        close(ready[1]);
+        char byte;
+        (void) !read(ready[0], &byte, 1);
+        errno = 0;
+        EXPECT(kill(grandchild, SIGTERM) == 0, "signal tree: a member signals its own child (a descendant)");
+        int status = 0;
+        waitpid(grandchild, &status, 0);
+        EXPECT(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM, "signal tree: and the child got it");
+        errno = 0;
+        EXPECT(kill(1, 0) < 0 && errno == EPERM, "signal tree: init refused (EPERM)");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (WIFSIGNALED(status)) printf("FAIL signal tree: the child died by signal %d\n", WTERMSIG(status));
+    EXPECT(ok, "signal tree: the checks in the confined tree passed");
+    return !ok;
+}
+
 /* ---- sbx_broker_listen and libsbx_child.so: a tree of processes attaches by path and token. ---- */
 
 #define TEST_TOKEN "sbx-test-token-0123456789abcdef"
@@ -2308,7 +2381,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | listen_check(self) | exec_helper_check(self) | exec_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

@@ -100,6 +100,7 @@ struct sbx_policy {
     char *system_paths[SBX_SYSTEM_SOCKETS_MAX];
     unsigned system_grants[SBX_SYSTEM_SOCKETS_MAX];
     unsigned system_count;
+    struct tree *tree;  /* SBX_LOCK_SIGNAL_TREE: the processes that have asked this policy's brokers anything */
     /* SBX_LOCK_UNIX's abstract names: the name's bytes (no leading NUL) and the mode. */
     char *unix_names[SBX_UNIX_NAMES_MAX];
     size_t unix_name_lengths[SBX_UNIX_NAMES_MAX];
@@ -114,9 +115,126 @@ static void default_audit(void *context, const struct sbx_access *access, int re
             access->resolved[0] ? access->resolved : "unresolved", strerror(-result));
 }
 
+/*
+ * ---- The tree a policy's brokers serve (SBX_LOCK_SIGNAL_TREE) ----
+ *
+ * Every process that has sent a request, by pid and start time (so a pid
+ * the kernel hands to someone else later is not taken for it). A signal's
+ * target is in the tree when it, or a process it descends from, is here.
+ */
+#define TREE_MAX 1024
+struct tree {
+    pthread_mutex_t lock;
+    unsigned count;
+    struct {
+        pid_t pid;
+        unsigned long long start;
+    } members[TREE_MAX];
+};
+
+/* A process's start time and parent from /proc/<pid>/stat; 0 when it is gone. */
+static unsigned long long process_start(pid_t pid, pid_t *parent) {
+    char path[64], text[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, text, sizeof(text) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    text[n] = 0;
+    /* After the command's closing parenthesis: state, ppid, then 17 fields to starttime (field 22). */
+    char *after = strrchr(text, ')');
+    if (!after) return 0;
+    char state;
+    int ppid;
+    unsigned long long start = 0;
+    if (sscanf(after + 1, " %c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &state,
+               &ppid, &start) != 3) {
+        return 0;
+    }
+    if (parent) *parent = (pid_t) ppid;
+    return start;
+}
+
+/*
+ * Records pid, once: every request passes here, so a pid already present
+ * costs a scan and no /proc read. A pid the kernel later reuses keeps its
+ * first start time, so the new process counts only as itself (a sender).
+ */
+static void tree_note(struct tree *tree, pid_t pid) {
+    if (!tree || pid <= 0) return;
+    pthread_mutex_lock(&tree->lock);
+    for (unsigned i = 0; i < tree->count; i++) {
+        if (tree->members[i].pid == pid) {
+            pthread_mutex_unlock(&tree->lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&tree->lock);
+    unsigned long long start = process_start(pid, NULL);
+    if (start == 0) return;
+    pthread_mutex_lock(&tree->lock);
+    unsigned slot = tree->count < TREE_MAX ? tree->count++ : TREE_MAX;
+    /* Full: the first member that has exited makes room. */
+    for (unsigned i = 0; slot == TREE_MAX && i < TREE_MAX; i++) {
+        if (process_start(tree->members[i].pid, NULL) != tree->members[i].start) slot = i;
+    }
+    if (slot < TREE_MAX) {
+        tree->members[slot].pid = pid;
+        tree->members[slot].start = start;
+    }
+    pthread_mutex_unlock(&tree->lock);
+}
+
+static int tree_has(struct tree *tree, pid_t pid, unsigned long long start) {
+    int found = 0;
+    pthread_mutex_lock(&tree->lock);
+    for (unsigned i = 0; i < tree->count && !found; i++) {
+        found = tree->members[i].pid == pid && tree->members[i].start == start;
+    }
+    pthread_mutex_unlock(&tree->lock);
+    return found;
+}
+
+/* Whether target (a process, by its thread group) is sender, or in the tree: a member or a member's descendant. */
+static int in_tree(struct tree *tree, pid_t sender, pid_t target) {
+    if (target <= 0) return 0;
+    if (target == sender) return 1;
+    pid_t at = target;
+    for (int depth = 0; depth < 64 && at > 1; depth++) {
+        pid_t parent = 0;
+        unsigned long long start = process_start(at, &parent);
+        if (start == 0) return 0;
+        if (tree_has(tree, at, start)) return 1;
+        at = parent;
+    }
+    return 0;
+}
+
+/* The thread group a thread belongs to, from /proc/<tid>/status; 0 when it is gone. */
+static pid_t thread_group(pid_t tid) {
+    char path[64], text[2048];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int) tid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, text, sizeof(text) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    text[n] = 0;
+    char *line = strstr(text, "\nTgid:");
+    return line ? (pid_t) atoi(line + 6) : 0;
+}
+
 struct sbx_policy *sbx_policy_new(void) {
     struct sbx_policy *policy = calloc(1, sizeof(struct sbx_policy));
-    if (policy) policy->audit = default_audit;
+    if (!policy) return NULL;
+    policy->tree = calloc(1, sizeof(struct tree));
+    if (!policy->tree) {
+        free(policy);
+        return NULL;
+    }
+    pthread_mutex_init(&policy->tree->lock, NULL);
+    policy->audit = default_audit;
     return policy;
 }
 
@@ -131,6 +249,8 @@ void sbx_policy_free(struct sbx_policy *policy) {
     for (unsigned i = 0; i < policy->unix_name_count; i++) free(policy->unix_names[i]);
     free(policy->rules);
     free(policy->aliases);
+    if (policy->tree) pthread_mutex_destroy(&policy->tree->lock);
+    free(policy->tree);
     free(policy);
 }
 
@@ -538,6 +658,7 @@ static const char *op_name(uint32_t op) {
     case SBX_UNIX_BIND: return "bind";
     case SBX_UNIX_CONNECT: return "connect";
     case SBX_EXEC: return "exec";
+    case SBX_SIGNAL: return "signal";
     default: return "unknown";
     }
 }
@@ -1503,10 +1624,59 @@ static void learn_one(const struct sbx_policy *policy, const char *body, size_t 
     reply(answer, 0, NULL, 0, -1);
 }
 
+/*
+ * SBX_SIGNAL: a signal the filter left to the broker (SBX_LOCK_SIGNAL_TREE).
+ * Sent by the broker itself when the target is the sender or in the tree;
+ * the receiver then sees the broker's pid as the sender. Audited as the
+ * access "signal"; a refusal goes to the decider like any other.
+ */
+static void signal_one(const struct sbx_policy *policy, const char *body, size_t body_len, pid_t pid, int answer) {
+    struct sbx_signal_request s;
+    if (body_len != sizeof(s)) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+    memcpy(&s, body, sizeof(s));
+    pid_t target = s.kind == SBX_SIG_TKILL ? thread_group(s.tid) : s.tgid;
+    if (s.kind < SBX_SIG_KILL || s.kind > SBX_SIG_TGQUEUEINFO || s.signal < 0 || s.signal > 64) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    if (target <= 0) {
+        /* A process group, every process, or a thread that is gone: never the tree's to judge. */
+        reply(answer, s.kind == SBX_SIG_TKILL || s.kind == SBX_SIG_TGKILL ? -ESRCH : -EPERM, NULL, 0, -1);
+        return;
+    }
+    char asked[96];
+    snprintf(asked, sizeof(asked), "signal %d to %d", s.signal, (int) target);
+    int verdict = in_tree(policy->tree, pid, target) ? 0 : -EPERM;
+    struct sbx_access access = {.op = "signal", .asked = asked, .resolved = asked, .pid = pid, .rule_verdict = verdict};
+    if (verdict != 0 && policy->decide) {
+        int decided = policy->decide(policy->decide_context, &access);
+        if (decided == 0) verdict = 0;
+    }
+    long result = verdict;
+    if (verdict == 0) {
+        switch (s.kind) {
+        case SBX_SIG_KILL: result = syscall(SYS_kill, target, s.signal); break;
+        case SBX_SIG_TGKILL: result = syscall(SYS_tgkill, target, s.tid, s.signal); break;
+        case SBX_SIG_TKILL: result = syscall(SYS_tgkill, target, s.tid, s.signal); break;
+        case SBX_SIG_QUEUEINFO: result = syscall(SYS_rt_sigqueueinfo, target, s.signal, s.info); break;
+        default: result = syscall(SYS_rt_tgsigqueueinfo, target, s.tid, s.signal, s.info); break;
+        }
+        if (result != 0) result = -errno;
+    }
+    policy->audit(policy->audit_context, &access, (int) result);
+    reply(answer, result, NULL, 0, -1);
+}
+
 static void serve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
                       size_t body_len, int *fds, int fd_count, pid_t pid) {
     if (fd_count < 1) return;
     int answer = fds[0];
+    tree_note(policy->tree, pid);
+    if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_SIGNAL) {
+        if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        signal_one(policy, body, body_len, pid, answer);
+        return;
+    }
     if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_LEARN) {
         if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
         learn_one(policy, body, body_len, pid, answer);

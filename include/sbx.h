@@ -208,6 +208,20 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  */
 #define SBX_LOCK_SIGNALS 0x800u
 /*
+ * Signals judged by the broker, the opt-in variant of SBX_LOCK_SIGNALS
+ * (Droidtop/tracker#584, item 5). A signal to the pid sbx_lockdown saw goes
+ * to the kernel as without it. kill, tgkill, tkill, rt_sigqueueinfo and
+ * rt_tgsigqueueinfo to any other process go to the broker. The broker sends
+ * them itself when the target is the sender (a forked child signalling
+ * itself) or is in the tree: a process that has made a request to a broker
+ * of this policy, or a descendant of one. Anything else is refused (EPERM)
+ * unless the decider allows it ("signal" access). The receiver sees the
+ * broker's pid as the sender (si_pid). Process groups (kill with a pid of 0
+ * or below) stay refused. Needs the broker; not with SBX_LOCK_SIGNALS,
+ * which leaves every signal to the kernel.
+ */
+#define SBX_LOCK_SIGNAL_TREE 0x2000u
+/*
  * The containment preset (Droidtop/tracker#584, owner, 2026-10-23): the
  * file system view is the one thing restricted, through the broker; link,
  * symlink and truncate are brokered like the rest, and sockets, signals,
