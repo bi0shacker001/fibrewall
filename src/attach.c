@@ -144,6 +144,17 @@ int sbx_attach_from_environment(void) {
     options.flags = flags;
     options.own_opens = own_count ? own : NULL;
     options.own_open_count = own_count;
+    /* SBX_LOCK_EXEC (in SBX_LOCK_CONTAIN): the host's sbx-exec and this library, by absolute path. */
+    static char helper[4096], library[4096];
+    const char *helper_text = getenv("SBX_EXEC_HELPER"), *library_text = getenv("SBX_CHILD_LIBRARY");
+    if (helper_text) {
+        snprintf(helper, sizeof(helper), "%s", helper_text);
+        options.exec_helper = helper;
+    }
+    if (library_text) {
+        snprintf(library, sizeof(library), "%s", library_text);
+        options.child_library = library;
+    }
     char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
     snprintf(path, sizeof(path), "%s", broker);
     char secret[128];
@@ -155,6 +166,9 @@ int sbx_attach_from_environment(void) {
     if (result == 0) {
         scrub("SBX_TOKEN");
         unsetenv("SBX_BROKER");
+        /* The handler keeps the helper open and passes both on to each image it execs. */
+        unsetenv("SBX_EXEC_HELPER");
+        unsetenv("SBX_CHILD_LIBRARY");
     }
     return result;
 }

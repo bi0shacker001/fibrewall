@@ -1682,6 +1682,174 @@ static int exec_check(const char *self) {
 #endif
 }
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SBX_TEST_CLANG_ASAN 1
+#endif
+#endif
+#ifndef SBX_TEST_CLANG_ASAN
+#define SBX_TEST_CLANG_ASAN 0
+#endif
+
+/* ---- A program tree under SBX_LOCK_CONTAIN: the system shell and what it runs, as Wine's tree would. ---- */
+
+struct tree_seen {
+    int execs;   /* exec decisions the broker allowed */
+    int refused; /* refusals the learning decider let through */
+};
+
+static void tree_audit(void *context, const struct sbx_access *access, int result) {
+    struct tree_seen *seen = context;
+    if (strcmp(access->op, "exec") == 0 && result == 0) __atomic_add_fetch(&seen->execs, 1, __ATOMIC_RELAXED);
+}
+
+static int tree_learn(void *context, const struct sbx_access *access) {
+    struct tree_seen *seen = context;
+    (void) access;
+    __atomic_add_fetch(&seen->refused, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+/*
+ * The shell's script: each step that fails exits with its own number. With
+ * STRICT=1 the secret must be refused in every image; a learning run lets
+ * it through and records it.
+ */
+static void tree_script(char *out, size_t size, const char *shell) {
+    snprintf(out, size,
+             "cat %s/data.txt >/dev/null || exit 11\n"
+             "[ \"$STRICT\" = 1 ] && cat %s/key >/dev/null 2>&1 && exit 12\n"
+             "ls %s >/dev/null || exit 13\n"
+             "%s -c 'cat %s/data.txt >/dev/null || exit 1; [ \"$STRICT\" = 1 ] && cat %s/key >/dev/null 2>&1 && exit 2; exit 0' "
+             "|| exit 14\n"
+             "echo through | cat | grep through >/dev/null || exit 15\n"
+             "%s/tree.sh || exit 16\n"
+             "exit 0\n",
+             game, secret, game, shell, game, secret, game);
+}
+
+/* Runs the tree in a child: locked down here (attach == NULL), or attached by libsbx_child.so from the environment. */
+static int run_tree(const char *shell, const char *helper, const char *library, int pair_fd, unsigned flags, int strict,
+                    const char *attach_path) {
+    static char script[4096];
+    tree_script(script, sizeof(script), shell);
+    char path_env[64], strict_env[16], helper_env[700], library_env[700], preload_env[700], broker_env[500],
+        flags_env[32];
+    snprintf(path_env, sizeof(path_env), "PATH=%s", access("/system/bin/sh", X_OK) == 0 ? "/system/bin" : "/usr/bin:/bin");
+    snprintf(strict_env, sizeof(strict_env), "STRICT=%d", strict);
+    snprintf(helper_env, sizeof(helper_env), "SBX_EXEC_HELPER=%s", helper);
+    snprintf(library_env, sizeof(library_env), "SBX_CHILD_LIBRARY=%s", library);
+    snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", library);
+    snprintf(broker_env, sizeof(broker_env), "SBX_BROKER=%s", attach_path ? attach_path : "");
+    snprintf(flags_env, sizeof(flags_env), "SBX_FLAGS=%u", flags);
+    char *plain[] = {path_env, strict_env, NULL};
+    char *attached[] = {path_env, strict_env, helper_env, library_env, preload_env, broker_env,
+                        "SBX_TOKEN=" TEST_TOKEN, flags_env, NULL};
+    char *argv[] = {"sh", "-c", script, NULL};
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        if (!attach_path) {
+            struct sbx_lockdown_options options = {.flags = flags, .exec_helper = helper, .child_library = library};
+            int locked = sbx_lockdown(pair_fd, &options);
+            if (locked != 0) {
+                printf("FAIL tree: lockdown (%s)\n", strerror(-locked));
+                _exit(120);
+            }
+        }
+        execve(shell, argv, attach_path ? attached : plain);
+        _exit(121);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+static int program_tree_check(const char *self) {
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    (void) self;
+    return 0;
+#else
+#if defined(__SANITIZE_ADDRESS__) || SBX_TEST_CLANG_ASAN
+    /* The shell is not sanitized, and the child library of a sanitized build cannot load into it. */
+    (void) self;
+    printf("skip tree: a sanitized libsbx_child.so cannot load into the system shell\n");
+    return 0;
+#endif
+    char helper[600], library[600];
+    if (exec_files(self, helper, library, sizeof(helper)) != 0) {
+        printf("FAIL tree: sbx-exec or libsbx_child.so is not beside the test\n");
+        return 1;
+    }
+    const char *shell = access("/system/bin/sh", X_OK) == 0 ? "/system/bin/sh" : "/bin/sh";
+    char script_path[400], body[1200];
+    snprintf(script_path, sizeof(script_path), "%s/tree.sh", game);
+    snprintf(body, sizeof(body),
+             "#!%s\ncat %s/data.txt >/dev/null || exit 1\n[ \"$STRICT\" = 1 ] && cat %s/key >/dev/null 2>&1 && exit 2\nexit 0\n",
+             shell, game, secret);
+    write_file(script_path, body);
+    chmod(script_path, 0755);
+    int failed = 0;
+    static const char *const meanings[] = {
+        [11] = "an allowed file", [12] = "the secret refused", [13] = "ls", [14] = "a nested shell",
+        [15] = "a pipe", [16] = "a #! script", [120] = "lockdown", [121] = "the first exec",
+    };
+    for (int learn = 0; learn <= 1; learn++) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+        static struct tree_seen seen[2];
+        struct sbx_policy *policy = sbx_policy_new();
+        sbx_policy_add(policy, "/", SBX_READ);
+        sbx_policy_add(policy, "/dev/null", SBX_READ | SBX_WRITE);
+        sbx_policy_add(policy, secret, SBX_DENY);
+        sbx_policy_set_audit(policy, tree_audit, &seen[learn]);
+        if (learn) sbx_policy_set_decider(policy, tree_learn, &seen[learn]);
+        if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+        unsigned flags = SBX_LOCK_CONTAIN | (learn ? SBX_LOCK_LEARN : 0);
+        int code = run_tree(shell, helper, library, pair[1], flags, !learn, NULL);
+        close(pair[1]);
+        char name[200];
+        const char *meaning = code > 0 && code < (int) (sizeof(meanings) / sizeof(meanings[0])) && meanings[code]
+                                  ? meanings[code] : "";
+        snprintf(name, sizeof(name), "tree%s: %s runs cat, ls, a nested shell, a pipe and a #! script, confined (exit %d%s%s)",
+                 learn ? " (learning)" : "", shell, code, *meaning ? ": " : "", meaning);
+        EXPECT(code == 0, name);
+        int execs = __atomic_load_n(&seen[learn].execs, __ATOMIC_RELAXED);
+        snprintf(name, sizeof(name), "tree%s: every exec went through the broker (%d decided)", learn ? " (learning)" : "",
+                 execs);
+        EXPECT(execs >= 6, name);
+        if (learn) {
+            snprintf(name, sizeof(name), "tree (learning): the secret was recorded, not refused (%d records)",
+                     seen[1].refused);
+            EXPECT(seen[1].refused >= 1, name);
+        }
+        failed |= code != 0 || execs < 6;
+    }
+    /* The first process attached by libsbx_child.so from the environment, as a host starts Wine. */
+    char broker_path[400];
+    snprintf(broker_path, sizeof(broker_path), "%s/tree.sock", root);
+    int files_error = host_socket_files(root);
+    if (files_error != 0) {
+        printf("skip tree: attached from the environment (the host refuses socket files unconfined: %s)\n",
+               strerror(files_error));
+        return failed;
+    }
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, "/", SBX_READ);
+    sbx_policy_add(policy, "/dev/null", SBX_READ | SBX_WRITE);
+    sbx_policy_add(policy, secret, SBX_DENY);
+    struct sbx_listener *listener = NULL;
+    if (sbx_broker_listen(policy, broker_path, TEST_TOKEN, &listener) != 0) return 1;
+    int code = run_tree(shell, helper, library, -1, SBX_LOCK_CONTAIN, 1, broker_path);
+    char name[200];
+    snprintf(name, sizeof(name), "tree: the same, its first process attached by libsbx_child.so from the environment (exit %d)",
+             code);
+    EXPECT(code == 0, name);
+    sbx_listener_close(listener);
+    return failed || code != 0;
+#endif
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -2381,7 +2549,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

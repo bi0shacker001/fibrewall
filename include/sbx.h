@@ -642,12 +642,16 @@ int sbx_attach(const char *socket_path, const char *token, const struct sbx_lock
 /*
  * sbx_attach from the environment, as libsbx_child.so's constructor
  * calls it before main: SBX_BROKER (the socket's path), SBX_TOKEN,
- * SBX_FLAGS (lockdown flags, decimal or 0x hex) and SBX_OWN_OPENS
- * (device paths separated by ':', see own_opens). Returns 1 when
+ * SBX_FLAGS (lockdown flags, decimal or 0x hex), SBX_OWN_OPENS
+ * (device paths separated by ':', see own_opens), and, for SBX_LOCK_EXEC
+ * (SBX_LOCK_CONTAIN includes it), SBX_EXEC_HELPER and SBX_CHILD_LIBRARY
+ * (the absolute paths of sbx-exec and libsbx_child.so). Returns 1 when
  * SBX_BROKER is not set (nothing to attach to), 0 when attached, or a
  * negative errno (the constructor then ends the process before main). On
  * success the token's value is overwritten in the environment strings and
- * SBX_BROKER and SBX_TOKEN are removed.
+ * SBX_BROKER, SBX_TOKEN, SBX_EXEC_HELPER and SBX_CHILD_LIBRARY are removed.
+ * An image a confined process execs adopts the lockdown instead
+ * (SBX_ADOPT, set by sbx-exec).
  */
 int sbx_attach_from_environment(void);
 #endif

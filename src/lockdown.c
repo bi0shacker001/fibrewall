@@ -1080,8 +1080,52 @@ static int starts_with(const char *text, const char *prefix) {
  * helper and the child library in SBX_EXEC_HELPER_FD and SBX_CHILD_LIBRARY.
  * Returns only when the exec failed.
  */
-static long exec_call(int dirfd, const char *path, char *const *argv, char *const *envp, int flags) {
+static long exec_call(int dirfd, const char *path, char *const *argv, char *const *envp, int flags, int depth);
+
+/*
+ * A "#!" script, as the kernel runs one: the interpreter named on the
+ * first line, with its one optional argument, then the script's path as
+ * it was given, then the program's arguments after argv[0]. The
+ * interpreter is decided by the broker like any exec (it may be a script
+ * itself, up to the kernel's 4 levels). Returns only on failure.
+ */
+static long script_call(int target, const char *path, char *const *argv, char *const *envp, int depth) {
+    char line[256];
+    ssize_t n = pread(target, line, sizeof(line) - 1, 0);
+    if (n < 2) return -ENOEXEC;
+    line[n] = '\0';
+    char *end = memchr(line, '\n', (size_t) n);
+    if (!end) return -ENOEXEC; /* a first line longer than the kernel reads */
+    *end = '\0';
+    char *interpreter = line + 2;
+    while (*interpreter == ' ' || *interpreter == '\t') interpreter++;
+    char *argument = interpreter;
+    while (*argument && *argument != ' ' && *argument != '\t') argument++;
+    if (*argument) *argument++ = '\0';
+    while (*argument == ' ' || *argument == '\t') argument++;
+    char *trail = argument + strlen(argument);
+    while (trail > argument && (trail[-1] == ' ' || trail[-1] == '\t' || trail[-1] == '\r')) *--trail = '\0';
+    if (!*interpreter) return -ENOEXEC;
+    size_t argc = 0;
+    while (argv && argv[argc]) argc++;
+    size_t size = (argc + 4) * sizeof(char *);
+    size = (size + 4095) & ~(size_t) 4095;
+    char **args = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (args == MAP_FAILED) return -ENOMEM;
+    size_t k = 0;
+    args[k++] = interpreter;
+    if (*argument) args[k++] = argument;
+    args[k++] = (char *) path;
+    for (size_t i = 1; i < argc; i++) args[k++] = argv[i];
+    args[k] = NULL;
+    long result = exec_call(AT_FDCWD, interpreter, args, envp, 0, depth + 1);
+    munmap(args, size);
+    return result;
+}
+
+static long exec_call(int dirfd, const char *path, char *const *argv, char *const *envp, int flags, int depth) {
     if (helper_fd < 0) return -EACCES;
+    if (depth > 4) return -ELOOP;
     if (path == NULL) return -EFAULT;
     char link[32];
     if (path[0] == '\0') {
@@ -1099,6 +1143,12 @@ static long exec_call(int dirfd, const char *path, char *const *argv, char *cons
     }
     long target = forward(SBX_EXEC, dirfd, path, 0, NULL, 0, 0, NULL, 0);
     if (target < 0) return target;
+    char magic[2];
+    if (pread((int) target, magic, 2, 0) == 2 && magic[0] == '#' && magic[1] == '!') {
+        long result = script_call((int) target, path, argv, envp, depth);
+        close((int) target);
+        return result;
+    }
 
     static const char helper_name[] = "SBX_EXEC_HELPER_FD=", library_name[] = "SBX_CHILD_LIBRARY=";
     env_bytes = sizeof(helper_name) + 12 + sizeof(library_name) + strlen(child_library) + 1;
@@ -1175,9 +1225,9 @@ static long dispatch(long nr, ucontext_t *uc) {
     case __NR_rt_tgsigqueueinfo:
         return signal_call(SBX_SIG_TGQUEUEINFO, a0, a1, a2, (const void *) a3);
     case __NR_execve:
-        return exec_call(AT_FDCWD, (const char *) a0, (char *const *) a1, (char *const *) a2, 0);
+        return exec_call(AT_FDCWD, (const char *) a0, (char *const *) a1, (char *const *) a2, 0, 0);
     case __NR_execveat:
-        return exec_call((int) a0, (const char *) a1, (char *const *) a2, (char *const *) a3, (int) a4);
+        return exec_call((int) a0, (const char *) a1, (char *const *) a2, (char *const *) a3, (int) a4, 0);
     case __NR_newfstatat: {
         const char *path = (const char *) a1;
         if ((a3 & AT_EMPTY_PATH) && path != NULL && path[0] == '\0') {
