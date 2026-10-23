@@ -696,6 +696,7 @@ struct learned {
     int socket_eacces; /* socket, recorded with EACCES */
     int kill_eperm;    /* kill of another process, recorded with EPERM */
     int unshare_eperm;
+    int named_flags;   /* socket naming SBX_LOCK_INET, kill SBX_LOCK_SIGNALS, unshare no flag */
     int path_refused;  /* a path the rules refused, which the decider let through */
 };
 
@@ -707,6 +708,10 @@ static void learn_audit(void *context, const struct sbx_access *access, int resu
         if (strncmp(access->asked, "socket(", 7) == 0 && access->rule_verdict == -EACCES) seen->socket_eacces++;
         if (strncmp(access->asked, "kill(", 5) == 0 && access->rule_verdict == -EPERM) seen->kill_eperm++;
         if (strncmp(access->asked, "unshare(", 8) == 0 && access->rule_verdict == -EPERM) seen->unshare_eperm++;
+        const char *by = access->allowed_by;
+        if (strncmp(access->asked, "socket(", 7) == 0 && by && strcmp(by, "SBX_LOCK_INET") == 0) seen->named_flags |= 1;
+        if (strncmp(access->asked, "kill(", 5) == 0 && by && strcmp(by, "SBX_LOCK_SIGNALS") == 0) seen->named_flags |= 2;
+        if (strncmp(access->asked, "unshare(", 8) == 0 && !by) seen->named_flags |= 4;
     }
 }
 
@@ -770,7 +775,10 @@ static int learn_check(void) {
     printf("%s learn: kill of another process recorded with EPERM (%d)\n", seen.kill_eperm >= 1 ? "ok  " : "FAIL", seen.kill_eperm);
     printf("%s learn: unshare recorded with EPERM (%d)\n", seen.unshare_eperm >= 1 ? "ok  " : "FAIL", seen.unshare_eperm);
     printf("%s learn: the refused path reached the decider (%d)\n", seen.path_refused >= 1 ? "ok  " : "FAIL", seen.path_refused);
-    failed |= !socket_ok || seen.kill_eperm < 1 || seen.unshare_eperm < 1 || seen.path_refused < 1;
+    int named = seen.named_flags == 7;
+    printf("%s learn: the records name the flag that allows each call (socket SBX_LOCK_INET, kill SBX_LOCK_SIGNALS, "
+           "unshare none: %#x)\n", named ? "ok  " : "FAIL", (unsigned) seen.named_flags);
+    failed |= !socket_ok || seen.kill_eperm < 1 || seen.unshare_eperm < 1 || seen.path_refused < 1 || !named;
 
     /* A real lockdown refuses the same calls, and does not let the trampoline through. */
     int real_pair[2];

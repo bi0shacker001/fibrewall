@@ -516,7 +516,7 @@ done:
 static int answer_open(struct broker *broker, const char *asked, unsigned flags, uint64_t *remote) {
     struct sbx_policy *policy = broker->policy;
     char resolved[3 * SBXW_PATH_MAX] = "";
-    struct sbx_access access = {"open", asked, resolved, 0, (int) flags, (pid_t) broker->pid, 0};
+    struct sbx_access access = {"open", asked, resolved, 0, (int) flags, (pid_t) broker->pid, 0, NULL};
     int result;
     wchar_t *full = NULL;
     if (!valid_flags(flags)) {

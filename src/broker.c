@@ -1323,9 +1323,59 @@ static const char *syscall_name(long nr) {
 }
 
 /*
+ * The lockdown flag that would have let a recorded call through, or NULL
+ * when none does (a clear escape: ptrace, namespaces, mounts, bpf and the
+ * like). The narrowest one: SBX_LOCK_SOCKETS allows every socket named
+ * here as well.
+ */
+static const char *allowed_by(long nr, const int64_t *args) {
+#if defined(__x86_64__) || defined(__aarch64__)
+    switch (nr) {
+    case __NR_socket: {
+        unsigned type = (unsigned) args[1] & 0xf;
+        switch ((int) args[0]) {
+        case AF_UNIX:
+            if (type == SOCK_STREAM || type == SOCK_SEQPACKET) return "SBX_LOCK_UNIX";
+            return type == SOCK_DGRAM ? "SBX_LOCK_LOG_SOCKET" : NULL;
+        case AF_INET:
+        case AF_INET6:
+            return type == SOCK_STREAM || type == SOCK_DGRAM ? "SBX_LOCK_INET" : NULL;
+        case AF_NETLINK:
+            return args[2] == 0 /* NETLINK_ROUTE */ ? "SBX_LOCK_SOCKETS" : NULL;
+        default:
+            return NULL;
+        }
+    }
+    case __NR_linkat:
+    case __NR_symlinkat:
+    case __NR_truncate:
+#ifdef __NR_link
+    case __NR_link:
+    case __NR_symlink:
+#endif
+        return "SBX_LOCK_PATHOPS";
+    case __NR_inotify_add_watch:
+        return "SBX_LOCK_INOTIFY";
+    case __NR_kill:
+    case __NR_tkill:
+    case __NR_tgkill:
+    case __NR_rt_sigqueueinfo:
+    case __NR_rt_tgsigqueueinfo:
+        return "SBX_LOCK_SIGNALS";
+    default:
+        return NULL;
+    }
+#else
+    (void) nr;
+    (void) args;
+    return NULL;
+#endif
+}
+
+/*
  * A call a learning lockdown let through (SBX_LOCK_LEARN): audited as the
  * access "syscall", named with its first three arguments, with the errno a
- * real lockdown answers as the rules' verdict. Answered 0, after which the
+ * real lockdown answers as the rules' verdict and the flag that allows it. Answered 0, after which the
  * handler makes the call.
  */
 static void learn_one(const struct sbx_policy *policy, const char *body, size_t body_len, pid_t pid, int answer) {
@@ -1344,7 +1394,7 @@ static void learn_one(const struct sbx_policy *policy, const char *body, size_t 
     }
     struct sbx_access access = {
         .op = "syscall", .asked = asked, .resolved = "", .need = 0, .flags = 0, .pid = pid,
-        .rule_verdict = -record.would,
+        .rule_verdict = -record.would, .allowed_by = allowed_by((long) record.nr, record.args),
     };
     policy->audit(policy->audit_context, &access, 0);
     reply(answer, 0, NULL, 0, -1);

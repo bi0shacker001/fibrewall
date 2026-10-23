@@ -128,8 +128,9 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * nothing the filter would refuse with EACCES or EPERM is refused. Each
  * such call is sent to the broker as a record, which reaches the host's
  * audit function as an access whose op is "syscall", whose asked is the
- * call's name and first arguments, and whose rule_verdict is the errno a
- * real lockdown answers; then the call is made. Three refusals stay: a
+ * call's name and first arguments, whose rule_verdict is the errno a
+ * real lockdown answers, and whose allowed_by names the flag that would
+ * allow the call (NULL when none does); then the call is made. Three refusals stay: a
  * call through another architecture's entry, a new SIGSYS handler, and
  * clone with namespace flags. Paths still go through the broker, whose
  * decider a learning host makes record and allow. A learning process has
@@ -427,6 +428,8 @@ struct sbx_access {
     int flags;             /* open flags for "open", else 0 */
     pid_t pid;             /* the confined process (the kernel's word) */
     int rule_verdict;      /* what the rules alone answered: 0 or a negative errno */
+    const char *allowed_by; /* for "syscall": the lockdown flag that would have allowed the call
+                               ("SBX_LOCK_INET", ...), or NULL when none does; NULL for every other op */
 };
 
 /*

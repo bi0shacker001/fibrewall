@@ -1166,8 +1166,14 @@ open"): code that jumps there can install a handler, which it could do
 anyway, and nothing else. The broker passes each record to the host's
 audit function as an access whose `op` is `"syscall"`, `asked` is the
 call's name and first three arguments (`socket(0x2, 0x1, 0)`, or `syscall
-<number>(...)` for one the library has no name for), and `rule_verdict` is
-the errno it would have had. The record is answered before the call is
+<number>(...)` for one the library has no name for), `rule_verdict` is
+the errno it would have had, and `allowed_by` is the lockdown flag that
+would have let it through: `SBX_LOCK_INET` for an inet socket,
+`SBX_LOCK_UNIX` or `SBX_LOCK_LOG_SOCKET` for a Unix one, `SBX_LOCK_SOCKETS`
+for route netlink, `SBX_LOCK_PATHOPS`, `SBX_LOCK_INOTIFY`,
+`SBX_LOCK_SIGNALS`, or NULL when no flag does (ptrace, namespaces, mounts
+and the other clear escapes). A host can show the flag beside each record,
+so relaxing a profile is choosing flags, not reading call numbers. The record is answered before the call is
 made, so records arrive in order.
 
 Three refusals stay refusals, unrecorded, as in a real lockdown: a call
