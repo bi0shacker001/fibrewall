@@ -42,6 +42,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -62,6 +63,9 @@
 #endif
 #ifndef SECCOMP_FILTER_FLAG_TSYNC
 #define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_LOG
+#define SECCOMP_FILTER_FLAG_LOG 2
 #endif
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
@@ -1063,7 +1067,66 @@ static long dispatch(long nr, ucontext_t *uc) {
     }
 }
 
+/* The trace ring (sbx_trace), or NULL. */
+static struct sbx_trace_header *trace_ring;
+
+static struct sbx_trace_entry *trace_entries(struct sbx_trace_header *ring) {
+    return (struct sbx_trace_entry *) (ring + 1);
+}
+
+int sbx_trace(int fd, unsigned slots) {
+    if (locked) return -EALREADY;
+    if (__atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE)) return -EALREADY;
+    if (slots < 16 || slots > 4096) return -EINVAL;
+    size_t size = sizeof(struct sbx_trace_header) + (size_t) slots * sizeof(struct sbx_trace_entry);
+    if (ftruncate(fd, 0) != 0 || ftruncate(fd, (off_t) size) != 0) return -errno;
+    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) return -errno;
+    struct sbx_trace_header *ring = mapped;
+    ring->version = SBX_TRACE_VERSION;
+    ring->slots = slots;
+    ring->next = 0;
+    ring->pid = (int32_t) getpid();
+    ring->locked = 0;
+    /* Last, so a reader that sees the magic sees the rest. */
+    __atomic_store_n(&ring->magic, SBX_TRACE_MAGIC, __ATOMIC_RELEASE);
+    __atomic_store_n(&trace_ring, ring, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* The handler's first act: plain stores, no system call before the call is noted. */
+static struct sbx_trace_entry *trace_enter(const siginfo_t *info, const ucontext_t *uc) {
+    struct sbx_trace_header *ring = __atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE);
+    if (!ring) return NULL;
+    uint32_t n = __atomic_fetch_add(&ring->next, 1, __ATOMIC_RELAXED);
+    struct sbx_trace_entry *entry = &trace_entries(ring)[n % ring->slots];
+    __atomic_store_n(&entry->seq, 0, __ATOMIC_RELAXED);
+    entry->nr = info->si_syscall;
+    entry->ip = (uint64_t) (uintptr_t) info->si_call_addr;
+    entry->arg0 = (uint64_t) ARG(uc, 0);
+    entry->state = SBX_TRACE_ENTERED | ((uint32_t) (info->si_errno & 0xffffff) << 8);
+    entry->tid = 0;
+    __atomic_store_n(&entry->seq, n + 1, __ATOMIC_RELEASE);
+    /* Allowed by every filter; after the note, so a death here still leaves one. */
+    entry->tid = (int32_t) syscall(__NR_gettid);
+    return entry;
+}
+
+static void trace_leave(struct sbx_trace_entry *entry) {
+    if (!entry) return;
+    uint32_t state = __atomic_load_n(&entry->state, __ATOMIC_RELAXED);
+    __atomic_store_n(&entry->state, (state & ~0xffu) | SBX_TRACE_LEFT, __ATOMIC_RELEASE);
+}
+
+static void handle_sigsys(int signal_number, siginfo_t *info, void *context);
+
 static void on_sigsys(int signal_number, siginfo_t *info, void *context) {
+    struct sbx_trace_entry *entry = trace_enter(info, (ucontext_t *) context);
+    handle_sigsys(signal_number, info, context);
+    trace_leave(entry);
+}
+
+static void handle_sigsys(int signal_number, siginfo_t *info, void *context) {
     int learning = info->si_code == SYS_SECCOMP &&
                    (info->si_errno == SBX_TRAP_LEARN_EACCES || info->si_errno == SBX_TRAP_LEARN_EPERM);
     if (learning) {
@@ -1467,6 +1530,12 @@ int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
     (void) mode;
     return sbx_local_add(path, fd);
 }
+
+int sbx_trace(int fd, unsigned slots) {
+    (void) fd;
+    (void) slots;
+    return -ENOSYS;
+}
 #endif
 
 #ifdef SBX_ARCH
@@ -1539,6 +1608,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (unbrokered && pass) return -EINVAL;
+    unsigned install = SECCOMP_FILTER_FLAG_TSYNC | ((options->flags & SBX_LOCK_AUDIT) ? SECCOMP_FILTER_FLAG_LOG : 0);
     /* Learning sends every record to the broker. */
     if ((options->flags & SBX_LOCK_LEARN) && unbrokered) return -EINVAL;
     /* With SBX_LOCK_UNIX, bind goes to the broker, so the log's Unix socket can no longer take a name unseen. */
@@ -1573,7 +1643,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         /* Nothing is forwarded, so no handler and no current directory to keep. */
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
         struct sock_fprog program = {.len = filter_length, .filter = filter};
-        long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program);
+        long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, install, &program);
         if (synced != 0) return synced > 0 ? -EBUSY : -errno;
         locked = 1;
         return 0;
@@ -1619,9 +1689,11 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         error = -errno;
     } else {
         struct sock_fprog program = {.len = filter_length, .filter = filter};
-        long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program);
+        long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, install, &program);
         if (synced == 0) {
             locked = 1;
+            struct sbx_trace_header *ring = __atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE);
+            if (ring) __atomic_store_n(&ring->locked, 1, __ATOMIC_RELEASE);
             return 0;
         }
         /* A positive result names a thread that could not be synchronised: a lockdown that misses threads is none. */

@@ -31,6 +31,7 @@
 #ifndef SBX_H
 #define SBX_H
 
+#include <stdint.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -172,6 +173,19 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  */
 #define SBX_LOCK_UNIX 0x80u
 
+/*
+ * The kernel logs every call the filter traps or refuses
+ * (SECCOMP_FILTER_FLAG_LOG): an audit record, type 1326, with the call's
+ * number, the instruction pointer and the action, which on Android reaches
+ * logcat as "audit: type=1326". The one record that is there when a trap
+ * kills the process before any of its own code runs: a SIGSYS the handler
+ * could not take (blocked, or arriving while the handler runs) ends the
+ * process with signal 31 and nothing else. For diagnosing; a busy process
+ * logs thousands. On a kernel without the flag (before 4.14) sbx_lockdown
+ * answers -EINVAL.
+ */
+#define SBX_LOCK_AUDIT 0x40u
+
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
 #define SBX_CLAIMS_MAX 32
@@ -238,6 +252,50 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options);
  * here only while the filter traps it (brokered or passthrough).
  */
 int sbx_local_add(const char *path, int fd);
+
+/*
+ * The trace ring: where the handler notes each trapped call before it
+ * does anything else, and again when it is done with it, in a file the
+ * host can read after the process is gone. A process killed inside the
+ * handler (a call the handler makes that is itself trapped, while SIGSYS
+ * is blocked because the handler is running) leaves an entry marked
+ * entered and never left: the call it was handling, on which thread, from
+ * where. Notes are plain stores into a shared mapping, no system call, so
+ * they cannot themselves trap, and the kernel keeps them when the process
+ * dies. The ring wraps; seq says which entries are newest.
+ */
+#define SBX_TRACE_MAGIC 0x54584253u  /* "SBXT" */
+#define SBX_TRACE_VERSION 1u
+#define SBX_TRACE_ENTERED 1u
+#define SBX_TRACE_LEFT 2u
+
+struct sbx_trace_header {
+    uint32_t magic;    /* SBX_TRACE_MAGIC */
+    uint32_t version;  /* SBX_TRACE_VERSION */
+    uint32_t slots;    /* entries after the header */
+    uint32_t next;     /* entries ever written; the newest is at (next - 1) % slots */
+    int32_t pid;       /* the traced process */
+    uint32_t locked;   /* 1 once the filter is on */
+    uint32_t reserved[2];
+};
+
+struct sbx_trace_entry {
+    uint32_t seq;    /* 1 + its place in the order of entries, 0 while being written */
+    int32_t tid;     /* thread */
+    int32_t nr;      /* system call number */
+    uint32_t state;  /* SBX_TRACE_ENTERED or SBX_TRACE_LEFT, low 8 bits; the filter's trap data above them */
+    uint64_t ip;     /* the instruction after the call (si_call_addr) */
+    uint64_t arg0;   /* the call's first argument */
+};
+
+/*
+ * Gives the handler a trace ring: fd is a regular file the caller opened
+ * read and write, which this sizes (ftruncate) to a header and slots
+ * entries and maps shared, keeping the mapping for the life of the
+ * process; fd may be closed afterwards. Call before sbx_lockdown. slots
+ * from 16 to 4096. Returns 0 or a negative errno.
+ */
+int sbx_trace(int fd, unsigned slots);
 
 /*
  * sbx_local_add with a mode: SBX_READ, or SBX_READ | SBX_WRITE for a file
