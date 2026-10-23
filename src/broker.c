@@ -1276,8 +1276,7 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
     net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0);
 }
 
-/* The name of a call a learning lockdown may record: the ones its filter refuses. */
-static const char *syscall_name(long nr) {
+const char *sbx_syscall_name(long nr) {
 #if defined(__x86_64__) || defined(__aarch64__)
     /* Only these architectures lock down, so only their records arrive (32-bit ARM has no mmap, for one). */
     switch (nr) {
@@ -1313,6 +1312,26 @@ static const char *syscall_name(long nr) {
 #ifdef __NR_open_tree
     NAME(open_tree) NAME(move_mount) NAME(fsopen) NAME(fsconfig) NAME(fsmount) NAME(fspick)
 #endif
+    /* What the filter traps: paths, signals and the rest of the handler's work. */
+    NAME(openat) NAME(newfstatat) NAME(faccessat) NAME(readlinkat) NAME(mkdirat) NAME(unlinkat) NAME(renameat2)
+    NAME(statfs) NAME(chdir) NAME(fchdir) NAME(getcwd) NAME(getdents64) NAME(fchmodat) NAME(utimensat)
+    NAME(rt_sigprocmask) NAME(rt_sigaction) NAME(clone) NAME(accept) NAME(accept4) NAME(listen) NAME(socketpair)
+#ifdef __NR_statx
+    NAME(statx)
+#endif
+#ifdef __NR_faccessat2
+    NAME(faccessat2)
+#endif
+#ifdef __NR_clone3
+    NAME(clone3)
+#endif
+#ifdef __NR_renameat
+    NAME(renameat)
+#endif
+#ifdef __NR_open
+    NAME(open) NAME(creat) NAME(stat) NAME(lstat) NAME(access) NAME(readlink) NAME(mkdir) NAME(rmdir)
+    NAME(unlink) NAME(rename) NAME(chmod) NAME(getdents)
+#endif
 #undef NAME
     default: return NULL;
     }
@@ -1333,7 +1352,7 @@ static void learn_one(const struct sbx_policy *policy, const char *body, size_t 
     if (body_len != sizeof(record)) { reply(answer, -EINVAL, NULL, 0, -1); return; }
     memcpy(&record, body, sizeof(record));
     char asked[160];
-    const char *name = syscall_name((long) record.nr);
+    const char *name = sbx_syscall_name((long) record.nr);
     if (name) {
         snprintf(asked, sizeof(asked), "%s(%#llx, %#llx, %#llx)", name, (unsigned long long) record.args[0],
                  (unsigned long long) record.args[1], (unsigned long long) record.args[2]);
