@@ -802,6 +802,34 @@ process of a tree and everything it forks; what it `exec`s needs
 survive `exec` and the new image's loader opens files before any
 constructor runs.
 
+**The containment preset, `SBX_LOCK_CONTAIN` (owner, 2026-10-23,
+Droidtop/tracker#584):** "For the wine sandbox, we don't have to worry
+about limiting or restricting handles, just the environment itself. The
+sandbox CAN apply extra restrictions, but that's obviously gonna break
+lots of games". So the preset restricts **the file system view only**,
+through the broker, and leaves the rest to the kernel with no per-call
+cost:
+
+| Flag in the preset | What it allows |
+| --- | --- |
+| `SBX_LOCK_PATHOPS` | `link`, `symlink`, `truncate`, brokered like other path calls |
+| `SBX_LOCK_INOTIFY` | inotify marks, the kernel deciding |
+| `SBX_LOCK_SOCKETS` | Unix sockets of every type, inet stream and datagram, route netlink; `bind`, `connect` and the rest unjudged |
+| `SBX_LOCK_SIGNALS` | signals to any process of the UID (`kill`, `tgkill`, `tkill`, the sigqueue calls) |
+| `SBX_LOCK_EXEC` | joins the preset when `sbx-exec` is built |
+
+Shared memory (SysV, `memfd`, `ashmem`) and every call on a descriptor
+were never refused. What the preset still refuses, whatever the flags:
+`ptrace`, `process_vm_*`, `process_madvise`, new namespaces (`clone`
+flags, `unshare`, `setns`), mounts and the new mount API, `chroot`,
+`pivot_root`, `bpf`, `perf_event_open`, `io_uring`, module loading, the
+keyring, `kcmp` and the pidfd calls. Judged variants stay opt-in: with
+`SBX_LOCK_UNIX` the broker judges Unix `bind` and `connect`, and a
+brokered signal-tree check can follow. What the outright flags give up is
+stated where they are declared (`include/sbx.h`): with `SBX_LOCK_SOCKETS`
+the process can reach any socket of its UID, the host's own included, and
+create socket files wherever the UID may write.
+
 `SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
 four is "a program tree": it can run its own helpers and talk to the
 sockets the host named, and nothing else.

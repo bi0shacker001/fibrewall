@@ -1027,6 +1027,118 @@ static int unix_check(void) {
     return !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 }
 
+/* ---- SBX_LOCK_CONTAIN: the file system view restricted, sockets and signals left to the kernel. ---- */
+
+static volatile sig_atomic_t usr1_seen;
+static void on_usr1(int signal_number) { (void) signal_number; usr1_seen = 1; }
+
+static int contain_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    pid_t parent = getpid();
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_CONTAIN | SBX_LOCK_NET_BROKERED};
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "contain: not with the brokered network");
+        options.flags = SBX_LOCK_CONTAIN;
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "contain: lockdown");
+        if (locked != 0) _exit(1);
+        char key[400], data[400];
+        snprintf(key, sizeof(key), "%s/key", secret);
+        snprintf(data, sizeof(data), "%s/data.txt", game);
+        errno = 0;
+        EXPECT(refused(open(key, O_RDONLY)), "contain: the file system view is still the broker's");
+        int fd = open(data, O_RDONLY | O_CLOEXEC);
+        EXPECT(fd >= 0, "contain: a file the rules allow opens");
+        if (fd >= 0) close(fd);
+        int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+        int unix_ok = 1;
+        for (int i = 0; i < 3; i++) {
+            int s = socket(AF_UNIX, types[i] | SOCK_CLOEXEC, 0);
+            unix_ok &= s >= 0;
+            if (s >= 0) close(s);
+        }
+        EXPECT(unix_ok, "contain: Unix sockets of every type");
+        int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        EXPECT(s >= 0, "contain: an inet socket");
+        if (s >= 0) close(s);
+        s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0 /* NETLINK_ROUTE */);
+        EXPECT(s >= 0 || errno != EACCES, "contain: route netlink is not refused by the filter");
+        if (s >= 0) close(s);
+        errno = 0;
+        EXPECT(refused(socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 15 /* NETLINK_KOBJECT_UEVENT */)),
+               "contain: other netlink protocols are refused");
+        struct sockaddr_un away = {.sun_family = AF_UNIX};
+        snprintf(away.sun_path, sizeof(away.sun_path), "/sbx-contain-%d", (int) getpid());
+        int u = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        errno = 0;
+        EXPECT(u >= 0 && connect(u, (struct sockaddr *) &away, sizeof(away)) < 0 && errno == ENOENT,
+               "contain: connect goes to the kernel (which finds no such socket)");
+        if (u >= 0) close(u);
+        EXPECT(kill(parent, 0) == 0, "contain: a signal to another process of the UID");
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &action, NULL);
+        fflush(stdout);
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            usr1_seen = 0;
+            int sent = kill(getpid(), SIGUSR1) == 0;
+            _exit(sent && usr1_seen ? 0 : 1);
+        }
+        int status = 0;
+        waitpid(grandchild, &status, 0);
+        EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "contain: a forked child signals itself");
+        errno = 0;
+        EXPECT(a_ptrace() == EACCES || a_ptrace() == EPERM, "contain: ptrace still refused");
+        EXPECT(a_unshare() == EPERM, "contain: unshare still refused");
+        EXPECT(a_mount() == EPERM, "contain: mount still refused");
+        EXPECT(a_bpf() == EACCES, "contain: bpf still refused");
+        EXPECT(a_io_uring() == EACCES, "contain: io_uring still refused");
+        errno = 0;
+        EXPECT(syscall(__NR_finit_module, -1, "", 0) < 0 && errno == EPERM, "contain: module loading refused");
+#ifdef __NR_pidfd_open
+        errno = 0;
+        EXPECT(syscall(__NR_pidfd_open, parent, 0) < 0 && errno == EPERM, "contain: pidfd_open still refused");
+#endif
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+    if (WIFSIGNALED(status)) printf("FAIL contain: the child died by signal %d\n", WTERMSIG(status));
+
+    /* Every flag at once still fits in a filter. */
+    int every[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, every) != 0) return 1;
+    if (sbx_broker_start(sbx_policy_new(), every[0]) != 0) return 1;
+    fflush(stdout);
+    child = fork();
+    if (child == 0) {
+        close(every[0]);
+        struct sbx_lockdown_options options = {
+            .flags = SBX_LOCK_CONTAIN | SBX_LOCK_UNIX | SBX_LOCK_INET | SBX_LOCK_LOG_SOCKET | SBX_LOCK_LEARN};
+        int locked = sbx_lockdown(every[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "contain: every flag at once fits in the filter");
+        _exit(failures ? 1 : 0);
+    }
+    close(every[1]);
+    waitpid(child, &status, 0);
+    failed |= !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+    return failed;
+}
+
 /* ---- sbx_broker_listen and libsbx_child.so: a tree of processes attaches by path and token. ---- */
 
 #define TEST_TOKEN "sbx-test-token-0123456789abcdef"
@@ -1822,7 +1934,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | listen_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

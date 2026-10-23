@@ -1197,15 +1197,25 @@ static void socket_rule(unsigned flags) {
     } families[3];
     unsigned family_count = 0;
     families[family_count++] = (struct family) {AF_UNIX, {SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM},
-                                                (flags & SBX_LOCK_LOG_SOCKET) ? 3u : 2u};
-    if (flags & SBX_LOCK_INET) {
+                                                (flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_SOCKETS)) ? 3u : 2u};
+    int netlink = (flags & SBX_LOCK_SOCKETS) != 0;
+    if (flags & (SBX_LOCK_INET | SBX_LOCK_SOCKETS)) {
         families[family_count++] = (struct family) {AF_INET, {SOCK_STREAM, SOCK_DGRAM, 0}, 2};
         families[family_count++] = (struct family) {AF_INET6, {SOCK_STREAM, SOCK_DGRAM, 0}, 2};
     }
     unsigned total = 2;  /* the load of the domain and the final refusal */
     for (unsigned f = 0; f < family_count; f++) total += 5 + families[f].count;
+    if (netlink) total += 5;
     jeq(__NR_socket, 0, (unsigned char) total);
     load(ARG_LO(0));
+    if (netlink) {
+        /* Route netlink only (interfaces and addresses), whatever the type. */
+        jeq(AF_NETLINK, 0, 4);
+        load(ARG_LO(2));
+        jeq(0 /* NETLINK_ROUTE */, 0, 1);
+        ret(ALLOW);
+        ret(REFUSE);
+    }
     for (unsigned f = 0; f < family_count; f++) {
         unsigned count = families[f].count;
         jeq(families[f].domain, 0, (unsigned char) (4 + count));
@@ -1342,7 +1352,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     /* A Unix datagram socket for the system log, or inet sockets, when asked; no other socket. */
     if (flags & SBX_LOCK_NET_BROKERED) {
         /* decided above */
-    } else if (flags & SBX_LOCK_UNIX) {
+    } else if (flags & (SBX_LOCK_UNIX | SBX_LOCK_SOCKETS)) {
         socket_rule(flags);
     } else if (flags & SBX_LOCK_LOG_SOCKET) {
         jeq(__NR_socket, 0, 7);
@@ -1393,11 +1403,13 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         /* And SIGSYS stays open on every thread: the handler makes the call (sigmask_call). */
         rule(__NR_rt_sigprocmask, TRAP);
     }
-    /* Signals only to this process. */
-    own_process_only(__NR_kill, pid);
-    own_process_only(__NR_tgkill, pid);
-    own_process_only(__NR_rt_sigqueueinfo, pid);
-    own_process_only(__NR_rt_tgsigqueueinfo, pid);
+    /* Signals only to this process, unless SBX_LOCK_SIGNALS leaves them to the kernel. */
+    if (!(flags & SBX_LOCK_SIGNALS)) {
+        own_process_only(__NR_kill, pid);
+        own_process_only(__NR_tgkill, pid);
+        own_process_only(__NR_rt_sigqueueinfo, pid);
+        own_process_only(__NR_rt_tgsigqueueinfo, pid);
+    }
     /* Sealed descriptors: kept, but no longer used. */
     if (sealed_count > 0) {
         sealed_block(__NR_ioctl, 0, sealed, sealed_count);
@@ -1444,15 +1456,18 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
     /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
-    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_NET_BROKERED))) rule(__NR_connect, REFUSE);
-    if (!(flags & (SBX_LOCK_INET | SBX_LOCK_NET_BROKERED))) rule(__NR_bind, REFUSE);
+    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_NET_BROKERED | SBX_LOCK_SOCKETS))) rule(__NR_connect, REFUSE);
+    if (!(flags & (SBX_LOCK_INET | SBX_LOCK_NET_BROKERED | SBX_LOCK_SOCKETS))) rule(__NR_bind, REFUSE);
     static const unsigned denied[] = {
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
         __NR_keyctl, __NR_add_key, __NR_request_key, __NR_kcmp, __NR_pidfd_open, __NR_pidfd_getfd,
         __NR_pidfd_send_signal, __NR_tkill, __NR_init_module, __NR_finit_module, __NR_delete_module,
     };
-    for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) rule(denied[i], DENY);
+    for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) {
+        if (denied[i] == __NR_tkill && (flags & SBX_LOCK_SIGNALS)) continue;
+        rule(denied[i], DENY);
+    }
     ret(ALLOW);
     return filter_length <= FILTER_MAX ? 0 : -E2BIG;
 }
@@ -1549,6 +1564,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if ((options->flags & SBX_LOCK_UNIX) && (options->flags & (SBX_LOCK_UNBROKERED | SBX_LOCK_NET_BROKERED))) {
         return -EINVAL;
     }
+    /* The process's own sockets, or the broker's: one or the other. */
+    if ((options->flags & SBX_LOCK_SOCKETS) && (options->flags & SBX_LOCK_NET_BROKERED)) return -EINVAL;
     /* The broker's network needs the broker, and replaces the process's own. */
     if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;
     if (unbrokered) broker_fd = -1;

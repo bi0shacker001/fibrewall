@@ -171,6 +171,37 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * SBX_LOCK_NET_BROKERED.
  */
 #define SBX_LOCK_UNIX 0x80u
+/*
+ * Sockets allowed outright, with no broker and no per-call cost: Unix
+ * sockets of every type, inet stream and datagram ones, and route netlink
+ * (NETLINK_ROUTE, how Wine and Go list network interfaces); bind, connect
+ * and the rest go to the kernel. The process can then reach every socket
+ * its UID may (the host's own, in the file system or the abstract
+ * namespace) and create socket files wherever the UID may write. For a
+ * containment sandbox that restricts the file system view only (the
+ * owner's policy for Wine, Droidtop/tracker#584). With SBX_LOCK_UNIX as
+ * well, bind and connect are judged by the broker as that flag says.
+ * Not with SBX_LOCK_NET_BROKERED.
+ */
+#define SBX_LOCK_SOCKETS 0x400u
+/*
+ * Signals to any process the kernel allows (the same UID): kill, tgkill,
+ * tkill, rt_sigqueueinfo and rt_tgsigqueueinfo go to the kernel. Without
+ * it a signal may go to this process only (the pid sbx_lockdown saw). The
+ * pidfd calls stay refused. For a tree of processes that signal each other
+ * (wineserver and its clients).
+ */
+#define SBX_LOCK_SIGNALS 0x800u
+/*
+ * The containment preset (Droidtop/tracker#584, owner, 2026-10-23): the
+ * file system view is the one thing restricted, through the broker; link,
+ * symlink and truncate are brokered like the rest, and sockets, signals,
+ * inotify, shared memory and descriptors are allowed outright. Clear
+ * escapes stay refused whatever the flags: ptrace, process_vm_*, new
+ * namespaces, mounts, bpf, perf_event_open, io_uring, module loading, the
+ * keyring. A host may add or remove any flag of it.
+ */
+#define SBX_LOCK_CONTAIN (SBX_LOCK_PATHOPS | SBX_LOCK_INOTIFY | SBX_LOCK_SOCKETS | SBX_LOCK_SIGNALS)
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
