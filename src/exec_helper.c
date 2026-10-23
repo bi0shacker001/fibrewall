@@ -272,6 +272,7 @@ struct kernel_sigaction {
 #define SIGSYS_ 31
 #define SIGSYS_BIT_ (1ULL << (SIGSYS_ - 1))
 #define SA_SIGINFO_ 4
+#define SA_NODEFER_ 0x40000000
 #define SA_RESTORER_ 0x04000000
 
 static long trampoline(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
@@ -610,7 +611,13 @@ __attribute__((noreturn, used)) void sbxe_main(long *initial) {
     struct kernel_sigaction action;
     memset(&action, 0, sizeof(action));
     action.handler = (void *) on_sigsys;
-    action.flags = SA_SIGINFO_;
+    /*
+     * SA_NODEFER, as the full handler: a trapped call made by another
+     * signal's handler while this one waits for the broker is a nested entry,
+     * not a death by SIGSYS. Each forward has its own answer socket and keeps
+     * everything on the stack, so nesting is safe.
+     */
+    action.flags = SA_SIGINFO_ | SA_NODEFER_;
 #if defined(__x86_64__)
     action.flags |= SA_RESTORER_;
     action.restorer = (void *) sbxe_restorer;
