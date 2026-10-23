@@ -1280,6 +1280,11 @@ calls sigprocmask from its handlers, and the lockdown traps sigprocmask.
 Fixing it, rather than seeing it, is a separate change (the handler would
 have to take a nested trap).
 
+Learning mode used to let exec through like any other recorded call. The
+new program keeps the filter but not the handler, so its first trapped call
+ended it with signal 31. Learning now records exec and refuses it, as a real
+lockdown does.
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the
