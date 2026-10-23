@@ -80,6 +80,13 @@ enum sbx_op {
     SBX_EXEC = 25,
     /* SBX_LOCK_SIGNAL_TREE: body = struct sbx_signal_request; the broker sends the signal when the target is the tree's */
     SBX_SIGNAL = 26,
+    /*
+     * SBX_LOCK_WATCH: path = the path to watch, mode = the inotify mask; the process's inotify descriptor is
+     * the first descriptor after the answer socket (dirfd_sent = 1), and its current directory the second
+     * (dirfd2_sent = 1) when the path is relative. The broker adds the mark on that descriptor; result = the
+     * watch descriptor.
+     */
+    SBX_WATCH = 27,
 };
 
 /* The calls SBX_SIGNAL carries. */

@@ -50,6 +50,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/inotify.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -659,6 +660,7 @@ static const char *op_name(uint32_t op) {
     case SBX_UNIX_CONNECT: return "connect";
     case SBX_EXEC: return "exec";
     case SBX_SIGNAL: return "signal";
+    case SBX_WATCH: return "watch";
     default: return "unknown";
     }
 }
@@ -1353,6 +1355,97 @@ static void unix_one(const struct sbx_policy *policy, const struct sbx_request *
     reply(answer, result, NULL, 0, -1);
 }
 
+/* The events an inotify mark may ask for, and the flags it may carry; nothing else reaches the kernel. */
+#define WATCH_EVENTS IN_ALL_EVENTS
+#define WATCH_FLAGS (IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT | IN_MASK_CREATE)
+/* A folder's own events: they carry no name. */
+#define WATCH_SELF (IN_DELETE_SELF | IN_MOVE_SELF)
+
+/*
+ * Whether every name inside folder (a decided real path) is one the
+ * process may read: no rule beneath it grants less, and it is not /proc,
+ * whose entries the rules decide per process.
+ */
+static int names_all_readable(const struct sbx_policy *policy, const char *folder) {
+    size_t length = strlen(folder);
+    if (strncmp(folder, "/proc", 5) == 0 && (folder[5] == '\0' || folder[5] == '/')) return 0;
+    for (size_t i = 0; i < policy->count; i++) {
+        const struct rule *r = &policy->rules[i];
+        if (r->length > length && within(r->path, folder, length) && !permits(r->mode, SBX_READ)) return 0;
+    }
+    return 1;
+}
+
+/*
+ * SBX_LOCK_WATCH: an inotify mark on the process's own inotify descriptor
+ * (docs/design.md, "SBX_LOCK_WATCH"). The path is decided as a read of what
+ * it resolves to (the last link followed unless IN_DONT_FOLLOW) and the mark
+ * is added through the checked folder, as /proc/self/fd/<parent>/<name>, with
+ * IN_DONT_FOLLOW, so it lands on what was decided. The mask keeps the
+ * standard events and flags. On a folder holding a name the process may not
+ * read, it keeps only the folder's own events, which name nothing; a mark
+ * that would then ask for nothing watches for the folder's deletion, so the
+ * call still succeeds and the process sees fewer events, never other names.
+ */
+static void watch_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                      size_t body_len, int *fds, int fd_count, pid_t pid) {
+    int answer = fds[0];
+    if (request->path2_len != 0 || request->path_len != body_len || body_len == 0 || body_len >= SBX_PATH_MAX ||
+        !request->dirfd_sent || fd_count != 1 + request->dirfd_sent + request->dirfd2_sent) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    char kind[SBX_PATH_MAX];
+    if (fd_path(fds[1], kind) != 0 || strcmp(kind, "anon_inode:inotify") != 0) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    uint32_t mask = request->mode;
+    if ((mask & WATCH_EVENTS) == 0 || (mask & ~(uint32_t) (WATCH_EVENTS | WATCH_FLAGS)) != 0) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    char base[SBX_PATH_MAX] = "/";
+    if (request->dirfd2_sent) {
+        if (fd_path(fds[2], base) != 0 || base[0] != '/') { reply(answer, -ENOTDIR, NULL, 0, -1); return; }
+    }
+    struct check c;
+    c.policy = policy;
+    c.op = request->op;
+    c.pid = pid;
+    c.tid = request->tid;
+    c.flags = (int) mask;
+    int result = decide(&c, base, body, body_len, SBX_READ, !(mask & IN_DONT_FOLLOW), 0);
+    if (result == 0 && c.real[0] == '\0') result = -ENOENT;
+    if (result == 0) {
+        const char *name;
+        int parent = open_parent(&c, SBX_READ, &name);
+        if (parent < 0) {
+            result = parent;
+        } else {
+            struct stat st;
+            if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                result = -errno;
+            } else {
+                if (S_ISDIR(st.st_mode) && !names_all_readable(policy, c.real)) {
+                    uint32_t events = mask & WATCH_SELF;
+                    mask = (mask & WATCH_FLAGS) | (events ? events : IN_DELETE_SELF);
+                }
+                char via[SBX_PATH_MAX];
+                int written = snprintf(via, sizeof(via), "/proc/self/fd/%d/%s", parent, name);
+                if (written < 0 || (size_t) written >= sizeof(via)) {
+                    result = -ENAMETOOLONG;
+                } else {
+                    int wd = inotify_add_watch(fds[1], via, mask | IN_DONT_FOLLOW);
+                    result = wd >= 0 ? wd : -errno;
+                }
+            }
+            close(parent);
+        }
+    }
+    reply(answer, result, NULL, 0, -1);
+}
+
 static int socket_domain(int fd) {
     int domain = 0;
     socklen_t length = sizeof(domain);
@@ -1576,7 +1669,8 @@ static const char *allowed_by(long nr, const int64_t *args) {
 #endif
         return "SBX_LOCK_PATHOPS";
     case __NR_inotify_add_watch:
-        return "SBX_LOCK_INOTIFY";
+        /* The scoped one; SBX_LOCK_INOTIFY also allows it, unscoped. */
+        return "SBX_LOCK_WATCH";
     case __NR_execve:
     case __NR_execveat:
         return "SBX_LOCK_EXEC";
@@ -1684,6 +1778,10 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
     }
     if (request->version == SBX_PROTOCOL_VERSION && (request->op == SBX_UNIX_BIND || request->op == SBX_UNIX_CONNECT)) {
         unix_one(policy, request, body, body_len, fds, fd_count, pid);
+        return;
+    }
+    if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_WATCH) {
+        watch_one(policy, request, body, body_len, fds, fd_count, pid);
         return;
     }
     if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {

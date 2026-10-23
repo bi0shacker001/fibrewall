@@ -1023,6 +1023,111 @@ static int pathops_check(void) {
     return failed;
 }
 
+/* ---- SBX_LOCK_WATCH: inotify marks decided and added by the broker. ---- */
+
+/* The mask the kernel holds for watch wd on inotify descriptor fd, from /proc/self/fdinfo; 0 when it is not there. */
+static unsigned watch_mask(int fd, int wd) {
+    char path[64], line[512];
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned mask = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int found;
+        const char *m = strstr(line, " mask:");
+        if (sscanf(line, "inotify wd:%x", (unsigned *) &found) == 1 && found == wd && m) {
+            mask = (unsigned) strtoul(m + 6, NULL, 16);
+        }
+    }
+    fclose(f);
+    return mask;
+}
+
+static int watch_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    char hidden[400], visible[400], made[500], link_out[400], data[400];
+    snprintf(hidden, sizeof(hidden), "%s/w-hidden", game);
+    snprintf(visible, sizeof(visible), "%s/w-visible", save);
+    snprintf(made, sizeof(made), "%s/w-made", visible);
+    snprintf(link_out, sizeof(link_out), "%s/w-link", save);
+    snprintf(data, sizeof(data), "%s/data.txt", game);
+    mkdir(hidden, 0700);
+    mkdir(visible, 0700);
+    unlink(link_out);
+    if (symlink(secret, link_out) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    sbx_policy_add(policy, hidden, SBX_DENY);
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_WATCH | SBX_LOCK_INOTIFY};
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "watch: not with SBX_LOCK_INOTIFY");
+        options.flags = SBX_LOCK_WATCH | SBX_LOCK_UNBROKERED;
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "watch: not without the broker");
+        options.flags = SBX_LOCK_WATCH;
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "watch: lockdown");
+        if (locked != 0) _exit(1);
+        int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+        EXPECT(fd >= 0, "watch: an inotify descriptor");
+
+        int wd = inotify_add_watch(fd, visible, IN_CREATE | IN_DELETE);
+        EXPECT(wd >= 0, "watch: a folder whose names are all readable");
+        unsigned mask = wd >= 0 ? watch_mask(fd, wd) : 0;
+        EXPECT((mask & (IN_CREATE | IN_DELETE)) == (IN_CREATE | IN_DELETE), "watch: keeps the events asked for");
+        int made_fd = open(made, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        if (made_fd >= 0) close(made_fd);
+        char events[4096];
+        ssize_t got = read(fd, events, sizeof(events));
+        const struct inotify_event *event = (const struct inotify_event *) events;
+        EXPECT(got >= (ssize_t) sizeof(*event) && event->wd == wd && (event->mask & IN_CREATE) && event->len > 0 &&
+                   strcmp(event->name, "w-made") == 0,
+               "watch: the event names the file made there");
+
+        wd = inotify_add_watch(fd, game, IN_CREATE | IN_DELETE_SELF);
+        EXPECT(wd >= 0, "watch: a folder holding a name it may not read is still watched");
+        mask = wd >= 0 ? watch_mask(fd, wd) : 0;
+        EXPECT(!(mask & IN_CREATE) && (mask & IN_DELETE_SELF), "watch: but only for the folder's own events");
+        wd = inotify_add_watch(fd, game, IN_CREATE);
+        mask = wd >= 0 ? watch_mask(fd, wd) : 0;
+        EXPECT(wd >= 0 && !(mask & IN_CREATE) && (mask & IN_DELETE_SELF),
+               "watch: one asking only for named events watches for the folder's deletion");
+
+        EXPECT(inotify_add_watch(fd, data, IN_MODIFY) >= 0, "watch: a readable file");
+        errno = 0;
+        EXPECT(refused(inotify_add_watch(fd, secret, IN_CREATE)), "watch: a folder outside the rules is refused");
+        errno = 0;
+        EXPECT(refused(inotify_add_watch(fd, hidden, IN_CREATE)), "watch: a folder a narrower rule denies is refused");
+        errno = 0;
+        EXPECT(refused(inotify_add_watch(fd, link_out, IN_CREATE)), "watch: a link out of the rules is refused");
+        EXPECT(inotify_add_watch(fd, link_out, IN_ATTRIB | IN_DONT_FOLLOW) >= 0,
+               "watch: with IN_DONT_FOLLOW, the link itself is watched");
+        errno = 0;
+        EXPECT(inotify_add_watch(fd, save, IN_ISDIR | IN_CREATE) < 0 && errno == EINVAL,
+               "watch: a flag outside the standard ones is refused");
+        int not_inotify[2];
+        errno = 0;
+        EXPECT(pipe(not_inotify) == 0 && inotify_add_watch(not_inotify[0], save, IN_CREATE) < 0 && errno == EINVAL,
+               "watch: a descriptor that is not inotify is refused");
+        EXPECT(chdir(save) == 0 && inotify_add_watch(fd, "w-visible", IN_CREATE) >= 0, "watch: a relative path");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    unlink(made);
+    rmdir(visible);
+    rmdir(hidden);
+    unlink(link_out);
+    return !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+}
+
 /* ---- SBX_LOCK_UNIX: Unix sockets of the process's own, bound and connected by the broker. ---- */
 
 /* A path into sun_path, cut to fit (the test's paths are short). */
@@ -2551,7 +2656,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

@@ -32,10 +32,10 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.1"
+#define SBX_VERSION "0.1.2"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
-#define SBX_VERSION_PATCH 1
+#define SBX_VERSION_PATCH 2
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -163,6 +163,17 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * notifications. fanotify stays refused.
  */
 #define SBX_LOCK_INOTIFY 0x200u
+/*
+ * inotify marks through the broker (docs/design.md, "SBX_LOCK_WATCH"): the
+ * broker decides the watched path as a read of what it resolves to and adds
+ * the mark itself, on the process's own inotify descriptor, through the
+ * checked folder and without following a last link. The mask keeps the
+ * standard events and flags only; on a folder holding anything the rules do
+ * not let the process read, it keeps only the folder's own events (deleted,
+ * moved), which name nothing, so no event names a file the process could not
+ * open. Needs the broker; not with SBX_LOCK_INOTIFY.
+ */
+#define SBX_LOCK_WATCH 0x4000u
 /*
  * execve and execveat are allowed, through the broker and the host's
  * static helper (docs/design.md, "SBX_LOCK_EXEC and sbx-exec"): the broker

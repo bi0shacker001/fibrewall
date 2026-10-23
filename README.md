@@ -73,6 +73,9 @@ Not built yet:
 
 ### Releases
 
+- **v0.1.2** (2026-10-23), for Ren'Py under Enginehost's lockdown ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)):
+  - `SBX_LOCK_WATCH`: inotify marks decided and added by the broker, scoped to readable paths and narrowed to a folder's own events where it holds a name the process may not read ([docs/design.md](docs/design.md), "SBX_LOCK_WATCH").
+
 - **v0.1.1** (2026-10-23), a program tree such as Wine, end to end ([Droidtop/tracker#470](https://github.com/Droidtop/tracker/issues/470)):
   - `#!` scripts run under `SBX_LOCK_EXEC`, as the kernel runs them, with the interpreter decided by the broker;
   - the first process of a tree attaches with `SBX_LOCK_CONTAIN` from the environment: `SBX_EXEC_HELPER` and `SBX_CHILD_LIBRARY` name `sbx-exec` and `libsbx_child.so`;

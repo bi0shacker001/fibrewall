@@ -884,6 +884,33 @@ static long unix_call(uint32_t op, int fd, const struct sockaddr *address, sockl
     return result;
 }
 
+/*
+ * SBX_LOCK_WATCH: inotify_add_watch goes to the broker with the inotify
+ * descriptor (and the current directory for a relative path); the broker
+ * decides the path and adds the mark on that same descriptor.
+ */
+static long watch_call(int fd, const char *path, uint32_t mask) {
+    if (path == NULL) return -EFAULT;
+    size_t length = strnlen(path, SBX_PATH_MAX);
+    if (length == SBX_PATH_MAX) return -ENAMETOOLONG;
+    if (length == 0) return -ENOENT;
+    int relative = path[0] != '/';
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = SBX_WATCH;
+    request.mode = mask;
+    request.path_len = (uint32_t) length;
+    request.tid = (int32_t) syscall(__NR_gettid);
+    request.dirfd_sent = 1;
+    request.dirfd2_sent = (uint8_t) relative;
+    int extra[2] = {fd, relative ? current_directory() : -1};
+    int passed;
+    long result = exchange(&request, extra, relative ? 2 : 1, path, length, NULL, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
 /* SIGSYS as a bit of the kernel's 64-bit signal mask. */
 #define SIGSYS_BIT (1ULL << (SIGSYS - 1))
 
@@ -1272,6 +1299,9 @@ static long dispatch(long nr, ucontext_t *uc) {
         return symlink_path((const char *) a0, (int) a1, (const char *) a2);
     case __NR_truncate:
         return truncate_path((const char *) a0, a1);
+    case __NR_inotify_add_watch:
+        /* Trapped only with SBX_LOCK_WATCH; otherwise refused or the kernel's. */
+        return watch_call((int) a0, (const char *) a1, (uint32_t) a2);
     case __NR_socket:
         return net_socket((int) a0, (int) a1, (int) a2);
     case __NR_connect:
@@ -1796,8 +1826,10 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         if (flags & SBX_LOCK_PATHOPS) {
             for (size_t i = 0; i < sizeof(pathops) / sizeof(pathops[0]); i++) rule(pathops[i], TRAP);
         }
+        /* SBX_LOCK_WATCH sends inotify marks to the broker. */
+        if (flags & SBX_LOCK_WATCH) rule(__NR_inotify_add_watch, TRAP);
         for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) {
-            if (refused_paths[i] == __NR_inotify_add_watch && (flags & SBX_LOCK_INOTIFY)) continue;
+            if (refused_paths[i] == __NR_inotify_add_watch && (flags & (SBX_LOCK_INOTIFY | SBX_LOCK_WATCH))) continue;
             rule(refused_paths[i], REFUSE);
         }
     }
@@ -1932,6 +1964,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if ((options->flags & SBX_LOCK_SIGNAL_TREE) && (options->flags & (SBX_LOCK_SIGNALS | SBX_LOCK_UNBROKERED))) {
         return -EINVAL;
     }
+    /* Watches decided by the broker, or left to the kernel: one or the other, and deciding needs the broker. */
+    if ((options->flags & SBX_LOCK_WATCH) && (options->flags & SBX_LOCK_INOTIFY || unbrokered || pass)) return -EINVAL;
     /* The process's own sockets, or the broker's: one or the other. */
     if ((options->flags & SBX_LOCK_SOCKETS) && (options->flags & SBX_LOCK_NET_BROKERED)) return -EINVAL;
     /* The broker's network needs the broker, and replaces the process's own. */

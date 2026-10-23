@@ -601,10 +601,43 @@ refused list in every mode (the kernel refuses them anyway without
 `CAP_SYS_MODULE`; this keeps them refused if the process ever had it).
 
 Not brokered, still refused: `mknod`, `chown` and friends, xattrs on a path,
-`inotify`/`fanotify` marks without `SBX_LOCK_INOTIFY` (Wine's change notifications fail with the same
-error it already handles when `inotify` is unavailable; a later
-`SBX_WATCH` could add a mark on an `inotify` descriptor the process hands
-over, as the socket calls do).
+`fanotify` marks, and `inotify` marks without `SBX_LOCK_INOTIFY` or `SBX_LOCK_WATCH` (Wine's change notifications fail with the same
+error it already handles when `inotify` is unavailable).
+
+#### SBX_LOCK_WATCH: inotify marks the broker decides (0.1.2)
+
+Enginehost's owner, for Ren'Py under the lockdown (Droidtop/tracker#550,
+2026-10-23): inotify "allowed, but scoped and filtered", then, asked
+whether filtering when the mark is added is enough since the kernel hands
+events straight to the process: "Can we modify the watch along the way?"
+and "yeah, that's what I meant" to the shape below.
+
+`inotify_add_watch` traps, and goes to the broker as `SBX_WATCH` with the
+process's inotify descriptor (and its current directory for a relative
+path). The broker:
+
+- checks the descriptor is an inotify one (`anon_inode:inotify`);
+- keeps the mask to the standard events (`IN_ALL_EVENTS`) and flags
+  (`IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`,
+  `IN_ONESHOT`, `IN_MASK_CREATE`); anything else is `EINVAL`;
+- decides the path as a read of what it resolves to, following a last
+  link unless `IN_DONT_FOLLOW`;
+- adds the mark itself, on that same descriptor (the same open file, so
+  the process reads its events as usual), through the checked folder as
+  `/proc/self/fd/<parent>/<name>` and with `IN_DONT_FOLLOW`, so the mark
+  lands on what was decided;
+- on a folder holding a name the process may not read (a narrower rule
+  beneath it that grants less than read, or anything under `/proc`), keeps
+  only the folder's own events, `IN_DELETE_SELF` and `IN_MOVE_SELF`, which
+  carry no name. A mark that would then ask for nothing watches for the
+  folder's deletion, so the call still succeeds: the process sees fewer
+  events, never a name it could not open.
+
+The kernel delivers events to the process directly, so nothing is filtered
+per event, and nothing costs anything per event. `inotify_rm_watch` is
+the kernel's. Needs the broker; not with `SBX_LOCK_INOTIFY`, which lets
+marks through unscoped. Learning records name `SBX_LOCK_WATCH` as the flag
+that would allow a refused mark.
 
 #### Directory listing
 
@@ -814,6 +847,7 @@ cost:
 | --- | --- |
 | `SBX_LOCK_PATHOPS` | `link`, `symlink`, `truncate`, brokered like other path calls |
 | `SBX_LOCK_INOTIFY` | inotify marks, the kernel deciding |
+| `SBX_LOCK_WATCH` | inotify marks, the broker deciding and narrowing them (not in the preset; not with `SBX_LOCK_INOTIFY`) |
 | `SBX_LOCK_SOCKETS` | Unix sockets of every type, inet stream and datagram, route netlink; `bind`, `connect` and the rest unjudged |
 | `SBX_LOCK_SIGNALS` | signals to any process of the UID (`kill`, `tgkill`, `tkill`, the sigqueue calls) |
 | `SBX_LOCK_EXEC` | `execve`/`execveat`, decided by the broker as a read and run through `sbx-exec` (needs `exec_helper` and `child_library` in the options) |
