@@ -537,6 +537,7 @@ static const char *op_name(uint32_t op) {
     case SBX_TRUNCATE: return "truncate";
     case SBX_UNIX_BIND: return "bind";
     case SBX_UNIX_CONNECT: return "connect";
+    case SBX_EXEC: return "exec";
     default: return "unknown";
     }
 }
@@ -604,6 +605,54 @@ static int decide(struct check *c, const char *base, const char *raw, size_t len
     if (result == 0 && resolved != 0) result = resolved;
     audit(c, need, result);
     return result;
+}
+
+/*
+ * ---- What each pid runs, after SBX_EXEC ----
+ *
+ * An image started through sbx-exec is, to the kernel, sbx-exec: its
+ * /proc/<pid>/exe names the helper. The broker records the target each pid
+ * was allowed to run and answers readlink and open of that pid's own
+ * /proc/<pid>/exe with it (Wine and others find their files from it).
+ */
+#define EXE_RECORDS 256
+static struct {
+    pid_t pid;
+    char path[SBX_PATH_MAX];
+} exe_records[EXE_RECORDS];
+static unsigned exe_next;
+static pthread_mutex_t exe_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void exe_record(pid_t pid, const char *path) {
+    pthread_mutex_lock(&exe_lock);
+    unsigned slot = exe_next % EXE_RECORDS;
+    for (unsigned i = 0; i < EXE_RECORDS; i++) {
+        if (exe_records[i].pid == pid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == exe_next % EXE_RECORDS) exe_next++;
+    exe_records[slot].pid = pid;
+    snprintf(exe_records[slot].path, sizeof(exe_records[slot].path), "%s", path);
+    pthread_mutex_unlock(&exe_lock);
+}
+
+/* Whether real is pid's own /proc/<pid>/exe with a recorded target; copies it to out. */
+static int exe_lookup(const char *real, pid_t pid, char *out) {
+    char own[64];
+    snprintf(own, sizeof(own), "/proc/%d/exe", (int) pid);
+    if (strcmp(real, own) != 0) return 0;
+    int found = 0;
+    pthread_mutex_lock(&exe_lock);
+    for (unsigned i = 0; i < EXE_RECORDS && !found; i++) {
+        if (exe_records[i].pid == pid && exe_records[i].path[0]) {
+            snprintf(out, SBX_PATH_MAX, "%s", exe_records[i].path);
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&exe_lock);
+    return found;
 }
 
 /*
@@ -704,6 +753,9 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         unsigned need = writing ? SBX_WRITE : (flags & O_PATH) ? LOOKUP : SBX_READ;
         error = decide(&c, base, path, request->path_len, need, !(flags & O_NOFOLLOW), creating);
         if (error != 0) break;
+        /* The process's own /proc/<pid>/exe after sbx-exec: the target it was allowed to run, not the helper. */
+        char exe[SBX_PATH_MAX];
+        if (!writing && exe_lookup(c.real, pid, exe)) snprintf(c.real, sizeof(c.real), "%s", exe);
         int fd = open_decided(&c, flags, (mode_t) request->mode, need);
         if (fd < 0) { error = fd; break; }
         reply(answer, 0, NULL, 0, fd);
@@ -756,6 +808,13 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
     case SBX_READLINK: {
         error = decide(&c, base, path, request->path_len, LOOKUP, 0, 0);
         if (error != 0) break;
+        char exe[SBX_PATH_MAX];
+        if (exe_lookup(c.real, pid, exe)) {
+            size_t n = strlen(exe);
+            if (n > request->mode) n = request->mode;
+            reply(answer, (int64_t) n, exe, (uint32_t) n, -1);
+            return;
+        }
         const char *name;
         int parent = open_parent(&c, LOOKUP, &name);
         if (parent < 0) { error = parent; break; }
@@ -822,6 +881,23 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         error = utimensat(parent, name, request->path2_len ? times : NULL, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
         close(parent);
         break;
+    }
+    case SBX_EXEC: {
+        /* A program is run as it is read: the rules' read decides, on what the path resolves to. */
+        error = decide(&c, base, path, request->path_len, SBX_READ, 1, 0);
+        if (error != 0) break;
+        int fd = open_decided(&c, O_RDONLY, 0, SBX_READ);
+        if (fd < 0) { error = fd; break; }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            close(fd);
+            error = -EACCES;  /* as the kernel answers an exec of anything but a regular file */
+            break;
+        }
+        exe_record(pid, c.real);
+        reply(answer, 0, NULL, 0, fd);
+        close(fd);
+        return;
     }
     case SBX_LINK: {
         /* Both names writable: a link to a file the process may only read would let it write that file. */
@@ -1356,6 +1432,9 @@ static const char *allowed_by(long nr, const int64_t *args) {
         return "SBX_LOCK_PATHOPS";
     case __NR_inotify_add_watch:
         return "SBX_LOCK_INOTIFY";
+    case __NR_execve:
+    case __NR_execveat:
+        return "SBX_LOCK_EXEC";
     case __NR_kill:
     case __NR_tkill:
     case __NR_tgkill:
