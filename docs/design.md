@@ -864,8 +864,8 @@ handler, but needs kernel 5.0 (the RP5 runs 4.19). The design:
    program's.
 3. **`sbx-exec` itself** is static and freestanding: no libc, no
    interpreter, no path call of its own. It maps the trampoline page and
-   installs a minimal SIGSYS handler (allowed with `SBX_LOCK_EXEC`; a
-   replaced handler only loses its own file access). That handler forwards
+   installs a minimal SIGSYS handler through the trampoline (allowed there
+   with `SBX_LOCK_EXEC`). That handler forwards
    `openat`, `newfstatat`, `faccessat`, `readlinkat`, `statfs` and
    `getcwd` (and the x86_64 forms without `at`) to the broker on the same wire protocol, and emulates
    `rt_sigaction` and `rt_sigprocmask` as the full handler does. It maps
@@ -892,10 +892,19 @@ As built, beyond the steps above:
 - The filter lets only one `execveat` through the trampoline: one with
   `AT_EMPTY_PATH`, which is the handler's run of the helper by
   descriptor. Through the trampoline an exec of a path still traps, and the
-  broker decides it. `rt_sigaction` through the trampoline is allowed for
-  every signal, SIGSYS included, because each new image installs its
-  handler that way. sbx-exec's goes through the trampoline, and the child
-  library's goes through sbx-exec's handler.
+  broker decides it.
+- `rt_sigaction` through the trampoline is allowed for every signal,
+  SIGSYS included, because each new image installs its handler that way:
+  sbx-exec its minimal one, and `sbx_adopt` the full one, with a raw call
+  and its own `rt_sigreturn` stub on x86_64.
+- A program's own SIGSYS handler is refused with `EPERM`, by both handlers,
+  as the filter refuses it without `SBX_LOCK_EXEC`. bionic's linker
+  installs debuggerd's handler for SIGSYS while it loads every image. If
+  that handler were installed, the next trapped call would reach debuggerd
+  and end the process with signal 31.
+- The trampoline's code starts 64 bytes into its page. clang's
+  `-fsanitize=function` reads a word before the target of an indirect
+  call, and that word has to be mapped.
 - The broker refuses a target with no execute bit (`EACCES`), as the
   kernel would, since the kernel's own check never runs on a file sbx-exec
   maps.

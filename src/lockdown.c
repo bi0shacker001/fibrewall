@@ -928,6 +928,12 @@ typedef long (*trampoline_fn)(long, long, long, long, long, long, long);
 static trampoline_fn through = sbx_learn_call;
 static uintptr_t through_after;  /* 0 until a lockdown sets it */
 SBXE_TRAMPOLINE_ASM
+#ifdef __x86_64__
+/* rt_sigreturn, for a handler sbx_adopt installs without libc. */
+void sbx_restorer(void);
+__asm__(".text\n.globl sbx_restorer\n.hidden sbx_restorer\n.type sbx_restorer,@function\n"
+        "sbx_restorer:\n  mov $15, %rax\n  syscall\n");
+#endif
 extern const char sbxe_trampoline_start[], sbxe_trampoline_after[], sbxe_trampoline_end[];
 
 static uintptr_t trampoline_after(void) {
@@ -940,12 +946,12 @@ static uintptr_t trampoline_after(void) {
  * lockdown.
  */
 static int map_trampoline(void) {
-    void *want = (void *) SBXE_TRAMPOLINE_ADDRESS;
+    void *want = (void *) SBXE_TRAMPOLINE_ADDRESS, *entry = (void *) SBXE_TRAMPOLINE_ENTRY;
     size_t length = (size_t) (sbxe_trampoline_end - sbxe_trampoline_start);
     void *page = mmap(want, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | 0x100000 /* MAP_FIXED_NOREPLACE */,
                       -1, 0);
     if (page == want) {
-        memcpy(page, sbxe_trampoline_start, length);
+        memcpy(entry, sbxe_trampoline_start, length);
         if (mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0) {
             int error = errno;
             munmap(page, 4096);
@@ -956,10 +962,10 @@ static int map_trampoline(void) {
         if (page != MAP_FAILED) munmap(page, 4096);
         unsigned char resident;
         if (mincore(want, 4096, &resident) != 0) return -ENOMEM;
-        if (memcmp(want, sbxe_trampoline_start, length) != 0) return -EEXIST;
+        if (memcmp(entry, sbxe_trampoline_start, length) != 0) return -EEXIST;
     }
-    through = (trampoline_fn) SBXE_TRAMPOLINE_ADDRESS;
-    through_after = SBXE_TRAMPOLINE_ADDRESS + (uintptr_t) (sbxe_trampoline_after - sbxe_trampoline_start);
+    through = (trampoline_fn) SBXE_TRAMPOLINE_ENTRY;
+    through_after = SBXE_TRAMPOLINE_ENTRY + (uintptr_t) (sbxe_trampoline_after - sbxe_trampoline_start);
     return 0;
 }
 
@@ -1010,12 +1016,15 @@ struct kernel_sigaction {
  * rt_sigaction, made with SIGSYS left out of the new handler's mask: while
  * a handler runs the kernel blocks its mask, and a trapped call made there
  * with SIGSYS blocked kills the process (docs/design.md, "SIGSYS stays
- * open"). The filter has already refused a new SIGSYS handler; the call is
- * made through the trampoline, which a real filter lets through for this
- * call alone.
+ * open"). The call is made through the trampoline, which a real filter
+ * lets through for this call alone. A new SIGSYS handler is refused, by the
+ * filter, or here with SBX_LOCK_EXEC (whose filter lets one through the
+ * trampoline for sbx_adopt): bionic installs debuggerd's for SIGSYS, which
+ * would end the process on the next trapped call.
  */
 static long sigaction_call(long signal_number, const void *action, void *old, unsigned long size) {
     if (size != sizeof(uint64_t)) return -EINVAL;
+    if (action != NULL && signal_number == SIGSYS) return -EPERM;
     if (action == NULL) return through(__NR_rt_sigaction, signal_number, 0, (long) old, (long) size, 0, 0);
     struct kernel_sigaction copy;
     memcpy(&copy, action, sizeof(copy));
@@ -2007,17 +2016,22 @@ int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, con
     unix_mode = (flags & SBX_LOCK_UNIX) != 0;
     lock_flags = flags;
     /*
-     * The full handler replaces sbx-exec's minimal one. sigaction traps, and
-     * the minimal handler makes the call through the trampoline, which the
-     * filter allows with SBX_LOCK_EXEC.
+     * The full handler replaces sbx-exec's minimal one, through the
+     * trampoline, which the filter allows with SBX_LOCK_EXEC. Not through
+     * libc's sigaction: that traps, and both handlers refuse a new SIGSYS
+     * handler.
      */
-    struct sigaction action;
+    struct kernel_sigaction action;
     memset(&action, 0, sizeof(action));
-    action.sa_sigaction = on_sigsys;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&action.sa_mask);
-    if (sigaction(SIGSYS, &action, NULL) != 0) {
-        int error = -errno;
+    action.handler = (void *) on_sigsys;
+    action.flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+#ifdef __x86_64__
+    action.flags |= 0x04000000; /* SA_RESTORER: x86_64 returns from a handler only through one */
+    action.restorer = (void *) sbx_restorer;
+#endif
+    long installed = through(__NR_rt_sigaction, SIGSYS, (long) &action, 0, sizeof(uint64_t), 0, 0);
+    if (installed != 0) {
+        int error = (int) installed;
         broker = -1;
         cwd = -1;
         helper_fd = -1;

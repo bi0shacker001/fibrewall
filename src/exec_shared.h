@@ -47,6 +47,12 @@
 #else
 #define SBXE_TRAMPOLINE_ADDRESS 0x5b0000000UL
 #endif
+/*
+ * The code starts 64 bytes into the page, so the word before it is mapped:
+ * clang's -fsanitize=function reads a signature there before an indirect
+ * call, and finds none.
+ */
+#define SBXE_TRAMPOLINE_ENTRY (SBXE_TRAMPOLINE_ADDRESS + 64)
 
 /*
  * sbxe_trampoline(nr, a0..a5) makes system call nr; the filter recognises

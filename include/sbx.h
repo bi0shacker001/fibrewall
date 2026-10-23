@@ -164,9 +164,8 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * comes up confined exactly as this one, with the same filter and pid,
  * adopting the connection in libsbx_child.so's constructor. Needs the
  * broker and sbx_lockdown_options.exec_helper and .child_library; not with
- * SBX_LOCK_PASSTHROUGH. With it, a process may install its own SIGSYS
- * handler (each new image must); a replaced handler only loses its own
- * file access, since the filter refuses what it would have forwarded.
+ * SBX_LOCK_PASSTHROUGH. A program's own SIGSYS handler is refused (EPERM)
+ * as without it; the library installs each new image's handler itself.
  */
 #define SBX_LOCK_EXEC 0x1000u
 /*

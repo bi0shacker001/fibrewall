@@ -1507,6 +1507,13 @@ static int exec_child_main(int argc, char **argv) {
     errno = 0;
     snprintf(name, sizeof(name), "exec %d: a file outside the rules refused", left);
     EXPECT(refused(open(path, O_RDONLY)), name);
+    /* As bionic's linker does for debuggerd: a program's own SIGSYS handler is refused, and ours stays. */
+    struct sigaction theirs;
+    memset(&theirs, 0, sizeof(theirs));
+    theirs.sa_handler = SIG_DFL;
+    errno = 0;
+    snprintf(name, sizeof(name), "exec %d: a program's own SIGSYS handler refused (EPERM)", left);
+    EXPECT(sigaction(SIGSYS, &theirs, NULL) < 0 && errno == EPERM, name);
     int fd = open(self, O_RDONLY);
     snprintf(name, sizeof(name), "exec %d: a file the rules allow opens, through the broker", left);
     EXPECT(fd >= 0, name);
@@ -1532,9 +1539,9 @@ static int exec_child_main(int argc, char **argv) {
      * decided by the broker.
      */
 #if defined(__x86_64__)
-    long (*trampoline)(long, long, long, long, long, long, long) = (void *) 0x200000000000UL;
+    long (*trampoline)(long, long, long, long, long, long, long) = (void *) (0x200000000000UL + 64);
 #else
-    long (*trampoline)(long, long, long, long, long, long, long) = (void *) 0x5b0000000UL;
+    long (*trampoline)(long, long, long, long, long, long, long) = (void *) (0x5b0000000UL + 64);
 #endif
     char *no_args[] = {path, NULL};
     snprintf(name, sizeof(name), "exec %d: execveat of a path through the trampoline is still decided (refused)", left);

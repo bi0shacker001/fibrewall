@@ -277,12 +277,20 @@ struct kernel_sigaction {
 
 static long trampoline(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     typedef long (*call_fn)(long, long, long, long, long, long, long);
-    return ((call_fn) SBXE_TRAMPOLINE_ADDRESS)(nr, a0, a1, a2, a3, a4, a5);
+    return ((call_fn) SBXE_TRAMPOLINE_ENTRY)(nr, a0, a1, a2, a3, a4, a5);
 }
 
-/* rt_sigaction with SIGSYS left out of the new handler's mask (lockdown.c, sigaction_call). */
+/*
+ * rt_sigaction with SIGSYS left out of the new handler's mask (lockdown.c,
+ * sigaction_call). A new SIGSYS handler is refused (EPERM, as a filter
+ * without SBX_LOCK_EXEC answers): bionic's linker installs debuggerd's for
+ * SIGSYS while it loads, and that one would end the process on the next
+ * trapped call. The child library installs the full handler through the
+ * trampoline, not through here.
+ */
 static long sigaction_call(long signal_number, const struct kernel_sigaction *action, void *old, unsigned long size) {
     if (size != sizeof(uint64_t)) return -22;
+    if (action && signal_number == SIGSYS_) return -1; /* EPERM */
     if (!action) return trampoline(NR_rt_sigaction, signal_number, 0, (long) old, (long) size, 0, 0);
     struct kernel_sigaction copy = *action;
     copy.mask &= ~SIGSYS_BIT_;
@@ -399,7 +407,7 @@ static void map_trampoline(void) {
         /* An image that was itself started through sbx-exec has it already (exec keeps nothing, so not here). */
         die("could not map the trampoline page at its fixed address");
     }
-    memcpy((void *) page, sbxe_trampoline_start, (size_t) (sbxe_trampoline_end - sbxe_trampoline_start));
+    memcpy((void *) SBXE_TRAMPOLINE_ENTRY, sbxe_trampoline_start, (size_t) (sbxe_trampoline_end - sbxe_trampoline_start));
     if (sys3(NR_mprotect, page, 4096, 5 /* R|X */) != 0) die("could not make the trampoline page executable");
 }
 
