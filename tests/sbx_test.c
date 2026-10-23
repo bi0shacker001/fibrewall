@@ -786,10 +786,13 @@ static int trace_check(void) {
            found ? "ok  " : "FAIL");
 
     /*
-     * A death inside the handler: while it waits for the broker, another
-     * signal's handler makes a trapped call. SIGSYS is blocked while the
-     * handler runs, so the kernel ends the process with signal 31 and
-     * nothing else; the ring still says which call was being handled.
+     * A trapped call made while the handler waits for the broker, by another
+     * signal's handler on the same thread (ART's signal chain does this with
+     * sigprocmask). With SIGSYS blocked for the handler's duration the
+     * kernel ended the process with signal 31; the handler now takes it as a
+     * nested entry. Meanwhile another process reading the ring sees the
+     * waiting call marked entered and not left, which is what a death in the
+     * handler leaves behind.
      */
     int slow_pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, slow_pair) != 0) return 1;
@@ -807,23 +810,35 @@ static int trace_check(void) {
     }
     close(slow_pair[1]);
     usleep(300000);
-    kill(child, SIGUSR1);
-    waitpid(child, &status, 0);
-    int killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS;
-    printf("%s trace: a trapped call in a signal handler that interrupted the handler ends the process with SIGSYS "
-           "(status %#x)\n", killed ? "ok  " : "FAIL", status);
-    int stuck = 0;
+    int waiting = 0;
     got = pread(ring_fd, &header, sizeof(header), 0) == (ssize_t) sizeof(header);
     for (uint32_t i = 0; got && i < header.next && i < header.slots; i++) {
         struct sbx_trace_entry entry;
         if (pread(ring_fd, &entry, sizeof(entry), (off_t) (sizeof(header) + i * sizeof(entry))) != (ssize_t) sizeof(entry)) break;
-        if (entry.seq != 0 && (entry.state & 0xff) == SBX_TRACE_ENTERED && entry.tid == child) stuck++;
+        if (entry.seq != 0 && (entry.state & 0xff) == SBX_TRACE_ENTERED && entry.tid == child) waiting++;
     }
-    printf("%s trace: the ring shows the call it died handling, entered and never left (%d)\n",
-           stuck == 1 ? "ok  " : "FAIL", stuck);
+    printf("%s trace: a call the handler is still handling is marked entered, not left (%d)\n",
+           waiting == 1 ? "ok  " : "FAIL", waiting);
+    kill(child, SIGUSR1);
+    waitpid(child, &status, 0);
+    int survived = WIFEXITED(status) && WEXITSTATUS(status) == 3;
+    printf("%s trace: a trapped call from a signal handler that interrupted the handler is handled (status %#x)\n",
+           survived ? "ok  " : "FAIL", status);
+    int left = 0, open_left = 0;
+    got = pread(ring_fd, &header, sizeof(header), 0) == (ssize_t) sizeof(header);
+    for (uint32_t i = 0; got && i < header.next && i < header.slots; i++) {
+        struct sbx_trace_entry entry;
+        if (pread(ring_fd, &entry, sizeof(entry), (off_t) (sizeof(header) + i * sizeof(entry))) != (ssize_t) sizeof(entry)) break;
+        if (entry.seq == 0 || entry.tid != child) continue;
+        if ((entry.state & 0xff) == SBX_TRACE_LEFT) left++;
+        else open_left++;
+    }
+    printf("%s trace: both the waiting call and the nested one were left (%d left, %d not)\n",
+           left >= 2 && open_left == 0 ? "ok  " : "FAIL", left, open_left);
+    int killed = !survived, stuck = waiting != 1 || left < 2 || open_left != 0;
     close(ring_fd);
     unlink(ring_file);
-    return failed | !header_ok | !found | !killed | (stuck != 1);
+    return failed | !header_ok | !found | killed | stuck;
 }
 
 static int learn_check(void) {

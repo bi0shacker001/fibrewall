@@ -1383,13 +1383,17 @@ case.
   such as a trap on a thread with SIGSYS blocked. It logs thousands of lines
   in a busy process, so it is for diagnosing only.
 
-The tests reproduce one such death. While the handler waits for the broker,
-another signal's handler makes a trapped call. That process ends with
-signal 31, and the ring shows the call being handled, entered and never
-left. In an Android app process this is not exotic: ART's signal chain
-calls sigprocmask from its handlers, and the lockdown traps sigprocmask.
-Fixing it, rather than seeing it, is a separate change (the handler would
-have to take a nested trap).
+One such death needed no blocked mask at all. While the handler waits for
+the broker, another signal's handler on the same thread makes a trapped
+call. The kernel had blocked SIGSYS for the handler's duration, so the
+process ended with signal 31. In an Android app process this is not exotic:
+ART's signal chain calls sigprocmask from its handlers, and the lockdown
+traps sigprocmask. The handler is now installed with SA_NODEFER and takes
+such a call as a nested entry. That is safe because each request has its
+own answer socket, the handler takes no lock, and errno is kept per entry.
+The tests run exactly this sequence. They also show that, while the outer
+call waits, another process reading the ring sees it entered and not left,
+which is what a death inside the handler leaves.
 
 Learning mode used to let exec through like any other recorded call. The
 new program keeps the filter but not the handler, so its first trapped call
