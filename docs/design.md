@@ -1088,6 +1088,61 @@ already takes an environment map, `WineXSession.kt:240-244`), a shared
 binding of the library replaces the plugin host's private one, and the
 prefix is created as a layer.
 
+#### Host guide: running a program tree such as Wine (as built, 0.1.1)
+
+What a host does to run a tree of programs confined, each image and each
+fork included. It is tested by `program_tree_check`: the system shell
+running `cat`, `ls`, a nested shell, a pipe and a `#!` script, on Linux,
+arm64 and the emulators.
+
+1. **Ship three files where they can be executed.** These are the host's
+   own binding of the library, `libsbx_child.so` and `sbx-exec`, for each
+   ABI the tree runs (arm64-v8a, x86_64). On Android that is the app's
+   native-library folder, since the app's data folder cannot be
+   executed.
+2. **Make the policy:**
+   - rules (`sbx_policy_add`), and `"/dev/null"` read-write for shells;
+   - aliases;
+   - a decider (`sbx_policy_set_decider`), which sees every refusal;
+   - an audit (`sbx_policy_set_audit`), which sees every decision, execs
+     included (op `"exec"`).
+3. **Listen:** `sbx_broker_listen(policy, path, token, &listener)`, with
+   the socket in the host's private folder and a fresh token of 16 or
+   more characters per run.
+4. **Start the first program** with these in its environment:
+   - `LD_PRELOAD`, with `libsbx_child.so` first;
+   - `SBX_BROKER`, the socket's path;
+   - `SBX_TOKEN`;
+   - `SBX_FLAGS`, which is `SBX_LOCK_CONTAIN` (`0x1f00`) for Wine,
+     with `SBX_LOCK_LEARN` (`0x20`) added for a learning run;
+   - `SBX_EXEC_HELPER` and `SBX_CHILD_LIBRARY`, the absolute paths of
+     `sbx-exec` and `libsbx_child.so`.
+
+   Its constructor attaches before `main` and removes the token, the
+   broker path and these two paths from the environment. A process that
+   cannot attach ends before `main` (127).
+5. **Everything after that follows by itself.** A fork keeps the
+   lockdown. An exec, of an ELF or a `#!` script, is decided by the
+   broker as a read of the target, and the new image adopts the same
+   connection, keeping its pid. The host's own preloads stay on
+   `LD_PRELOAD` after `libsbx_child.so`.
+6. **Learning.** With `SBX_LOCK_LEARN`, a decider that records and returns
+   0 lets the tree run while it records:
+   - every path the rules would refuse (decider);
+   - every exec (audit);
+   - every call the filter would refuse (audit op `"syscall"`, with
+     `allowed_by` naming the flag that would allow it).
+
+   A learning run has no protection, and the host says so.
+7. **End:** `sbx_listener_close` when the tree has exited. The broker
+   threads end as their clients close.
+
+Limits a host should know:
+- a static program runs with sbx-exec's minimal handler only (open, stat,
+  access, readlink, statfs, getcwd);
+- the receiver of a brokered signal sees the broker as its sender;
+- a program's own SIGSYS handler is refused (`EPERM`).
+
 ### 4. Library API summary (additions)
 
 Broker side:
@@ -1391,10 +1446,29 @@ that cannot be made, a job that cannot be assigned. There is no unconfined
 mode. A host runs no computer-side plugins on a system whose backend is not
 built or whose escape tests do not pass.
 
-**Not decided here**: what the broker allows. The permission checks and the
-bundled Python belong to the droidtop-agent / Pythia lane (its broker in
-Rust calls this library's spawn and serves or wraps its decider). The
-client call's shape above is proposed to that lane on Droidtop/tracker#606.
+**Decided with the droidtop-agent / Pythia lane** (Droidtop/tracker#606,
+2026-10-23). That lane's Rust broker owns the permission checks; this
+library provides spawn, the broker and the decider.
+- **`sbx_open` as above.** The runtime's own files are `SBX_READ |
+  SBX_STATIC`, and Python opens them directly. A file a plugin asks for
+  through the plugin API is decided by the agent first, then opened by
+  the agent's own `droidtop.host` module with `sbx_open`. The agent's
+  decider allows that one open and refuses a second (`-EACCES` reaches
+  the child), as `tests/sbx_test_win.c` checks.
+- **On Windows the module passes the real path, not a token.**
+  `sbx_policy_alias`, which maps a virtual path, is Linux and Android only
+  for now. A virtual-path form on Windows is a later addition, if the
+  agent wants one.
+- **Open only.** mkdir, unlink, rename and listing are plugin-API
+  operations the agent performs itself.
+- **No network in the container, and no brokered sockets.** Network goes
+  through plugin-API operations. The agent's channel to its plugin is a
+  pipe passed in the handle list, which works in LPAC as the broker's own
+  channel does.
+- **The C runtime is the consumer's.** The sources set none. CMake links
+  it statically only when this is the top-level project
+  (`SBX_MSVC_STATIC_RUNTIME`), so a `/MD` Rust program can build the
+  library in.
 
 ### Tests
 
@@ -1417,8 +1491,10 @@ attempt proves nothing), then confined, where each must fail. The attempts:
 Then, confined only, what must work and what the broker must refuse:
 `sbx_open` of an allowed file reads it; creating and writing in a writable
 rule; refused outside the rules, through `..`, writing in a read-only rule,
-and through a junction planted in a writable folder that leads out; and an
-open relative to a folder handle the broker gave is refused by the token.
+and through a junction planted in a writable folder that leads out; an
+open relative to a folder handle the broker gave is refused by the token;
+and a decider that grants one open of a path no rule covers lets the first
+through and refuses the second with `-EACCES`.
 
 ## When a trap kills: the trace ring and the kernel's audit (built 2026-10-23, Droidtop/tracker#550)
 

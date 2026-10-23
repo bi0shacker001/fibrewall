@@ -308,6 +308,17 @@ static void broker_checks(void) {
 
     utf8_path(path, sizeof(path), L"secret\\key");
     check("sbx_open outside the rules is refused", sbx_open(path, SBX_OPEN_READ, &handle) == -EACCES);
+
+    /* The agent's flow (Droidtop/tracker#606): its decider grants one open of a path no rule covers, then refuses. */
+    utf8_path(path, sizeof(path), L"granted\\once.txt");
+    r = sbx_open(path, SBX_OPEN_READ, &handle);
+    check("the decider grants a path no rule covers, once", r == 0);
+    if (r == 0) {
+        read_word(handle, word, sizeof(word));
+        CloseHandle(handle);
+        check("which reads", strcmp(word, "once") == 0);
+    }
+    check("the second open of it is refused by the decider (-EACCES)", sbx_open(path, SBX_OPEN_READ, &handle) == -EACCES);
     utf8_path(path, sizeof(path), L"game\\..\\secret\\key");
     check("sbx_open through \"..\" out of a rule is refused", sbx_open(path, SBX_OPEN_READ, &handle) == -EACCES);
     utf8_path(path, sizeof(path), L"game\\data.txt");
@@ -421,6 +432,16 @@ static void count_refusals(void *context, const struct sbx_access *access, int r
     }
 }
 
+/* The agent's decider, as a test: one open of granted\once.txt, then the rules' refusal again. */
+static volatile LONG granted_used;
+static int grant_once(void *context, const struct sbx_access *access) {
+    (void) context;
+    static const char leaf[] = "granted\\once.txt";
+    size_t n = strlen(access->asked), m = sizeof(leaf) - 1;
+    if (n >= m && _stricmp(access->asked + n - m, leaf) == 0 && InterlockedExchange(&granted_used, 1) == 0) return 0;
+    return SBX_KEEP;
+}
+
 /* One confined run of the child, and its judgement against the control. */
 static void confined_run(int less, const struct result *control, size_t control_count) {
     const char *label = less ? "less-privileged" : "appcontainer";
@@ -439,6 +460,8 @@ static void confined_run(int less, const struct result *control, size_t control_
                    sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC) == 0,
                "the policy");
         sbx_policy_set_audit(policy, count_refusals, NULL);
+        granted_used = 0;
+        sbx_policy_set_decider(policy, grant_once, NULL);
         HANDLE read_end, write_end;
         CreatePipe(&read_end, &write_end, &inherit, 0);
         SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
@@ -543,6 +566,10 @@ int main(int argc, char **argv) {
     make_file(path, "hello");
     child_path(path, L"secret\\key");
     make_file(path, "secret");
+    child_path(path, L"granted");
+    CreateDirectoryW(path, NULL);
+    child_path(path, L"granted\\once.txt");
+    make_file(path, "once");
     child_path(path, L"save\\link");
     child_path(target, L"secret");
     wchar_t mklink[3 * MAX_PATH];
@@ -640,8 +667,8 @@ int main(int argc, char **argv) {
     confined_run(1, control, control_count);
 
     /* Removes what it made, one by one (the junction itself, not what it leads to). */
-    static const wchar_t *const files[] = {L"save\\new.txt", L"game\\data.txt", L"secret\\key"};
-    static const wchar_t *const folders[] = {L"save\\link", L"save", L"game", L"secret"};
+    static const wchar_t *const files[] = {L"save\\new.txt", L"game\\data.txt", L"secret\\key", L"granted\\once.txt"};
+    static const wchar_t *const folders[] = {L"save\\link", L"save", L"game", L"secret", L"granted"};
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         child_path(path, files[i]);
         DeleteFileW(path);
