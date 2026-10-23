@@ -49,6 +49,20 @@ jobs:
       - name: Test
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
 
+  windows:
+    # The Windows backend: an AppContainer and job object at spawn, an explicit broker (docs/design.md, "Windows").
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows version
+        run: cmd /c ver
+      - name: Build
+        run: |
+          cmake -S . -B build
+          cmake --build build --config Release
+      - name: Test
+        run: .\build\Release\sbx_test_win.exe
+
   android-build:
     # Compiles for every Android ABI (tests for the 64-bit ones); the x86_64 build also runs on the emulator below.
     runs-on: ubuntu-24.04

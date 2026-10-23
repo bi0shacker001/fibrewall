@@ -22,6 +22,10 @@
  * Nothing here knows about any particular host. Linux (glibc or bionic),
  * aarch64 and x86_64.
  *
+ * Windows (x86_64) has no trap: there sbx_spawn() starts the program in an
+ * AppContainer inside a job object, and the confined program asks the
+ * broker for files with sbx_open() (docs/design.md, "Windows").
+ *
  * Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
  */
 #ifndef SBX_H
@@ -32,6 +36,38 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---- On every system: handles and the client call ---- */
+
+#ifdef _WIN32
+typedef void *sbx_handle;  /* a HANDLE */
+#ifdef _MSC_VER
+typedef int pid_t;         /* struct sbx_access's process: the Windows process id */
+#endif
+#else
+typedef int sbx_handle;    /* a descriptor */
+#endif
+
+/* sbx_open flags. */
+#define SBX_OPEN_READ 0x1u
+#define SBX_OPEN_WRITE 0x2u
+#define SBX_OPEN_CREATE 0x4u     /* create the file when it is missing */
+#define SBX_OPEN_TRUNCATE 0x8u   /* empty it (with SBX_OPEN_WRITE) */
+#define SBX_OPEN_EXCLUSIVE 0x10u /* with SBX_OPEN_CREATE: -EEXIST when it exists */
+#define SBX_OPEN_APPEND 0x20u    /* every write goes to the end (with SBX_OPEN_WRITE) */
+#define SBX_OPEN_DIRECTORY 0x40u /* a folder, for listing; not with the writing flags */
+
+/*
+ * Opens path (absolute, UTF-8) for the confined program, as the broker
+ * decides. Linux and Android: open(), which the lockdown traps and the
+ * broker answers, so it works before lockdown too. Windows: a request on
+ * the channel sbx_spawn() gave the program; a path open the program makes
+ * itself is refused by its token. Returns 0 and the handle in *out, or a
+ * negative errno (-EACCES when refused). Thread-safe.
+ */
+int sbx_open(const char *path, unsigned flags, sbx_handle *out);
+
+#ifndef _WIN32
 
 /* ---- The confined half ---- */
 
@@ -210,6 +246,54 @@ int sbx_spawn(const struct sbx_spawn_spec *spec, pid_t *pid_out);
 /* Called by the spawned program first: makes it non-dumpable again (exec reset that). */
 int sbx_spawned_init(void);
 
+#else /* _WIN32 */
+
+/* ---- Starting a confined program (Windows) ---- */
+
+#define SBX_SPAWN_HANDLES_MAX 16
+
+struct sbx_spawn_spec {
+    const char *path;       /* the program, absolute (UTF-8); its folder needs an SBX_STATIC rule */
+    char *const *argv;      /* argv[0] first; quoted into a command line */
+    char *const *envp;      /* "NAME=value" (UTF-8); NULL: none. SBX_BROKER is added. */
+    const sbx_handle *handles; /* inherited with the same values; each must be inheritable */
+    unsigned handle_count;
+    sbx_handle std_in, std_out, std_err; /* NULL: none; each must be inheritable */
+    const char *container;  /* the AppContainer profile's name; created when missing */
+    int less_privileged;    /* nonzero: a less-privileged AppContainer where the system has one */
+    unsigned long long memory_limit; /* bytes of committed memory; 0: no limit */
+    /*
+     * The broker's rules, or NULL for no broker. Taken by the call, even
+     * when it fails: the broker frees it when the program closes its end.
+     */
+    struct sbx_policy *policy;
+};
+
+struct sbx_process {
+    sbx_handle process;     /* the program's process handle */
+    sbx_handle job;         /* its job: closing it ends the program */
+    unsigned long pid;
+    int less_privileged;    /* whether it runs in a less-privileged AppContainer */
+};
+
+/*
+ * Starts spec->path suspended in an AppContainer with no capabilities,
+ * with child processes refused, in a job object (one process, no
+ * breakaway, killed when the job closes, UI limits, the memory limit),
+ * inheriting only the listed handles. Applies the policy's SBX_STATIC
+ * grants, starts the broker on a thread, then lets the program run.
+ * Returns 0, or a negative errno with nothing started (never half-confined).
+ */
+int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out);
+
+/* Waits for the program to end, sets *exit_code (may be NULL), then closes the job and the process handle. */
+int sbx_process_wait(struct sbx_process *process, int *exit_code);
+
+/* Ends the program (closes its job) and closes the handles. */
+void sbx_process_close(struct sbx_process *process);
+
+#endif /* _WIN32 */
+
 /* ---- The broker half ---- */
 
 /* Rule modes. A rule covers its path and everything under it; the longest matching rule decides. */
@@ -219,6 +303,14 @@ int sbx_spawned_init(void);
 /* Rule flags, or'ed into the mode. */
 #define SBX_CASE_INSENSITIVE 0x10u  /* a name that does not exist matches one that differs only in case */
 #define SBX_DECIDE 0x20u            /* ask the decider about every access under this rule, not only refusals */
+/*
+ * With SBX_READ: on Windows, granted to the AppContainer itself at spawn
+ * (an ACL entry for its SID, read and execute, inherited by everything
+ * under the folder), so the loader can open the program's own code by
+ * path. It stays on the folder. Linux and Android ignore it: the rule is an
+ * ordinary brokered one there. Never with SBX_WRITE.
+ */
+#define SBX_STATIC 0x40u
 
 struct sbx_policy;
 
@@ -232,10 +324,13 @@ void sbx_policy_free(struct sbx_policy *policy);
  * ancestor of a rule can be stat()ed and traversed, but not listed or
  * opened. /proc/self and /proc/thread-self mean the confined process's own
  * entries, which are always allowed; other processes' are always denied.
- * Returns 0 or a negative errno.
+ * On Windows the path is a drive or UNC path, matched case-insensitively,
+ * and a rule covers the name as given (the broker checks where each open
+ * really leads). Returns 0 or a negative errno.
  */
 int sbx_policy_add(struct sbx_policy *policy, const char *path, unsigned mode);
 
+#ifndef _WIN32
 /*
  * Makes virtual_path (and everything under it) mean real_path for the
  * confined process: a host can hand over a folder under a fixed name
@@ -243,6 +338,7 @@ int sbx_policy_add(struct sbx_policy *policy, const char *path, unsigned mode);
  * real path. Returns 0 or a negative errno.
  */
 int sbx_policy_alias(struct sbx_policy *policy, const char *virtual_path, const char *real_path);
+#endif
 
 /* One brokered request, as the decider and the audit see it. */
 struct sbx_access {
@@ -271,6 +367,7 @@ struct sbx_access {
 typedef int (*sbx_decide_fn)(void *context, const struct sbx_access *access);
 void sbx_policy_set_decider(struct sbx_policy *policy, sbx_decide_fn decide, void *context);
 
+#ifndef _WIN32
 /*
  * What a process locked down with SBX_LOCK_NET_BROKERED may do on the
  * network: none by default. The decider sees each socket call as an access
@@ -301,6 +398,7 @@ void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants);
  */
 #define SBX_SYSTEM_SOCKETS_MAX 8
 int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant);
+#endif
 
 /* Receives every decision with its result (0 or a negative errno). Defaults to logging refusals on stderr. */
 typedef void (*sbx_audit_fn)(void *context, const struct sbx_access *access, int result);
@@ -313,9 +411,11 @@ void sbx_policy_set_audit(struct sbx_policy *policy, sbx_audit_fn audit, void *c
  * sbx_broker_serve blocks; sbx_broker_start serves on a new detached
  * thread and returns 0 or a negative errno.
  */
+#ifndef _WIN32
 int sbx_broker_prepare(int fd);
 void sbx_broker_serve(struct sbx_policy *policy, int fd);
 int sbx_broker_start(struct sbx_policy *policy, int fd);
+#endif
 
 #ifdef __cplusplus
 }

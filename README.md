@@ -61,7 +61,8 @@ An end-to-end test runs escape attempts first without the sandbox, as a control,
 Early. Built today:
 
 - the lockdown and the broker;
-- the end-to-end and escape-attempt test, run in CI on Linux and on the Android emulator (API 28 and 34).
+- the end-to-end and escape-attempt test, run in CI on Linux and on the Android emulator (API 28 and 34);
+- on Windows, `sbx_spawn` into an AppContainer and job object with an explicit broker (`sbx_open`), and its escape suite in CI ([design](docs/design.md#windows-design-2026-10-23-droidtoptracker606)). macOS is later.
 
 Not built yet:
 
@@ -75,6 +76,8 @@ Not built yet:
 cmake -S . -B build && cmake --build build
 TMPDIR=/tmp ./build/sbx_test
 ```
+
+On Windows: `cmake -S . -B build && cmake --build build --config Release && build\Release\sbx_test_win.exe`.
 
 For Android, add the NDK toolchain file: `-DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26`.
 

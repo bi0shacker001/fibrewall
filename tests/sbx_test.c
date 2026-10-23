@@ -347,6 +347,12 @@ static void working(void) {
         close(fd);
     }
     EXPECT(stat(path, &st) == 0 && st.st_size == 5, "stat of a game file");
+    sbx_handle handle = -1;
+    EXPECT(sbx_open(path, SBX_OPEN_READ, &handle) == 0 && handle >= 0, "sbx_open of a game file goes through the broker");
+    if (handle >= 0) close(handle);
+    snprintf(path2, sizeof(path2), "%s/key", secret);
+    EXPECT(sbx_open(path2, SBX_OPEN_READ, &handle) == -EACCES, "sbx_open outside the rules is refused");
+    EXPECT(sbx_open(path, SBX_OPEN_WRITE, &handle) == -EACCES, "sbx_open for writing in a read-only rule is refused");
     fd = open("data.txt", O_RDONLY);
     EXPECT(fd >= 0, "relative path from the starting directory");
     if (fd >= 0) close(fd);
