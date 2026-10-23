@@ -34,11 +34,19 @@
 #define SBXE_STATFS_SIZE 120
 
 /*
- * The trampoline page: below the helper's own image (linked at
- * 0x5c0000000) and above where programs, Wine's preloader and Box64 map
- * themselves, inside a 39-bit address space.
+ * The trampoline page: just below the helper's own image (linked 256 MB
+ * above it, CMakeLists.txt) and above where programs, Wine's preloader and
+ * Box64 map themselves. On arm64 it is inside a 39-bit address space and
+ * under AddressSanitizer's shadow, which starts at 64 GB there. On x86_64
+ * that shadow covers 0x7fff8000 to 0x10007fff7fff, and the low 2 GB are
+ * Wine's, so the page is in the sanitizer's high application range: a
+ * sanitized program the helper loads must be able to map its shadow.
  */
+#if defined(__x86_64__)
+#define SBXE_TRAMPOLINE_ADDRESS 0x200000000000UL
+#else
 #define SBXE_TRAMPOLINE_ADDRESS 0x5b0000000UL
+#endif
 
 /*
  * sbxe_trampoline(nr, a0..a5) makes system call nr; the filter recognises

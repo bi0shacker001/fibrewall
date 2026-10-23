@@ -846,7 +846,10 @@ handler, but needs kernel 5.0 (the RP5 runs 4.19). The design:
    (`MAP_FIXED_NOREPLACE`; a kernel that maps it elsewhere fails the
    lockdown) with the same code in every image. The filter's address check
    then holds after `exec`. Code that jumps there gets only what that check
-   lets through, as today.
+   lets through, as today. The page is at `0x5b0000000` on arm64 (inside a
+   39-bit address space) and at `0x200000000000` on x86_64, where the low
+   2 GB are Wine's and AddressSanitizer's shadow covers everything from
+   2 GB to 16 TB; the helper is linked 256 MB above it.
 2. **execve traps.** The handler sends `SBX_EXEC` (the path) to the broker,
    which decides it as a read of the resolved target (the decider sees op
    `exec`). It answers with the target opened read-only, and records the
