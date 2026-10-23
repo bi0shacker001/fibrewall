@@ -540,13 +540,15 @@ static int sealed_check(void) {
 
 /* ---- SIGSYS stays open: a blocked SIGSYS used to kill the process on its next trap. ---- */
 
+/* go[0]: set by the thread once SIGSYS is blocked; go[1]: set by the test to let it end. */
 static void *block_sigsys_and_wait(void *arg) {
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGSYS);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     volatile int *go = (volatile int *) arg;
-    while (!*go) usleep(1000);
+    go[0] = 1;
+    while (!go[1]) usleep(1000);
     return NULL;
 }
 
@@ -569,12 +571,13 @@ static int sigsys_check(void) {
     pid_t child = fork();
     if (child == 0) {
         /* A thread that blocked SIGSYS before lockdown: refused, not half-installed. */
-        static volatile int go = 0;
+        /* Waited for, not slept for: a slow emulator may not have run the thread after 50 ms. */
+        static volatile int go[2] = {0, 0};
         pthread_t blocker;
-        pthread_create(&blocker, NULL, block_sigsys_and_wait, (void *) &go);
-        usleep(50000);
+        pthread_create(&blocker, NULL, block_sigsys_and_wait, (void *) go);
+        while (!go[0]) usleep(1000);
         EXPECT(sbx_lockdown(pair[1], NULL) == -EDEADLK, "sigsys: lockdown refused while a thread has SIGSYS blocked");
-        go = 1;
+        go[1] = 1;
         pthread_join(blocker, NULL);
         EXPECT(sbx_lockdown(pair[1], NULL) == 0, "sigsys: lockdown once no thread blocks SIGSYS");
         sigset_t set, old, now;
