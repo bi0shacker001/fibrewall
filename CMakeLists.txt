@@ -11,8 +11,18 @@ option(SBX_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer"
 
 if(WIN32)
   # Windows: an AppContainer and job object at spawn, and an explicit broker (docs/design.md, "Windows").
-  # The C runtime is linked in, so a confined program needs no runtime DLL beside it.
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Built on its own (the test), the C runtime is linked in, so a confined program needs no runtime DLL
+  # beside it. Inside another project the library takes that project's runtime (Rust's MSVC targets use
+  # the DLL one, /MD), unless the project asks for the static one.
+  if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(SBX_TOP_LEVEL ON)
+  else()
+    set(SBX_TOP_LEVEL OFF)
+  endif()
+  option(SBX_MSVC_STATIC_RUNTIME "Link the MSVC C runtime statically (/MT)" ${SBX_TOP_LEVEL})
+  if(SBX_MSVC_STATIC_RUNTIME)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
   add_library(sbx STATIC src/windows.c src/windows_client.c)
   target_include_directories(sbx PUBLIC include PRIVATE src)
   target_link_libraries(sbx PUBLIC userenv advapi32 ntdll)
