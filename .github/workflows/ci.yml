@@ -89,7 +89,7 @@ jobs:
         run: |
           cmake -S . -B build             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-26
           cmake --build build -j
-          cp build/sbx_test build/gpu_probe build/libsbx_child.so .
+          cp build/sbx_test build/gpu_probe build/libsbx_child.so build/sbx-exec .
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -105,8 +105,8 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
           # The GPU probe is a measurement, not a gate: its output is the answer (see tests/android/gpu_probe.c).
           script: |
-            adb push sbx_test gpu_probe libsbx_child.so /data/local/tmp/
-            adb shell 'uname -a; cat /proc/sys/kernel/seccomp/actions_avail; cd /data/local/tmp && chmod 755 sbx_test gpu_probe && TMPDIR=/data/local/tmp ./sbx_test; echo "exit=$?"' | tee result.txt
+            adb push sbx_test gpu_probe libsbx_child.so sbx-exec /data/local/tmp/
+            adb shell 'uname -a; cat /proc/sys/kernel/seccomp/actions_avail; cd /data/local/tmp && chmod 755 sbx_test gpu_probe sbx-exec && TMPDIR=/data/local/tmp ./sbx_test; echo "exit=$?"' | tee result.txt
             adb logcat -c || true
             adb shell 'cd /data/local/tmp && ./gpu_probe; echo "probe_exit=$?"' || true
             adb shell 'cd /data/local/tmp && ./gpu_probe --no-seal; echo "probe_exit=$?"' || true

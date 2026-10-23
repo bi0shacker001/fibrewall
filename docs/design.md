@@ -863,8 +863,8 @@ handler, but needs kernel 5.0 (the RP5 runs 4.19). The design:
    interpreter, no path call of its own. It maps the trampoline page and
    installs a minimal SIGSYS handler (allowed with `SBX_LOCK_EXEC`; a
    replaced handler only loses its own file access). That handler forwards
-   `openat`, `newfstatat`, `faccessat`, `readlinkat`, `statfs`, `getcwd`
-   and `chdir` to the broker on the same wire protocol, and emulates
+   `openat`, `newfstatat`, `faccessat`, `readlinkat`, `statfs` and
+   `getcwd` (and the x86_64 forms without `at`) to the broker on the same wire protocol, and emulates
    `rt_sigaction` and `rt_sigprocmask` as the full handler does. It maps
    the target and its interpreter (`PT_INTERP`) as the kernel would and
    builds the new stack: the program's arguments and environment, plus

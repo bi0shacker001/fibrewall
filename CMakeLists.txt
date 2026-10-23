@@ -46,6 +46,20 @@ add_library(sbx_child SHARED src/child.c)
 target_link_libraries(sbx_child PRIVATE sbx)
 target_compile_options(sbx_child PRIVATE -Wall -Wextra -Werror)
 
+# sbx-exec: static and freestanding, linked at a fixed address above 4 GB (docs/design.md, "SBX_LOCK_EXEC").
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|aarch64|arm64)$")
+  add_executable(sbx-exec src/exec_helper.c)
+  target_include_directories(sbx-exec PRIVATE src include)
+  target_compile_options(sbx-exec PRIVATE -std=c11 -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin
+                         -fno-stack-protector -fpie -fno-sanitize=all)
+  if(ANDROID)
+    set(SBX_EXEC_BASE -Wl,--image-base=0x5c0000000)
+  else()
+    set(SBX_EXEC_BASE -Wl,-Ttext-segment=0x5c0000000)
+  endif()
+  target_link_options(sbx-exec PRIVATE -nostdlib -static -Wl,-no-pie ${SBX_EXEC_BASE} -fno-sanitize=all)
+endif()
+
 if(SBX_SANITIZE)
   target_compile_options(sbx PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(sbx PUBLIC -fsanitize=address,undefined)

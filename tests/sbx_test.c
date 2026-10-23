@@ -1262,6 +1262,76 @@ static int listen_check(const char *self) {
     return failed || failures;
 }
 
+/* ---- sbx-exec's loader: a program started through it, as the kernel would start it. ---- */
+
+/* Runs in the image sbx-exec loaded: the environment it was given, and a working libc. */
+static int loaded_main(const char *library) {
+    const char *preload = getenv("LD_PRELOAD");
+    EXPECT(preload != NULL && strncmp(preload, library, strlen(library)) == 0, "loaded: libsbx_child.so first on LD_PRELOAD");
+    EXPECT(getenv("SBX_ADOPT") && strcmp(getenv("SBX_ADOPT"), "1") == 0, "loaded: SBX_ADOPT for the child library");
+    EXPECT(getenv("SBX_BROKER_FD") && getenv("SBX_CWD_FD"), "loaded: the connection and directory are named");
+    EXPECT(getenv("SBX_EXEC_TEST") && strcmp(getenv("SBX_EXEC_TEST"), "kept") == 0, "loaded: the program's own environment kept");
+    EXPECT(getenv("SBX_TOKEN") == NULL, "loaded: a token in the environment does not pass through");
+    char *copy = strdup("libc works");
+    EXPECT(copy && strcmp(copy, "libc works") == 0, "loaded: malloc and the rest of libc");
+    free(copy);
+    return failures ? 1 : 0;
+}
+
+static int exec_helper_check(const char *self) {
+    char helper[600], library[600];
+    snprintf(helper, sizeof(helper), "%s", self);
+    char *slash = strrchr(helper, '/');
+    if (!slash) return 1;
+    snprintf(slash + 1, sizeof(helper) - (size_t) (slash + 1 - helper), "sbx-exec");
+    snprintf(library, sizeof(library), "%s", helper);
+    slash = strrchr(library, '/');
+    snprintf(slash + 1, sizeof(library) - (size_t) (slash + 1 - library), "libsbx_child.so");
+    if (access(helper, X_OK) != 0) {
+#if defined(__x86_64__) || defined(__aarch64__)
+        printf("FAIL exec: sbx-exec is not beside the test (%s)\n", helper);
+        return 1;
+#else
+        return 0;
+#endif
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, "/", SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int target = open(self, O_RDONLY);
+        int directory = open(".", O_PATH | O_DIRECTORY);
+        char broker_text[16], cwd_text[16], target_text[16];
+        snprintf(broker_text, sizeof(broker_text), "%d", pair[1]);
+        snprintf(cwd_text, sizeof(cwd_text), "%d", directory);
+        snprintf(target_text, sizeof(target_text), "%d", target);
+        char *argv[] = {helper, broker_text, cwd_text, target_text, "0", library, (char *) self, "--",
+                        (char *) self, "--loaded", library, NULL};
+        char *envp[] = {"SBX_EXEC_TEST=kept", "SBX_TOKEN=must-not-pass", "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+        execve(helper, argv, envp);
+        _exit(126);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (WIFSIGNALED(status)) printf("FAIL exec: the loaded image died by signal %d\n", WTERMSIG(status));
+    EXPECT(ok, "exec: sbx-exec loaded the test with its interpreter, and it ran");
+    pid_t bad = fork();
+    if (bad == 0) {
+        char *argv[] = {helper, "nonsense", NULL};
+        execve(helper, argv, (char *[]) {NULL});
+        _exit(126);
+    }
+    waitpid(bad, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 127, "exec: sbx-exec with bad arguments ends with 127");
+    return !ok;
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -1920,6 +1990,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "--spawned") == 0) return spawned_main();
     if (argc > 3 && strcmp(argv[1], "--attached") == 0) return attached_main(argv[2], argv[3]);
+    if (argc > 2 && strcmp(argv[1], "--loaded") == 0) return loaded_main(argv[2]);
     char self[512];
     ssize_t self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (self_len <= 0) { perror("readlink"); return 2; }
@@ -1960,7 +2031,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | exec_helper_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
