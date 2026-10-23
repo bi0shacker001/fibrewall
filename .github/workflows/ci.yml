@@ -146,3 +146,32 @@ jobs:
               --notes "Built from main by CI. Rebuilt on every push; see the commit in the asset upload time."
           gh release upload probe-latest sbx_test-* gpu_probe-* libsbx_child-*.zip --clobber
           gh release edit probe-latest --notes "Built from ${GITHUB_SHA} by CI run ${GITHUB_RUN_ID}."
+
+  release:
+    # A tagged release for each version in CMakeLists.txt, made once, after every test job passed on
+    # main. Consumers pin the tag (Droidtop/tracker#584). The notes are the README's entry for it.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [linux, linux-arm64, windows, android-build, android-emulator]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release the version if it has no tag yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^project(sandbox VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
+          test -n "$version" || { echo "no version in CMakeLists.txt"; exit 1; }
+          grep -q "^#define SBX_VERSION \"$version\"" include/sbx.h || { echo "sbx.h's SBX_VERSION is not $version"; exit 1; }
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version is released already"
+            exit 0
+          fi
+          awk -v head="- **v$version**" '
+            index($0, head) == 1 { on = 1; print; next }
+            on && (/^- \*\*v/ || /^#/) { exit }
+            on { print }' README.md > notes.md
+          test -s notes.md || { echo "README.md has no entry for v$version"; exit 1; }
+          printf '\nBuilt and tested by CI run %s.\n' "$GITHUB_RUN_ID" >> notes.md
+          gh release create "v$version" --target "$GITHUB_SHA" --title "sandbox $version" --notes-file notes.md

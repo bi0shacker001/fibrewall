@@ -65,6 +65,12 @@ Early. Built today:
 - on Windows, `sbx_spawn` into an AppContainer and job object with an explicit broker (`sbx_open`), and its escape suite in CI ([design](docs/design.md#windows-design-2026-10-23-droidtoptracker606)). macOS is later;
 - for a tree of processes such as Wine: `sbx_broker_listen` and `libsbx_child.so`, exec through the broker (`SBX_LOCK_EXEC` and the static `sbx-exec` loader), and the `SBX_LOCK_CONTAIN` preset, which restricts the file system view only.
 
+Not built yet:
+
+- minijail policy files, for per-process allowlists;
+- the `native` launcher, a binder-less process that keeps the GPU;
+- the Android AAR with its Kotlin API.
+
 ### Releases
 
 - **v0.1.0** (2026-10-23), the library half of [Droidtop/tracker#584](https://github.com/Droidtop/tracker/issues/584) piece 0:
@@ -75,12 +81,6 @@ Early. Built today:
   - the Windows backend.
 
   A host using `SBX_LOCK_EXEC`, or `SBX_LOCK_CONTAIN`, which includes it, ships `sbx-exec` and `libsbx_child.so` where they can be executed (on Android, the app's native-library folder). It passes their absolute paths in `sbx_lockdown_options`.
-
-Not built yet:
-
-- minijail policy files, for per-process allowlists;
-- the `native` launcher, a binder-less process that keeps the GPU;
-- the Android AAR with its Kotlin API.
 
 ## Build
 
