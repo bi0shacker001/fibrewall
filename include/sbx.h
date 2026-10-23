@@ -289,7 +289,10 @@ int sbx_spawned_init(void);
 struct sbx_spawn_spec {
     const char *path;       /* the program, absolute (UTF-8); its folder needs an SBX_STATIC rule */
     char *const *argv;      /* argv[0] first; quoted into a command line */
-    char *const *envp;      /* "NAME=value" (UTF-8); NULL: none. SBX_BROKER is added. */
+    char *const *envp;      /* "NAME=value" (UTF-8); NULL: none. SBX_BROKER is added, and the
+                               parent's SystemRoot, SystemDrive, USERPROFILE, LOCALAPPDATA,
+                               APPDATA, TEMP and TMP where envp lacks them (Windows makes the
+                               container's own folders from them). */
     const sbx_handle *handles; /* inherited with the same values; each must be inheritable */
     unsigned handle_count;
     sbx_handle std_in, std_out, std_err; /* NULL: none; each must be inheritable */

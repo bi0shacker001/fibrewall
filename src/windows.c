@@ -775,7 +775,29 @@ static int command_line(char *const *argv, struct text *line) {
     return line->length ? 0 : -EINVAL;
 }
 
-/* The environment block: envp, then SBX_BROKER=<channel> when there is one. Double-NUL terminated. */
+/*
+ * Variables Windows reads to set up an AppContainer process (its own
+ * LocalAppData and temporary folder are made from them; CreateProcess
+ * fails with ERROR_ENVVAR_NOT_FOUND without them). Taken from the parent
+ * when envp does not set them: they name folders and grant nothing.
+ */
+static const wchar_t *const container_variables[] = {
+    L"SystemRoot", L"SystemDrive", L"USERPROFILE", L"LOCALAPPDATA", L"APPDATA", L"TEMP", L"TMP",
+};
+
+/* Whether envp sets name. */
+static int sets(char *const *envp, const wchar_t *name) {
+    size_t n = wcslen(name);
+    for (char *const *entry = envp; envp && *entry; entry++) {
+        wchar_t *w = wide(*entry);
+        int found = w && wcslen(w) > n && w[n] == L'=' && same(w, name, n);
+        free(w);
+        if (found) return 1;
+    }
+    return 0;
+}
+
+/* The environment block: envp, the container's variables it lacks, then SBX_BROKER=<channel>. Double-NUL terminated. */
 static int environment(char *const *envp, HANDLE channel, struct text *block) {
     if (envp) {
         for (char *const *entry = envp; *entry; entry++) {
@@ -787,6 +809,16 @@ static int environment(char *const *envp, HANDLE channel, struct text *block) {
             int error = append(block, w, wcslen(w) + 1);
             free(w);
             if (error) return error;
+        }
+    }
+    for (size_t i = 0; i < sizeof(container_variables) / sizeof(container_variables[0]); i++) {
+        const wchar_t *name = container_variables[i];
+        if (sets(envp, name)) continue;
+        wchar_t value[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(name, value, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) continue;
+        if (append(block, name, wcslen(name)) || append(block, L"=", 1) || append(block, value, (size_t) n + 1)) {
+            return -ENOMEM;
         }
     }
     if (channel) {
