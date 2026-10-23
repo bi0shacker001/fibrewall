@@ -62,7 +62,19 @@ Early. Built today:
 
 - the lockdown and the broker;
 - the end-to-end and escape-attempt test, run in CI on Linux and on the Android emulator (API 28 and 34);
-- on Windows, `sbx_spawn` into an AppContainer and job object with an explicit broker (`sbx_open`), and its escape suite in CI ([design](docs/design.md#windows-design-2026-10-23-droidtoptracker606)). macOS is later.
+- on Windows, `sbx_spawn` into an AppContainer and job object with an explicit broker (`sbx_open`), and its escape suite in CI ([design](docs/design.md#windows-design-2026-10-23-droidtoptracker606)). macOS is later;
+- for a tree of processes such as Wine: `sbx_broker_listen` and `libsbx_child.so`, exec through the broker (`SBX_LOCK_EXEC` and the static `sbx-exec` loader), and the `SBX_LOCK_CONTAIN` preset, which restricts the file system view only.
+
+### Releases
+
+- **v0.1.0** (2026-10-23), the library half of [Droidtop/tracker#584](https://github.com/Droidtop/tracker/issues/584) piece 0:
+  - `SBX_LOCK_LEARN`, with learning records that name the flag that would allow each call (`allowed_by`);
+  - `SBX_LOCK_INET`, `SBX_LOCK_UNIX`, `SBX_LOCK_PATHOPS`, `SBX_LOCK_INOTIFY`, `SBX_LOCK_SOCKETS`, `SBX_LOCK_SIGNALS`, `SBX_LOCK_SIGNAL_TREE`, `SBX_LOCK_EXEC` and `SBX_LOCK_AUDIT`, and the `SBX_LOCK_CONTAIN` preset;
+  - `sbx_broker_listen`, `sbx_attach` and `libsbx_child.so`, and `sbx-exec` for arm64-v8a and x86_64;
+  - `sbx_trace`;
+  - the Windows backend.
+
+  A host using `SBX_LOCK_EXEC`, or `SBX_LOCK_CONTAIN`, which includes it, ships `sbx-exec` and `libsbx_child.so` where they can be executed (on Android, the app's native-library folder). It passes their absolute paths in `sbx_lockdown_options`.
 
 Not built yet:
 
