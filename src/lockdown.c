@@ -1640,7 +1640,20 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
     }
     /* A thread that has SIGSYS blocked would kill the process on its first trapped call. */
-    if (!unbrokered && sigsys_blocked_somewhere()) return -EDEADLK;
+    if (!unbrokered) {
+        /*
+         * A thread on its way out can still be listed with its last mask, in
+         * a state that is not yet Z or X, for a while after pthread_join on a
+         * slow machine (the API 28 emulator failed this way at random).
+         * Only a thread that stays blocked is a reason to refuse.
+         */
+        int blocked = sigsys_blocked_somewhere();
+        for (int tries = 0; blocked && tries < 20; tries++) {
+            usleep(5000);
+            blocked = sigsys_blocked_somewhere();
+        }
+        if (blocked) return -EDEADLK;
+    }
     /* So would a handler whose mask blocks it, for any trapped call made while it runs. */
     if (!unbrokered) open_sigsys_in_handlers();
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
