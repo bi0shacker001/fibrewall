@@ -118,18 +118,54 @@ static int run_process(DWORD flags) {
 static int a_create_process(void) { return run_process(0); }
 static int a_breakaway(void) { return run_process(CREATE_BREAKAWAY_FROM_JOB); }
 
-static int a_connect(void) {
+/*
+ * Winsock and user32 are loaded when an attempt needs them, not imported:
+ * the parent and both children are this one program, and a DLL that fails
+ * to initialise in a container would end the child before main.
+ */
+static struct {
+    int (WSAAPI *startup)(WORD, LPWSADATA);
+    SOCKET (WSAAPI *socket)(int, int, int);
+    int (WSAAPI *connect)(SOCKET, const struct sockaddr *, int);
+    int (WSAAPI *bind)(SOCKET, const struct sockaddr *, int);
+    int (WSAAPI *listen)(SOCKET, int);
+    int (WSAAPI *getsockname)(SOCKET, struct sockaddr *, int *);
+    int (WSAAPI *closesocket)(SOCKET);
+    int (WSAAPI *last_error)(void);
+} ws;
+
+static int load_winsock(void) {
+    if (ws.startup) return 0;
+    HMODULE module = LoadLibraryW(L"ws2_32.dll");
+    if (!module) return last_error();
+#define GET(field, name) *(FARPROC *) &ws.field = GetProcAddress(module, name)
+    GET(socket, "socket");
+    GET(connect, "connect");
+    GET(bind, "bind");
+    GET(listen, "listen");
+    GET(getsockname, "getsockname");
+    GET(closesocket, "closesocket");
+    GET(last_error, "WSAGetLastError");
+    GET(startup, "WSAStartup");
+#undef GET
     WSADATA data;
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return -2;
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return WSAGetLastError();
+    return ws.startup && ws.startup(MAKEWORD(2, 2), &data) == 0 ? 0 : -2;
+}
+
+static unsigned short swap16(unsigned short v) { return (unsigned short) ((v << 8) | (v >> 8)); }
+
+static int a_connect(void) {
+    int loaded = load_winsock();
+    if (loaded) return loaded;
+    SOCKET s = ws.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return ws.last_error();
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int result = connect(s, (struct sockaddr *) &address, sizeof(address)) == 0 ? 0 : WSAGetLastError();
-    closesocket(s);
+    address.sin_port = swap16(port);
+    address.sin_addr.s_addr = 0x0100007f; /* 127.0.0.1 */
+    int result = ws.connect(s, (struct sockaddr *) &address, sizeof(address)) == 0 ? 0 : ws.last_error();
+    ws.closesocket(s);
     return result;
 }
 
@@ -159,9 +195,17 @@ static int a_named_event(void) {
 }
 
 static int a_clipboard(void) {
-    if (!OpenClipboard(NULL)) return last_error();
-    int result = EmptyClipboard() ? 0 : last_error();
-    CloseClipboard();
+    HMODULE user32 = LoadLibraryW(L"user32.dll");
+    if (!user32) return last_error();
+    typedef BOOL(WINAPI * open_fn)(HWND);
+    typedef BOOL(WINAPI * plain_fn)(void);
+    open_fn open_clipboard = (open_fn) (void (*)(void)) GetProcAddress(user32, "OpenClipboard");
+    plain_fn empty_clipboard = (plain_fn) (void (*)(void)) GetProcAddress(user32, "EmptyClipboard");
+    plain_fn close_clipboard = (plain_fn) (void (*)(void)) GetProcAddress(user32, "CloseClipboard");
+    if (!open_clipboard || !empty_clipboard || !close_clipboard) return -3;
+    if (!open_clipboard(NULL)) return last_error();
+    int result = empty_clipboard() ? 0 : last_error();
+    close_clipboard();
     return result;
 }
 
@@ -365,6 +409,7 @@ static void to_utf8(char *out, size_t size, const wchar_t *text) {
     if (WideCharToMultiByte(CP_UTF8, 0, text, -1, out, (int) size, NULL, NULL) <= 0) out[0] = 0;
 }
 
+static char root8[MAX_PATH * 3], profile8[MAX_PATH * 3], exe_dir8[MAX_PATH * 3], exe8[MAX_PATH * 3], port8[16], pid8[16];
 static int audit_refusals;
 static void count_refusals(void *context, const struct sbx_access *access, int result) {
     (void) context;
@@ -372,6 +417,103 @@ static void count_refusals(void *context, const struct sbx_access *access, int r
         InterlockedIncrement((volatile LONG *) &audit_refusals);
         fprintf(stderr, "     audit: refused %s %s: %d\n", access->op, access->asked, result);
     }
+}
+
+/* One confined run of the child, and its judgement against the control. */
+static void confined_run(int less, const struct result *control, size_t control_count) {
+    const char *label = less ? "less-privileged" : "appcontainer";
+    struct result confined[64], checks[64];
+    size_t confined_count = 0, check_count = 0;
+    SECURITY_ATTRIBUTES inherit = {sizeof(inherit), NULL, TRUE};
+    wchar_t path[MAX_PATH];
+    audit_refusals = 0;
+    /* Confined. */
+    {
+        struct sbx_policy *policy = sbx_policy_new();
+        char game8[MAX_PATH * 3], save8[MAX_PATH * 3];
+        utf8_path(game8, sizeof(game8), L"game");
+        utf8_path(save8, sizeof(save8), L"save");
+        EXPECT(sbx_policy_add(policy, game8, SBX_READ) == 0 && sbx_policy_add(policy, save8, SBX_WRITE) == 0 &&
+                   sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC) == 0,
+               "the policy");
+        sbx_policy_set_audit(policy, count_refusals, NULL);
+        HANDLE read_end, write_end;
+        CreatePipe(&read_end, &write_end, &inherit, 0);
+        SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+        HANDLE error_out = NULL;
+        DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &error_out, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS);
+        char *child_argv[] = {exe8, "--child", "confined", root8, profile8, exe_dir8, port8, pid8, NULL};
+        wchar_t system_root[MAX_PATH];
+        char system_root_entry[MAX_PATH * 3 + 16];
+        GetEnvironmentVariableW(L"SystemRoot", system_root, MAX_PATH);
+        snprintf(system_root_entry, sizeof(system_root_entry), "SystemRoot=");
+        to_utf8(system_root_entry + 11, sizeof(system_root_entry) - 11, system_root);
+        char *envp[] = {system_root_entry, NULL};
+        struct sbx_spawn_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.path = exe8;
+        spec.argv = child_argv;
+        spec.envp = envp;
+        spec.std_out = write_end;
+        spec.std_err = error_out;
+        spec.container = CONTAINER;
+        spec.less_privileged = less;
+        spec.memory_limit = MEMORY_LIMIT;
+        spec.policy = policy;
+        struct sbx_process process;
+        int spawned = sbx_spawn(&spec, &process);
+        CloseHandle(write_end);
+        if (error_out) CloseHandle(error_out);
+        printf("---- %s: sbx_spawn: %d (Windows error %lu), less-privileged: %d\n", label, spawned, sbx_spawn_error(),
+               spawned == 0 ? process.less_privileged : -1);
+        EXPECT(spawned == 0, "the confined child starts");
+        if (spawned == 0) {
+            check_count = collect(read_end, confined, &confined_count, checks, 64);
+            int code = -1;
+            int waited = sbx_process_wait(&process, &code);
+            printf("     the confined child's exit code: 0x%08x\n", (unsigned) code);
+            EXPECT(waited == 0 && code == 0, "the confined child exits cleanly");
+        }
+        CloseHandle(read_end);
+    }
+
+    EXPECT(control_count == ATTEMPTS, "the control ran every attempt");
+    EXPECT(confined_count == ATTEMPTS, "the confined child ran every attempt");
+    for (size_t i = 0; i < ATTEMPTS; i++) {
+        int control_value = i < control_count ? control[i].value : -1;
+        int confined_value = i < confined_count ? confined[i].value : 0;
+        char what[256];
+        if (control_value != 0) {
+            snprintf(what, sizeof(what), "control: %s succeeds unconfined (error %d)", attempts[i].name, control_value);
+            if (attempts[i].host_may_refuse) {
+                printf("skip %s (the host refuses it unconfined: %d)\n", attempts[i].name, control_value);
+                continue;
+            }
+            EXPECT(0, what);
+            continue;
+        }
+        snprintf(what, sizeof(what), "confined: %s refused (error %d)", attempts[i].name, confined_value);
+        EXPECT(confined_value != 0, what);
+    }
+    EXPECT(check_count > 0, "the confined child ran the broker checks");
+    for (size_t i = 0; i < check_count; i++) {
+        char what[200];
+        snprintf(what, sizeof(what), "%s: broker: %s", label, checks[i].name);
+        EXPECT(checks[i].value == 1, what);
+    }
+    EXPECT(audit_refusals >= 5, "the audit saw the broker's refusals");
+
+    child_path(path, L"save\\new.txt");
+    HANDLE written = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    char word[16] = "";
+    if (written != INVALID_HANDLE_VALUE) {
+        read_word(written, word, sizeof(word));
+        CloseHandle(written);
+    }
+    EXPECT(strcmp(word, "put") == 0, "the file the child created through the broker holds what it wrote");
+    DeleteFileW(path);
+
 }
 
 int main(int argc, char **argv) {
@@ -414,24 +556,21 @@ int main(int argc, char **argv) {
     if (!GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH)) wcscpy(profile, L"C:\\Users");
 
     /* A listening port and a named event the child must not reach. */
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET listener = load_winsock() == 0 ? ws.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) : INVALID_SOCKET;
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = 0x0100007f; /* 127.0.0.1 */
     int length = sizeof(address);
-    EXPECT(listener != INVALID_SOCKET && bind(listener, (struct sockaddr *) &address, sizeof(address)) == 0 &&
-               listen(listener, 8) == 0 && getsockname(listener, (struct sockaddr *) &address, &length) == 0,
+    EXPECT(listener != INVALID_SOCKET && ws.bind(listener, (struct sockaddr *) &address, sizeof(address)) == 0 &&
+               ws.listen(listener, 8) == 0 && ws.getsockname(listener, (struct sockaddr *) &address, &length) == 0,
            "a listening port for the network attempt");
-    port = ntohs(address.sin_port);
+    port = swap16(address.sin_port);
     wchar_t event_name[64];
     swprintf(event_name, 64, L"Local\\sbx-test-%lu", GetCurrentProcessId());
     HANDLE event = CreateEventW(NULL, FALSE, FALSE, event_name);
     EXPECT(event != NULL, "a named event for the named-object attempt");
 
-    char root8[MAX_PATH * 3], profile8[MAX_PATH * 3], exe_dir8[MAX_PATH * 3], exe8[MAX_PATH * 3], port8[16], pid8[16];
     to_utf8(root8, sizeof(root8), root);
     to_utf8(profile8, sizeof(profile8), profile);
     to_utf8(exe_dir8, sizeof(exe_dir8), exe_dir);
@@ -439,8 +578,8 @@ int main(int argc, char **argv) {
     snprintf(port8, sizeof(port8), "%u", port);
     snprintf(pid8, sizeof(pid8), "%lu", GetCurrentProcessId());
 
-    struct result control[64], confined[64], checks[64], unused[64];
-    size_t control_count = 0, confined_count = 0, check_count = 0;
+    struct result control[64], unused[64];
+    size_t control_count = 0;
     SECURITY_ATTRIBUTES inherit = {sizeof(inherit), NULL, TRUE};
 
     /* The control: the same child, unconfined. */
@@ -494,92 +633,9 @@ int main(int argc, char **argv) {
         CloseHandle(plain);
     }
 
-    /* Confined. */
-    {
-        struct sbx_policy *policy = sbx_policy_new();
-        char game8[MAX_PATH * 3], save8[MAX_PATH * 3];
-        utf8_path(game8, sizeof(game8), L"game");
-        utf8_path(save8, sizeof(save8), L"save");
-        EXPECT(sbx_policy_add(policy, game8, SBX_READ) == 0 && sbx_policy_add(policy, save8, SBX_WRITE) == 0 &&
-                   sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC) == 0,
-               "the policy");
-        sbx_policy_set_audit(policy, count_refusals, NULL);
-        HANDLE read_end, write_end;
-        CreatePipe(&read_end, &write_end, &inherit, 0);
-        SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
-        HANDLE error_out = NULL;
-        DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &error_out, 0, TRUE,
-                        DUPLICATE_SAME_ACCESS);
-        char *child_argv[] = {exe8, "--child", "confined", root8, profile8, exe_dir8, port8, pid8, NULL};
-        wchar_t system_root[MAX_PATH];
-        char system_root_entry[MAX_PATH * 3 + 16];
-        GetEnvironmentVariableW(L"SystemRoot", system_root, MAX_PATH);
-        snprintf(system_root_entry, sizeof(system_root_entry), "SystemRoot=");
-        to_utf8(system_root_entry + 11, sizeof(system_root_entry) - 11, system_root);
-        char *envp[] = {system_root_entry, NULL};
-        struct sbx_spawn_spec spec;
-        memset(&spec, 0, sizeof(spec));
-        spec.path = exe8;
-        spec.argv = child_argv;
-        spec.envp = envp;
-        spec.std_out = write_end;
-        spec.std_err = error_out;
-        spec.container = CONTAINER;
-        spec.less_privileged = 1;
-        spec.memory_limit = MEMORY_LIMIT;
-        spec.policy = policy;
-        struct sbx_process process;
-        int spawned = sbx_spawn(&spec, &process);
-        CloseHandle(write_end);
-        if (error_out) CloseHandle(error_out);
-        printf("     sbx_spawn: %d (Windows error %lu), less-privileged: %d\n", spawned, sbx_spawn_error(),
-               spawned == 0 ? process.less_privileged : -1);
-        EXPECT(spawned == 0, "the confined child starts");
-        if (spawned == 0) {
-            check_count = collect(read_end, confined, &confined_count, checks, 64);
-            int code = -1;
-            int waited = sbx_process_wait(&process, &code);
-            printf("     the confined child's exit code: 0x%08x\n", (unsigned) code);
-            EXPECT(waited == 0 && code == 0, "the confined child exits cleanly");
-        }
-        CloseHandle(read_end);
-    }
-
-    /* The judgement. */
-    EXPECT(control_count == ATTEMPTS, "the control ran every attempt");
-    EXPECT(confined_count == ATTEMPTS, "the confined child ran every attempt");
-    for (size_t i = 0; i < ATTEMPTS; i++) {
-        int control_value = i < control_count ? control[i].value : -1;
-        int confined_value = i < confined_count ? confined[i].value : 0;
-        char what[256];
-        if (control_value != 0) {
-            snprintf(what, sizeof(what), "control: %s succeeds unconfined (error %d)", attempts[i].name, control_value);
-            if (attempts[i].host_may_refuse) {
-                printf("skip %s (the host refuses it unconfined: %d)\n", attempts[i].name, control_value);
-                continue;
-            }
-            EXPECT(0, what);
-            continue;
-        }
-        snprintf(what, sizeof(what), "confined: %s refused (error %d)", attempts[i].name, confined_value);
-        EXPECT(confined_value != 0, what);
-    }
-    EXPECT(check_count > 0, "the confined child ran the broker checks");
-    for (size_t i = 0; i < check_count; i++) {
-        char what[200];
-        snprintf(what, sizeof(what), "broker: %s", checks[i].name);
-        EXPECT(checks[i].value == 1, what);
-    }
-    EXPECT(audit_refusals >= 5, "the audit saw the broker's refusals");
-
-    child_path(path, L"save\\new.txt");
-    HANDLE written = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    char word[16] = "";
-    if (written != INVALID_HANDLE_VALUE) {
-        read_word(written, word, sizeof(word));
-        CloseHandle(written);
-    }
-    EXPECT(strcmp(word, "put") == 0, "the file the child created through the broker holds what it wrote");
+    /* Confined: an AppContainer, then a less-privileged one where the system has it. */
+    confined_run(0, control, control_count);
+    confined_run(1, control, control_count);
 
     /* Removes what it made, one by one (the junction itself, not what it leads to). */
     static const wchar_t *const files[] = {L"save\\new.txt", L"game\\data.txt", L"secret\\key"};
@@ -594,7 +650,7 @@ int main(int argc, char **argv) {
     }
     RemoveDirectoryW(root);
     if (event) CloseHandle(event);
-    closesocket(listener);
+    if (listener != INVALID_SOCKET) ws.closesocket(listener);
     printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }
