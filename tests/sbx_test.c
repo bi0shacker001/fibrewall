@@ -748,7 +748,13 @@ static int trace_check(void) {
         EXPECT(sbx_trace(ring_fd, 64) == -EALREADY, "trace: only once");
         close(ring_fd);
         struct sbx_lockdown_options audited = {.flags = SBX_LOCK_AUDIT};
-        EXPECT(sbx_lockdown(pair[1], &audited) == 0, "trace: lockdown with the kernel's audit");
+        int locked_down = sbx_lockdown(pair[1], &audited);
+        if (locked_down == -EINVAL) {
+            /* Before Linux 4.14 there is no SECCOMP_FILTER_FLAG_LOG; the ring does not need it. */
+            printf("info trace: this kernel has no seccomp audit flag; locking down without it\n");
+            locked_down = sbx_lockdown(pair[1], NULL);
+        }
+        EXPECT(locked_down == 0, "trace: lockdown (with the kernel's audit where it has one)");
         int opened = open("/sbx-trace-no-such-file", O_RDONLY);
         if (opened >= 0) close(opened);
         _exit(failures ? 1 : 0);
