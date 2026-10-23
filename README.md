@@ -73,6 +73,13 @@ Not built yet:
 
 ### Releases
 
+- **v0.1.1** (2026-10-23), a program tree such as Wine, end to end ([Droidtop/tracker#470](https://github.com/Droidtop/tracker/issues/470)):
+  - `#!` scripts run under `SBX_LOCK_EXEC`, as the kernel runs them, with the interpreter decided by the broker;
+  - the first process of a tree attaches with `SBX_LOCK_CONTAIN` from the environment: `SBX_EXEC_HELPER` and `SBX_CHILD_LIBRARY` name `sbx-exec` and `libsbx_child.so`;
+  - a test of the system shell running `cat`, `ls`, a nested shell, a pipe and a `#!` script, each image confined, also in learning mode and attached from the environment, on Linux, arm64 and the emulators;
+  - on Windows, a test that a decider can grant one open and refuse the next with `-EACCES`, and the C runtime left to the consumer (`SBX_MSVC_STATIC_RUNTIME`);
+  - a host guide for running a program tree, in [docs/design.md](docs/design.md).
+
 - **v0.1.0** (2026-10-23), the library half of [Droidtop/tracker#584](https://github.com/Droidtop/tracker/issues/584) piece 0:
   - `SBX_LOCK_LEARN`, with learning records that name the flag that would allow each call (`allowed_by`);
   - `SBX_LOCK_INET`, `SBX_LOCK_UNIX`, `SBX_LOCK_PATHOPS`, `SBX_LOCK_INOTIFY`, `SBX_LOCK_SOCKETS`, `SBX_LOCK_SIGNALS`, `SBX_LOCK_SIGNAL_TREE`, `SBX_LOCK_EXEC` and `SBX_LOCK_AUDIT`, and the `SBX_LOCK_CONTAIN` preset;

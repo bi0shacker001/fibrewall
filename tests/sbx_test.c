@@ -1718,14 +1718,15 @@ static int tree_learn(void *context, const struct sbx_access *access) {
 static void tree_script(char *out, size_t size, const char *shell) {
     snprintf(out, size,
              "cat %s/data.txt >/dev/null || exit 11\n"
-             "[ \"$STRICT\" = 1 ] && cat %s/key >/dev/null 2>&1 && exit 12\n"
+             "if [ \"$STRICT\" = 1 ]; then cat %s/key >/dev/null 2>&1 && exit 12; "
+             "else cat %s/key >/dev/null || exit 17; fi\n"
              "ls %s >/dev/null || exit 13\n"
              "%s -c 'cat %s/data.txt >/dev/null || exit 1; [ \"$STRICT\" = 1 ] && cat %s/key >/dev/null 2>&1 && exit 2; exit 0' "
              "|| exit 14\n"
              "echo through | cat | grep through >/dev/null || exit 15\n"
              "%s/tree.sh || exit 16\n"
              "exit 0\n",
-             game, secret, game, shell, game, secret, game);
+             game, secret, secret, game, shell, game, secret, game);
 }
 
 /* Runs the tree in a child: locked down here (attach == NULL), or attached by libsbx_child.so from the environment. */
@@ -1792,7 +1793,8 @@ static int program_tree_check(const char *self) {
     int failed = 0;
     static const char *const meanings[] = {
         [11] = "an allowed file", [12] = "the secret refused", [13] = "ls", [14] = "a nested shell",
-        [15] = "a pipe", [16] = "a #! script", [120] = "lockdown", [121] = "the first exec",
+        [15] = "a pipe", [16] = "a #! script", [17] = "the secret read while learning", [120] = "lockdown",
+        [121] = "the first exec",
     };
     for (int learn = 0; learn <= 1; learn++) {
         int pair[2];
@@ -1819,7 +1821,7 @@ static int program_tree_check(const char *self) {
                  execs);
         EXPECT(execs >= 6, name);
         if (learn) {
-            snprintf(name, sizeof(name), "tree (learning): the secret was recorded, not refused (%d records)",
+            snprintf(name, sizeof(name), "tree (learning): the secret was read, and recorded (%d records)",
                      seen[1].refused);
             EXPECT(seen[1].refused >= 1, name);
         }
