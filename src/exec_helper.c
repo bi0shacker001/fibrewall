@@ -622,7 +622,13 @@ __attribute__((noreturn, used)) void sbxe_main(long *initial) {
     action.flags |= SA_RESTORER_;
     action.restorer = (void *) sbxe_restorer;
 #endif
-    if (sys4(NR_rt_sigaction, SIGSYS_, &action, 0, 8) != 0) die("could not install the minimal handler");
+    /*
+     * Through the trampoline: after the exec there is no handler, and an
+     * SBX_LOCK_EXEC filter traps rt_sigaction made from anywhere else.
+     */
+    if (trampoline(NR_rt_sigaction, SIGSYS_, (long) &action, 0, 8, 0, 0) != 0) {
+        die("could not install the minimal handler");
+    }
 
     /* The target, then its interpreter, opened through the broker like any path. */
     char interp_path[SBXE_PATH_MAX];
@@ -671,7 +677,12 @@ __attribute__((noreturn, used)) void sbxe_main(long *initial) {
         new_envp[envc++] = put(&b, *e);
     }
     /* libsbx_child.so first, so its constructor adopts before anything else of the image runs. */
-    if (old_preload && old_preload[0]) {
+    size_t child_length = length_of(child_library);
+    if (old_preload && same_prefix(old_preload, child_library) &&
+        (old_preload[child_length] == ':' || old_preload[child_length] == 0)) {
+        /* Already first: an image this tree started, which execs again. */
+        new_envp[envc++] = put_two(&b, "LD_PRELOAD=", old_preload);
+    } else if (old_preload && old_preload[0]) {
         char joined[SBXE_PATH_MAX * 2];
         size_t n = length_of(child_library), m = length_of(old_preload);
         if (n + m + 2 > sizeof(joined)) die("LD_PRELOAD too long");

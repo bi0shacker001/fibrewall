@@ -889,9 +889,14 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         int fd = open_decided(&c, O_RDONLY, 0, SBX_READ);
         if (fd < 0) { error = fd; break; }
         struct stat st;
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        /*
+         * As the kernel answers an exec of anything but a regular file, or of
+         * one with no execute bit: sbx-exec maps the file itself, so the
+         * kernel's own check never runs.
+         */
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || !(st.st_mode & 0111)) {
             close(fd);
-            error = -EACCES;  /* as the kernel answers an exec of anything but a regular file */
+            error = -EACCES;
             break;
         }
         exe_record(pid, c.real);

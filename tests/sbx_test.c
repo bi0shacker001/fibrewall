@@ -1190,7 +1190,12 @@ static int unix_check(void) {
 static volatile sig_atomic_t usr1_seen;
 static void on_usr1(int signal_number) { (void) signal_number; usr1_seen = 1; }
 
-static int contain_check(void) {
+static int exec_files(const char *self, char *helper, char *library, size_t size);
+
+static int contain_check(const char *self) {
+    /* The preset includes SBX_LOCK_EXEC, which needs the helper and the child library. */
+    static char helper[600], library[600];
+    exec_files(self, helper, library, sizeof(helper));
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
     struct sbx_policy *policy = sbx_policy_new();
@@ -1202,7 +1207,8 @@ static int contain_check(void) {
     pid_t child = fork();
     if (child == 0) {
         close(pair[0]);
-        struct sbx_lockdown_options options = {.flags = SBX_LOCK_CONTAIN | SBX_LOCK_NET_BROKERED};
+        struct sbx_lockdown_options options = {
+            .flags = SBX_LOCK_CONTAIN | SBX_LOCK_NET_BROKERED, .exec_helper = helper, .child_library = library};
         EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "contain: not with the brokered network");
         options.flags = SBX_LOCK_CONTAIN;
         int locked = sbx_lockdown(pair[1], &options);
@@ -1285,7 +1291,8 @@ static int contain_check(void) {
     if (child == 0) {
         close(every[0]);
         struct sbx_lockdown_options options = {
-            .flags = SBX_LOCK_CONTAIN | SBX_LOCK_UNIX | SBX_LOCK_INET | SBX_LOCK_LOG_SOCKET | SBX_LOCK_LEARN};
+            .flags = SBX_LOCK_CONTAIN | SBX_LOCK_UNIX | SBX_LOCK_INET | SBX_LOCK_LOG_SOCKET | SBX_LOCK_LEARN,
+            .exec_helper = helper, .child_library = library};
         int locked = sbx_lockdown(every[1], &options);
         errno = -locked;
         EXPECT(locked == 0, "contain: every flag at once fits in the filter");
@@ -1402,20 +1409,6 @@ static int listen_check(const char *self) {
 
 /* ---- sbx-exec's loader: a program started through it, as the kernel would start it. ---- */
 
-/* Runs in the image sbx-exec loaded: the environment it was given, and a working libc. */
-static int loaded_main(const char *library) {
-    const char *preload = getenv("LD_PRELOAD");
-    EXPECT(preload != NULL && strncmp(preload, library, strlen(library)) == 0, "loaded: libsbx_child.so first on LD_PRELOAD");
-    EXPECT(getenv("SBX_ADOPT") && strcmp(getenv("SBX_ADOPT"), "1") == 0, "loaded: SBX_ADOPT for the child library");
-    EXPECT(getenv("SBX_BROKER_FD") && getenv("SBX_CWD_FD"), "loaded: the connection and directory are named");
-    EXPECT(getenv("SBX_EXEC_TEST") && strcmp(getenv("SBX_EXEC_TEST"), "kept") == 0, "loaded: the program's own environment kept");
-    EXPECT(getenv("SBX_TOKEN") == NULL, "loaded: a token in the environment does not pass through");
-    char *copy = strdup("libc works");
-    EXPECT(copy && strcmp(copy, "libc works") == 0, "loaded: malloc and the rest of libc");
-    free(copy);
-    return failures ? 1 : 0;
-}
-
 static int exec_helper_check(const char *self) {
     char helper[600], library[600];
     snprintf(helper, sizeof(helper), "%s", self);
@@ -1456,9 +1449,14 @@ static int exec_helper_check(const char *self) {
     close(pair[1]);
     int status = 0;
     waitpid(child, &status, 0);
-    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    /*
+     * The image comes up with libsbx_child.so first and SBX_ADOPT set, but no
+     * filter behind it: the child library's probe gets the kernel's answer,
+     * so it refuses to call the image confined and ends it before main.
+     */
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 127;
     if (WIFSIGNALED(status)) printf("FAIL exec: the loaded image died by signal %d\n", WTERMSIG(status));
-    EXPECT(ok, "exec: sbx-exec loaded the test with its interpreter, and it ran");
+    EXPECT(ok, "exec: sbx-exec loaded the test, whose child library would not adopt without a filter (127)");
     pid_t bad = fork();
     if (bad == 0) {
         char *argv[] = {helper, "nonsense", NULL};
@@ -1468,6 +1466,140 @@ static int exec_helper_check(const char *self) {
     waitpid(bad, &status, 0);
     EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 127, "exec: sbx-exec with bad arguments ends with 127");
     return !ok;
+}
+
+/* ---- SBX_LOCK_EXEC: a confined process execs, and the new image is confined the same. ---- */
+
+/* sbx-exec and libsbx_child.so, beside the test; 0 when they are there. */
+static int exec_files(const char *self, char *helper, char *library, size_t size) {
+    snprintf(helper, size, "%s", self);
+    char *slash = strrchr(helper, '/');
+    if (!slash) return -1;
+    snprintf(slash + 1, size - (size_t) (slash + 1 - helper), "sbx-exec");
+    snprintf(library, size, "%s", helper);
+    slash = strrchr(library, '/');
+    snprintf(slash + 1, size - (size_t) (slash + 1 - library), "libsbx_child.so");
+    return access(helper, X_OK) == 0 && access(library, R_OK) == 0 ? 0 : -1;
+}
+
+static char *exec_environment[] = {"SBX_EXEC_TEST=kept", "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+
+/*
+ * Runs in each image of the chain: argv is self, "--exec-child", the
+ * generations left, the library, the secret folder and the first pid.
+ */
+static int exec_child_main(int argc, char **argv) {
+    if (argc < 7) return 2;
+    const char *self = argv[0], *library = argv[3], *secret_folder = argv[4], *not_executable = argv[6];
+    int left = atoi(argv[2]);
+    char name[160];
+    snprintf(name, sizeof(name), "exec %d: the same process (pid)", left);
+    EXPECT(getpid() == (pid_t) atol(argv[5]), name);
+    const char *preload = getenv("LD_PRELOAD");
+    snprintf(name, sizeof(name), "exec %d: libsbx_child.so first on LD_PRELOAD, once", left);
+    EXPECT(preload && strncmp(preload, library, strlen(library)) == 0 && !strstr(preload + 1, library), name);
+    snprintf(name, sizeof(name), "exec %d: the adoption names are gone", left);
+    EXPECT(!getenv("SBX_ADOPT") && !getenv("SBX_EXEC_HELPER_FD") && !getenv("SBX_CHILD_LIBRARY"), name);
+    snprintf(name, sizeof(name), "exec %d: the program's own environment kept", left);
+    EXPECT(getenv("SBX_EXEC_TEST") && strcmp(getenv("SBX_EXEC_TEST"), "kept") == 0, name);
+    char path[600];
+    snprintf(path, sizeof(path), "%s/key", secret_folder);
+    errno = 0;
+    snprintf(name, sizeof(name), "exec %d: a file outside the rules refused", left);
+    EXPECT(refused(open(path, O_RDONLY)), name);
+    int fd = open(self, O_RDONLY);
+    snprintf(name, sizeof(name), "exec %d: a file the rules allow opens, through the broker", left);
+    EXPECT(fd >= 0, name);
+    if (fd >= 0) close(fd);
+    char exe[600];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[n > 0 ? n : 0] = 0;
+    snprintf(name, sizeof(name), "exec %d: /proc/self/exe is the program, not sbx-exec", left);
+    EXPECT(n > 0 && strcmp(exe, self) == 0, name);
+    errno = 0;
+    snprintf(name, sizeof(name), "exec %d: exec of a file outside the rules refused", left);
+    EXPECT(execl(path, path, (char *) NULL) < 0 && errno == EACCES, name);
+    errno = 0;
+    snprintf(name, sizeof(name), "exec %d: exec of a file with no execute bit refused", left);
+    EXPECT(execl(not_executable, not_executable, (char *) NULL) < 0 && errno == EACCES, name);
+    errno = 0;
+    snprintf(name, sizeof(name), "exec %d: a direct execveat through no trampoline still traps (missing file)", left);
+    EXPECT(syscall(__NR_execveat, AT_FDCWD, "/nonexistent-sbx-exec-test", (char *[]) {NULL}, (char *[]) {NULL}, 0) < 0 &&
+               errno == ENOENT, name);
+    /*
+     * Code that jumps to the fixed trampoline gets only the helper's form of
+     * execveat (a descriptor, AT_EMPTY_PATH): a path is still trapped and
+     * decided by the broker.
+     */
+#if defined(__x86_64__)
+    long (*trampoline)(long, long, long, long, long, long, long) = (void *) 0x200000000000UL;
+#else
+    long (*trampoline)(long, long, long, long, long, long, long) = (void *) 0x5b0000000UL;
+#endif
+    char *no_args[] = {path, NULL};
+    snprintf(name, sizeof(name), "exec %d: execveat of a path through the trampoline is still decided (refused)", left);
+    EXPECT(trampoline(__NR_execveat, AT_FDCWD, (long) path, (long) no_args, (long) no_args + sizeof(char *), 0, 0) == -EACCES,
+           name);
+    fflush(stdout);
+    if (left > 0 && failures == 0) {
+        char next[12];
+        snprintf(next, sizeof(next), "%d", left - 1);
+        char *args[] = {(char *) self, "--exec-child", next, (char *) library, (char *) secret_folder, argv[5],
+                        (char *) not_executable, NULL};
+        execve(self, args, exec_environment);
+        printf("FAIL exec %d: the next exec (errno %d %s)\n", left, errno, strerror(errno));
+        return 1;
+    }
+    return failures ? 1 : 0;
+}
+
+static int exec_check(const char *self) {
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    (void) self;
+    return 0;
+#else
+    char helper[600], library[600];
+    if (exec_files(self, helper, library, sizeof(helper)) != 0) {
+        printf("FAIL exec: sbx-exec or libsbx_child.so is not beside the test\n");
+        return 1;
+    }
+    char not_executable[400];
+    snprintf(not_executable, sizeof(not_executable), "%s/data.txt", game);
+    struct sbx_lockdown_options bad = {.flags = SBX_LOCK_EXEC};
+    EXPECT(sbx_lockdown(0, &bad) == -EINVAL, "exec: SBX_LOCK_EXEC without the helper and library refused");
+    bad.exec_helper = helper;
+    bad.child_library = library;
+    bad.flags = SBX_LOCK_EXEC | SBX_LOCK_PASSTHROUGH;
+    EXPECT(sbx_lockdown(0, &bad) == -EINVAL, "exec: SBX_LOCK_EXEC with passthrough refused");
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, "/", SBX_READ);
+    sbx_policy_add(policy, secret, SBX_DENY);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_EXEC, .exec_helper = helper, .child_library = library};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "exec: lockdown with SBX_LOCK_EXEC");
+        if (locked != 0) _exit(1);
+        char pid_text[16];
+        snprintf(pid_text, sizeof(pid_text), "%d", (int) getpid());
+        char *args[] = {(char *) self, "--exec-child", "2", library, secret, pid_text, not_executable, NULL};
+        execve(self, args, exec_environment);
+        printf("FAIL exec: the first exec (errno %d %s)\n", errno, strerror(errno));
+        _exit(1);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (WIFSIGNALED(status)) printf("FAIL exec: the chain died by signal %d\n", WTERMSIG(status));
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    EXPECT(ok, "exec: three images in a row, each confined as the first");
+    return !ok || failures;
+#endif
 }
 
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
@@ -2128,7 +2260,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "--spawned") == 0) return spawned_main();
     if (argc > 3 && strcmp(argv[1], "--attached") == 0) return attached_main(argv[2], argv[3]);
-    if (argc > 2 && strcmp(argv[1], "--loaded") == 0) return loaded_main(argv[2]);
+    if (argc > 1 && strcmp(argv[1], "--exec-child") == 0) return exec_child_main(argc, argv);
     char self[512];
     ssize_t self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (self_len <= 0) { perror("readlink"); return 2; }
@@ -2169,7 +2301,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check() | listen_check(self) | exec_helper_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | unix_check() | contain_check(self) | listen_check(self) | exec_helper_check(self) | exec_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

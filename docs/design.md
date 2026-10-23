@@ -816,7 +816,7 @@ cost:
 | `SBX_LOCK_INOTIFY` | inotify marks, the kernel deciding |
 | `SBX_LOCK_SOCKETS` | Unix sockets of every type, inet stream and datagram, route netlink; `bind`, `connect` and the rest unjudged |
 | `SBX_LOCK_SIGNALS` | signals to any process of the UID (`kill`, `tgkill`, `tkill`, the sigqueue calls) |
-| `SBX_LOCK_EXEC` | joins the preset when `sbx-exec` is built |
+| `SBX_LOCK_EXEC` | `execve`/`execveat`, decided by the broker as a read and run through `sbx-exec` (needs `exec_helper` and `child_library` in the options) |
 
 Shared memory (SysV, `memfd`, `ashmem`) and every call on a descriptor
 were never refused. What the preset still refuses, whatever the flags:
@@ -830,7 +830,7 @@ stated where they are declared (`include/sbx.h`): with `SBX_LOCK_SOCKETS`
 the process can reach any socket of its UID, the host's own included, and
 create socket files wherever the UID may write.
 
-**`SBX_LOCK_EXEC` and `sbx-exec` (design, 2026-10-23; option 1, approved
+**`SBX_LOCK_EXEC` and `sbx-exec` (built 2026-10-23; option 1, approved
 on Droidtop/tracker#584).** Item 1 above cannot work as first written.
 After `exec` the filter stays and the SIGSYS handler is gone. The new
 image's dynamic linker then opens `libc.so`, the preloads and every
@@ -884,6 +884,35 @@ handler, but needs kernel 5.0 (the RP5 runs 4.19). The design:
    one stands). From then on the image is confined exactly as its parent
    was, with the same pid.
 
+As built, beyond the steps above:
+- `SBX_LOCK_EXEC` is `0x1000`. It needs the broker, and
+  `sbx_lockdown_options.exec_helper` (opened before lockdown) and
+  `.child_library` (an absolute path). It is not allowed with
+  `SBX_LOCK_PASSTHROUGH`.
+- The filter lets only one `execveat` through the trampoline: one with
+  `AT_EMPTY_PATH`, which is the handler's run of the helper by
+  descriptor. Through the trampoline an exec of a path still traps, and the
+  broker decides it. `rt_sigaction` through the trampoline is allowed for
+  every signal, SIGSYS included, because each new image installs its
+  handler that way. sbx-exec's goes through the trampoline, and the child
+  library's goes through sbx-exec's handler.
+- The broker refuses a target with no execute bit (`EACCES`), as the
+  kernel would, since the kernel's own check never runs on a file sbx-exec
+  maps.
+- The handler passes the helper's descriptor and the child library's path
+  to the new image in `SBX_EXEC_HELPER_FD` and `SBX_CHILD_LIBRARY`.
+  `sbx_adopt` removes them, with `SBX_ADOPT`, `SBX_CWD_FD` and `SBX_FLAGS`.
+  sbx-exec does not add the child library to `LD_PRELOAD` again when it is
+  already first.
+- Adoption first asks a probe the filter answers: `prctl(0x53425845)`
+  gets `ENOTRECOVERABLE` under an `SBX_LOCK_EXEC` filter and `EINVAL` from
+  the kernel. An image handed `SBX_ADOPT` with no filter behind it is ended
+  before `main` (127), rather than calling itself confined.
+- The trampoline page is at a fixed address: `0x5b0000000` on arm64, and
+  `0x200000000000` on x86_64, out of AddressSanitizer's shadow there. A
+  kernel before 4.17 takes `MAP_FIXED_NOREPLACE` as a hint; if the page
+  lands elsewhere, the lockdown fails.
+
 Fails closed at every step: a target the broker refuses, a helper that
 cannot be executed, a trampoline address that cannot be mapped, or an
 image without the child library all end with the program not running
@@ -920,8 +949,9 @@ merged directories above. `statx` and `openat2` keep answering `ENOSYS`
 
 Untouched: everything on a descriptor (`read`, `write`, `pread`, `mmap`,
 `ioctl`, `fcntl` and `flock`, `fstat`, `ftruncate`, `futimens`, `sendmsg`,
-`recvmsg`, `poll`), the clock and futex calls, `clone` without namespace
-flags, and `execve` (checked by nothing but the inherited filter). So a game
+`recvmsg`, `poll`), the clock and futex calls, and `clone` without namespace
+flags. `execve` is one round trip, then the helper's own forwarded calls
+while the new image's loader runs. So a game
 that opens its assets once and reads them pays at open only.
 
 Still refused, with the effects to expect: `inotify` marks (directory change

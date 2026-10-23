@@ -34,6 +34,8 @@
 #define _GNU_SOURCE
 #include "sbx.h"
 #include "protocol.h"
+#include "exec_shared.h"
+#include "internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -488,7 +490,7 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
     int passed;
     long result = exchange(&request, extra, count, path, length, path2, length2, out, out_len,
                            op == SBX_OPEN && !(flags & O_CLOEXEC), &passed);
-    if ((op == SBX_OPEN || op == SBX_CHDIR) && result >= 0) {
+    if ((op == SBX_OPEN || op == SBX_CHDIR || op == SBX_EXEC) && result >= 0) {
         if (passed < 0) return -EIO;
         return passed;
     }
@@ -916,6 +918,57 @@ static long sigmask_call(ucontext_t *uc, int how, const void *set, void *old, un
 }
 
 /*
+ * The trampoline the handler makes its own calls through, and the address
+ * just after its syscall instruction, which the filter recognises. Without
+ * SBX_LOCK_EXEC it is sbx_learn_call. With it, it is the page at
+ * SBXE_TRAMPOLINE_ADDRESS, the same in every image of the tree, so the
+ * filter's check still holds after exec.
+ */
+typedef long (*trampoline_fn)(long, long, long, long, long, long, long);
+static trampoline_fn through = sbx_learn_call;
+static uintptr_t through_after;  /* 0 until a lockdown sets it */
+SBXE_TRAMPOLINE_ASM
+extern const char sbxe_trampoline_start[], sbxe_trampoline_after[], sbxe_trampoline_end[];
+
+static uintptr_t trampoline_after(void) {
+    return through_after ? through_after : (uintptr_t) sbx_learn_call_after;
+}
+
+/*
+ * The fixed trampoline page: mapped here, or found already mapped by
+ * sbx-exec in an image it started. Anything else at that address fails the
+ * lockdown.
+ */
+static int map_trampoline(void) {
+    void *want = (void *) SBXE_TRAMPOLINE_ADDRESS;
+    size_t length = (size_t) (sbxe_trampoline_end - sbxe_trampoline_start);
+    void *page = mmap(want, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | 0x100000 /* MAP_FIXED_NOREPLACE */,
+                      -1, 0);
+    if (page == want) {
+        memcpy(page, sbxe_trampoline_start, length);
+        if (mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0) {
+            int error = errno;
+            munmap(page, 4096);
+            return -error;
+        }
+    } else {
+        /* A kernel before 4.17 takes the address as a hint and maps elsewhere when it is taken. */
+        if (page != MAP_FAILED) munmap(page, 4096);
+        unsigned char resident;
+        if (mincore(want, 4096, &resident) != 0) return -ENOMEM;
+        if (memcmp(want, sbxe_trampoline_start, length) != 0) return -EEXIST;
+    }
+    through = (trampoline_fn) SBXE_TRAMPOLINE_ADDRESS;
+    through_after = SBXE_TRAMPOLINE_ADDRESS + (uintptr_t) (sbxe_trampoline_after - sbxe_trampoline_start);
+    return 0;
+}
+
+/* SBX_LOCK_EXEC's state: the lockdown's flags, the helper, and the child library's path. */
+static unsigned lock_flags;
+static int helper_fd = -1;
+static char child_library[SBX_PATH_MAX];
+
+/*
  * SBX_LOCK_LEARN: a call a real lockdown refuses with errno would. The
  * broker records it (SBX_LEARN, answered before the call is made, so the
  * records keep their order), then the call is made as asked, through the
@@ -942,7 +995,7 @@ static long learn_call(long nr, ucontext_t *uc, int would) {
      * recorded and refused, as a real lockdown refuses it.
      */
     if (nr == __NR_execve || nr == __NR_execveat) return -would;
-    return sbx_learn_call(nr, ARG(uc, 0), ARG(uc, 1), ARG(uc, 2), ARG(uc, 3), ARG(uc, 4), ARG(uc, 5));
+    return through(nr, ARG(uc, 0), ARG(uc, 1), ARG(uc, 2), ARG(uc, 3), ARG(uc, 4), ARG(uc, 5));
 }
 
 /* The kernel's struct sigaction for rt_sigaction, the same on x86_64 and arm64 (both have sa_restorer). */
@@ -963,11 +1016,112 @@ struct kernel_sigaction {
  */
 static long sigaction_call(long signal_number, const void *action, void *old, unsigned long size) {
     if (size != sizeof(uint64_t)) return -EINVAL;
-    if (action == NULL) return sbx_learn_call(__NR_rt_sigaction, signal_number, 0, (long) old, (long) size, 0, 0);
+    if (action == NULL) return through(__NR_rt_sigaction, signal_number, 0, (long) old, (long) size, 0, 0);
     struct kernel_sigaction copy;
     memcpy(&copy, action, sizeof(copy));
     copy.mask &= ~SIGSYS_BIT;
-    return sbx_learn_call(__NR_rt_sigaction, signal_number, (long) &copy, (long) old, (long) size, 0, 0);
+    return through(__NR_rt_sigaction, signal_number, (long) &copy, (long) old, (long) size, 0, 0);
+}
+
+/* value in decimal into out (at least 12 bytes), with no stdio in the handler. */
+static char *decimal(char *out, unsigned value) {
+    char digits[12];
+    int n = 0;
+    do digits[n++] = (char) ('0' + value % 10);
+    while ((value /= 10) != 0);
+    char *at = out;
+    while (n > 0) *at++ = digits[--n];
+    *at = '\0';
+    return out;
+}
+
+static int starts_with(const char *text, const char *prefix) {
+    return strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+/*
+ * execve and execveat under SBX_LOCK_EXEC (docs/design.md, "SBX_LOCK_EXEC
+ * and sbx-exec"). The broker decides the target as a read and answers with
+ * it open. The handler then runs sbx-exec through the trampoline (the one
+ * execveat the filter lets through), with the broker connection, the
+ * current directory, the target and the lockdown's flags; sbx-exec loads
+ * the target in this process, which keeps its pid and its filter. The new
+ * image's libsbx_child.so adopts the connection (sbx_adopt), finding the
+ * helper and the child library in SBX_EXEC_HELPER_FD and SBX_CHILD_LIBRARY.
+ * Returns only when the exec failed.
+ */
+static long exec_call(int dirfd, const char *path, char *const *argv, char *const *envp, int flags) {
+    if (helper_fd < 0) return -EACCES;
+    if (path == NULL) return -EFAULT;
+    char link[32];
+    if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        fd_link(link, dirfd == AT_FDCWD ? current_directory() : dirfd);
+        path = link;
+        dirfd = AT_FDCWD;
+    }
+    size_t argc = 0, envc = 0, env_bytes = 0;
+    while (argv && argv[argc]) {
+        if (++argc > (1u << 20)) return -E2BIG;
+    }
+    while (envp && envp[envc]) {
+        if (++envc > (1u << 20)) return -E2BIG;
+    }
+    long target = forward(SBX_EXEC, dirfd, path, 0, NULL, 0, 0, NULL, 0);
+    if (target < 0) return target;
+
+    static const char helper_name[] = "SBX_EXEC_HELPER_FD=", library_name[] = "SBX_CHILD_LIBRARY=";
+    env_bytes = sizeof(helper_name) + 12 + sizeof(library_name) + strlen(child_library) + 1;
+    size_t pointers = (8 + argc + 1) + (envc + 3);
+    size_t size = pointers * sizeof(char *) + 5 * 12 + env_bytes;
+    size = (size + 4095) & ~(size_t) 4095;
+    char **space = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (space == MAP_FAILED) {
+        close((int) target);
+        return -ENOMEM;
+    }
+    /* The helper's descriptors, kept across the exec; every other one of ours is close-on-exec. */
+    int kept[4] = {
+        fcntl(broker, F_DUPFD, 3), fcntl(current_directory(), F_DUPFD, 3), fcntl((int) target, F_DUPFD, 3),
+        fcntl(helper_fd, F_DUPFD, 3),
+    };
+    close((int) target);
+    long result = -EMFILE;
+    if (kept[0] >= 0 && kept[1] >= 0 && kept[2] >= 0 && kept[3] >= 0) {
+        char **args = space, **env = space + 8 + argc + 1;
+        char *text = (char *) (space + pointers);
+        args[0] = (char *) "sbx-exec";
+        for (int i = 0; i < 3; i++) {
+            args[1 + i] = decimal(text, (unsigned) kept[i]);
+            text += 12;
+        }
+        args[4] = decimal(text, lock_flags);
+        text += 12;
+        args[5] = child_library;
+        args[6] = (char *) path;
+        args[7] = (char *) "--";
+        for (size_t i = 0; i < argc; i++) args[8 + i] = argv[i];
+        args[8 + argc] = NULL;
+        size_t e = 0;
+        for (size_t i = 0; i < envc; i++) {
+            if (starts_with(envp[i], helper_name) || starts_with(envp[i], library_name)) continue;
+            env[e++] = envp[i];
+        }
+        env[e++] = text;
+        memcpy(text, helper_name, sizeof(helper_name) - 1);
+        decimal(text + sizeof(helper_name) - 1, (unsigned) kept[3]);
+        text += strlen(text) + 1;
+        env[e++] = text;
+        memcpy(text, library_name, sizeof(library_name) - 1);
+        memcpy(text + sizeof(library_name) - 1, child_library, strlen(child_library) + 1);
+        env[e] = NULL;
+        result = through(__NR_execveat, kept[3], (long) "", (long) args, (long) env, AT_EMPTY_PATH, 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (kept[i] >= 0) close(kept[i]);
+    }
+    munmap(space, size);
+    return result;
 }
 
 static long dispatch(long nr, ucontext_t *uc) {
@@ -980,6 +1134,10 @@ static long dispatch(long nr, ucontext_t *uc) {
         return sigmask_call(uc, (int) a0, (const void *) a1, (void *) a2, (unsigned long) a3);
     case __NR_openat:
         return open_path((int) a0, (const char *) a1, (int) a2, (uint32_t) a3, buffer);
+    case __NR_execve:
+        return exec_call(AT_FDCWD, (const char *) a0, (char *const *) a1, (char *const *) a2, 0);
+    case __NR_execveat:
+        return exec_call((int) a0, (const char *) a1, (char *const *) a2, (char *const *) a3, (int) a4);
     case __NR_newfstatat: {
         const char *path = (const char *) a1;
         if ((a3 & AT_EMPTY_PATH) && path != NULL && path[0] == '\0') {
@@ -1311,13 +1469,35 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1));
     ret(REFUSE_ALWAYS);
 #endif
+    if (flags & SBX_LOCK_EXEC) {
+        /* The adoption probe (sbx_adopt): proof, in an image sbx-exec started, that this filter is in place. */
+        jeq(__NR_prctl, 0, 3);
+        load(ARG_LO(0));
+        jeq(SBX_EXEC_PROBE, 0, 1);
+        ret(SECCOMP_RET_ERRNO | ENOTRECOVERABLE);
+        load(offsetof(struct seccomp_data, nr));
+        /*
+         * The handler's run of sbx-exec: execveat(fd, "", ..., AT_EMPTY_PATH)
+         * through the trampoline. Every other exec traps (exec_call).
+         */
+        uint64_t after = (uint64_t) trampoline_after();
+        jeq(__NR_execveat, 0, 7);
+        load(offsetof(struct seccomp_data, instruction_pointer));
+        jeq((unsigned) after, 0, 5);
+        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+        jeq((unsigned) (after >> 32), 0, 3);
+        load(ARG_LO(4));
+        emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, AT_EMPTY_PATH, 0, 1));
+        ret(ALLOW);
+        load(offsetof(struct seccomp_data, nr));
+    }
     if (learn) {
         /*
          * The learning handler makes a recorded call through its own
          * trampoline, which only a learning filter lets through: anything
          * at that address would get past a real one.
          */
-        uint64_t after = (uint64_t) (uintptr_t) sbx_learn_call_after;
+        uint64_t after = (uint64_t) trampoline_after();
         load(offsetof(struct seccomp_data, instruction_pointer));
         jeq((unsigned) after, 0, 3);
         load(offsetof(struct seccomp_data, instruction_pointer) + 4);
@@ -1458,11 +1638,22 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
          * handler (sigaction_call), with SIGSYS left out of its mask, through
          * the trampoline, which is let through here for rt_sigaction alone.
          */
-        uint64_t after = (uint64_t) (uintptr_t) sbx_learn_call_after;
-        jeq(__NR_rt_sigaction, 0, 9);
-        load(ARG_LO(0));
-        jeq(SIGSYS, 0, 1);
-        ret(DENY_ALWAYS);  /* even learning: without our handler nothing after it would be recorded */
+        uint64_t after = (uint64_t) trampoline_after();
+        if (flags & SBX_LOCK_EXEC) {
+            /*
+             * Each new image installs its handler, through the trampoline
+             * (sbx-exec's, then libsbx_child.so's), so a SIGSYS handler is
+             * allowed there too. Code that replaces ours only loses its own
+             * file access: the filter still refuses what the handler would
+             * have forwarded.
+             */
+            jeq(__NR_rt_sigaction, 0, 6);
+        } else {
+            jeq(__NR_rt_sigaction, 0, 9);
+            load(ARG_LO(0));
+            jeq(SIGSYS, 0, 1);
+            ret(DENY_ALWAYS);  /* even learning: without our handler nothing after it would be recorded */
+        }
         load(offsetof(struct seccomp_data, instruction_pointer));
         jeq((unsigned) after, 0, 3);
         load(offsetof(struct seccomp_data, instruction_pointer) + 4);
@@ -1523,6 +1714,10 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup, __NR_io_uring_enter,
         __NR_io_uring_register,
     };
+    if (flags & SBX_LOCK_EXEC) {
+        rule(__NR_execve, TRAP);
+        rule(__NR_execveat, TRAP);
+    }
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
     /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
     if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_NET_BROKERED | SBX_LOCK_SOCKETS))) rule(__NR_connect, REFUSE);
@@ -1644,6 +1839,12 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if ((options->flags & SBX_LOCK_SOCKETS) && (options->flags & SBX_LOCK_NET_BROKERED)) return -EINVAL;
     /* The broker's network needs the broker, and replaces the process's own. */
     if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;
+    /* Exec through the broker and the helper: needs both, and the broker's decisions (not passthrough's). */
+    int exec = (options->flags & SBX_LOCK_EXEC) != 0;
+    if (exec && (unbrokered || pass || !options->exec_helper || !options->child_library ||
+                 options->child_library[0] != '/' || strnlen(options->child_library, SBX_PATH_MAX) == SBX_PATH_MAX)) {
+        return -EINVAL;
+    }
     if (unbrokered) broker_fd = -1;
     else if (broker_fd < 0) return -EBADF;
     if (options->claim_count > SBX_CLAIMS_MAX || (options->claim_count && !options->claims)) return -EINVAL;
@@ -1673,8 +1874,21 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     /* So would a handler whose mask blocks it, for any trapped call made while it runs. */
     if (!unbrokered) open_sigsys_in_handlers();
+    int helper = -1;
+    if (exec) {
+        helper = open(options->exec_helper, O_RDONLY | O_CLOEXEC);
+        if (helper < 0) return -errno;
+        int mapped = map_trampoline();
+        if (mapped != 0) {
+            close(helper);
+            return mapped;
+        }
+    }
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
-    if (built != 0) return built;
+    if (built != 0) {
+        if (helper >= 0) close(helper);
+        return built;
+    }
     if (unbrokered) {
         /* Nothing is forwarded, so no handler and no current directory to keep. */
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
@@ -1685,7 +1899,11 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         return 0;
     }
     int directory = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) return -errno;
+    if (directory < 0) {
+        int error = -errno;
+        if (helper >= 0) close(helper);
+        return error;
+    }
     broker = broker_fd;
     cwd = directory;
     unsigned locals_before = __atomic_load_n(&local_count, __ATOMIC_ACQUIRE);
@@ -1711,6 +1929,11 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     passthrough = pass;
     unix_mode = (options->flags & SBX_LOCK_UNIX) != 0;
+    lock_flags = options->flags;
+    if (exec) {
+        helper_fd = helper;
+        snprintf(child_library, sizeof(child_library), "%s", options->child_library);
+    }
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));
@@ -1745,11 +1968,62 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         error = synced > 0 ? -EBUSY : -errno;
     }
     if (error != -ENOMEM) sigaction(SIGSYS, &previous, NULL);
+    if (helper >= 0) close(helper);
+    helper_fd = -1;
     drop_locals_from(locals_before);
     free_claims();
     close(directory);
     broker = -1;
     cwd = -1;
     return error;
+#endif
+}
+
+int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, const char *library) {
+#ifndef SBX_ARCH
+    (void) flags;
+    (void) broker_fd;
+    (void) cwd_fd;
+    (void) exec_helper_fd;
+    (void) library;
+    return -ENOSYS;
+#else
+    if (locked) return -EALREADY;
+    if (!(flags & SBX_LOCK_EXEC) || (flags & (SBX_LOCK_UNBROKERED | SBX_LOCK_PASSTHROUGH))) return -EINVAL;
+    if (broker_fd < 0 || cwd_fd < 0 || exec_helper_fd < 0) return -EBADF;
+    if (!library || library[0] != '/' || strnlen(library, SBX_PATH_MAX) == SBX_PATH_MAX) return -EINVAL;
+    /* The filter the exec kept answers the probe; without it nothing here is confined, so nothing is claimed. */
+    errno = 0;
+    if (prctl(SBX_EXEC_PROBE, 0, 0, 0, 0) != -1 || errno != ENOTRECOVERABLE) return -EPERM;
+    int mapped = map_trampoline();
+    if (mapped != 0) return mapped;
+    fcntl(cwd_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(exec_helper_fd, F_SETFD, FD_CLOEXEC);
+    broker = broker_fd;
+    cwd = cwd_fd;
+    helper_fd = exec_helper_fd;
+    snprintf(child_library, sizeof(child_library), "%s", library);
+    passthrough = 0;
+    unix_mode = (flags & SBX_LOCK_UNIX) != 0;
+    lock_flags = flags;
+    /*
+     * The full handler replaces sbx-exec's minimal one. sigaction traps, and
+     * the minimal handler makes the call through the trampoline, which the
+     * filter allows with SBX_LOCK_EXEC.
+     */
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = on_sigsys;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGSYS, &action, NULL) != 0) {
+        int error = -errno;
+        broker = -1;
+        cwd = -1;
+        helper_fd = -1;
+        return error;
+    }
+    locked = 1;
+    return 0;
 #endif
 }

@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 #include "sbx.h"
+#include "internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -69,7 +70,46 @@ static void scrub(const char *name) {
     unsetenv(name);
 }
 
+/* A descriptor or flags number from the environment, or -1. */
+static long number_from(const char *name) {
+    const char *text = getenv(name);
+    if (!text || !text[0]) return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 0);
+    if (errno != 0 || *end != '\0' || value > 0x7fffffffUL) return -1;
+    return (long) value;
+}
+
+/*
+ * An image sbx-exec started (SBX_LOCK_EXEC): the filter is already in
+ * place and kept by the exec, so the process takes over the connection
+ * and descriptors it was handed instead of attaching. Fails closed: a
+ * missing or bad name, or no filter behind them, is an error, and the
+ * child library ends the process.
+ */
+static int adopt_from_environment(void) {
+    long broker_fd = number_from("SBX_BROKER_FD"), cwd_fd = number_from("SBX_CWD_FD");
+    long helper_fd = number_from("SBX_EXEC_HELPER_FD"), flags = number_from("SBX_FLAGS");
+    const char *library = getenv("SBX_CHILD_LIBRARY");
+    if (broker_fd < 0 || cwd_fd < 0 || helper_fd < 0 || flags < 0 || !library) return -EINVAL;
+    char copy[4096];
+    if (snprintf(copy, sizeof(copy), "%s", library) >= (int) sizeof(copy)) return -ENAMETOOLONG;
+    int result = sbx_adopt((unsigned) flags, (int) broker_fd, (int) cwd_fd, (int) helper_fd, copy);
+    if (result == 0) {
+        /* The program's own environment again; SBX_BROKER_FD stays, as sbx_attach leaves it. */
+        unsetenv("SBX_ADOPT");
+        unsetenv("SBX_CWD_FD");
+        unsetenv("SBX_FLAGS");
+        unsetenv("SBX_EXEC_HELPER_FD");
+        unsetenv("SBX_CHILD_LIBRARY");
+    }
+    return result;
+}
+
 int sbx_attach_from_environment(void) {
+    const char *adopt = getenv("SBX_ADOPT");
+    if (adopt && strcmp(adopt, "1") == 0) return adopt_from_environment();
     const char *broker = getenv("SBX_BROKER");
     if (!broker) return 1;
     const char *token = getenv("SBX_TOKEN");
