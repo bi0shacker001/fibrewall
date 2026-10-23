@@ -936,6 +936,12 @@ static long learn_call(long nr, ucontext_t *uc, int would) {
     int passed;
     exchange(&request, NULL, 0, &record, sizeof(record), NULL, 0, NULL, 0, 0, &passed);
     if (passed >= 0) close(passed);
+    /*
+     * A program started by exec keeps the filter but not this handler, so
+     * its first trapped call (any path) would end it with signal 31: exec is
+     * recorded and refused, as a real lockdown refuses it.
+     */
+    if (nr == __NR_execve || nr == __NR_execveat) return -would;
     return sbx_learn_call(nr, ARG(uc, 0), ARG(uc, 1), ARG(uc, 2), ARG(uc, 3), ARG(uc, 4), ARG(uc, 5));
 }
 
