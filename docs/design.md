@@ -830,6 +830,68 @@ stated where they are declared (`include/sbx.h`): with `SBX_LOCK_SOCKETS`
 the process can reach any socket of its UID, the host's own included, and
 create socket files wherever the UID may write.
 
+**`SBX_LOCK_EXEC` and `sbx-exec` (design, 2026-10-23; option 1, approved
+on Droidtop/tracker#584).** Item 1 above cannot work as first written.
+After `exec` the filter stays and the SIGSYS handler is gone. The new
+image's dynamic linker then opens `libc.so`, the preloads and every
+`DT_NEEDED` library by path before any constructor runs, and each open
+traps with no handler. bionic's linker also installs its debuggerd
+handlers then, and every `rt_sigaction` traps after lockdown. A new image
+would die at load. `SECCOMP_RET_USER_NOTIF` would avoid the in-process
+handler, but needs kernel 5.0 (the RP5 runs 4.19). The design:
+
+1. **A trampoline at a fixed address.** With `SBX_LOCK_EXEC` the
+   trampoline the filter recognises by instruction pointer (today's
+   `sbx_learn_call`) is a page mapped at one fixed address
+   (`MAP_FIXED_NOREPLACE`; a kernel that maps it elsewhere fails the
+   lockdown) with the same code in every image. The filter's address check
+   then holds after `exec`. Code that jumps there gets only what that check
+   lets through, as today.
+2. **execve traps.** The handler sends `SBX_EXEC` (the path) to the broker,
+   which decides it as a read of the resolved target (the decider sees op
+   `exec`). It answers with the target opened read-only, and records the
+   target as that pid's `/proc/self/exe` (answered by the broker from then
+   on). The handler then `execveat`s the helper through the trampoline,
+   which the filter lets through for that call alone. The helper is a file
+   the host names in `SBX_EXEC_HELPER` (on Android, in the app's
+   native-library folder, which may be executed), opened before lockdown.
+   The helper is passed the broker connection, the current directory, the
+   target and the flags as descriptors and numbers in its arguments,
+   followed by the program's own arguments; its environment is the
+   program's.
+3. **`sbx-exec` itself** is static and freestanding: no libc, no
+   interpreter, no path call of its own. It maps the trampoline page and
+   installs a minimal SIGSYS handler (allowed with `SBX_LOCK_EXEC`; a
+   replaced handler only loses its own file access). That handler forwards
+   `openat`, `newfstatat`, `faccessat`, `readlinkat`, `statfs`, `getcwd`
+   and `chdir` to the broker on the same wire protocol, and emulates
+   `rt_sigaction` and `rt_sigprocmask` as the full handler does. It maps
+   the target and its interpreter (`PT_INTERP`) as the kernel would and
+   builds the new stack: the program's arguments and environment, plus
+   `LD_PRELOAD` with `libsbx_child.so` first, plus `SBX_BROKER_FD`,
+   `SBX_CWD_FD`, `SBX_FLAGS` and `SBX_ADOPT=1`; the auxiliary vector
+   carries the target's `AT_PHDR`, `AT_PHNUM`, `AT_ENTRY` and the
+   interpreter's `AT_BASE`, with the helper's own `AT_SYSINFO_EHDR`,
+   `AT_HWCAP`, `AT_HWCAP2`, `AT_PAGESZ`, `AT_CLKTCK` and `AT_RANDOM`. Then it
+   jumps to the interpreter's entry. The linker's opens go to the broker
+   through the minimal handler.
+4. **Adoption.** `libsbx_child.so`'s constructor sees `SBX_ADOPT` and
+   adopts instead of attaching: it installs the full handler on the
+   inherited connection and directory, with no new filter (the inherited
+   one stands). From then on the image is confined exactly as its parent
+   was, with the same pid.
+
+Fails closed at every step: a target the broker refuses, a helper that
+cannot be executed, a trampoline address that cannot be mapped, or an
+image without the child library all end with the program not running
+unconfined. A static target (no interpreter) runs with the minimal
+handler for its whole life, so only the calls listed in item 3 are
+brokered and other path calls answer `ENOSYS`; Wine's own binaries are
+dynamic. Programs that read `/proc/self/exe` get the target, from the
+broker. The helper is built for arm64-v8a and x86_64, and tested on Linux
+and both emulators by running a dynamic program from a confined one, and
+by an `exec` chain three images deep.
+
 `SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
 four is "a program tree": it can run its own helpers and talk to the
 sockets the host named, and nothing else.
