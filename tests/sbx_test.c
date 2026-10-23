@@ -819,6 +819,10 @@ static int learn_check(void) {
         EXPECT(kill(parent, 0) == 0, "learn: a signal to another process is sent");
         EXPECT(unshare(0) == 0, "learn: unshare made");
         EXPECT(open(file, O_RDONLY) >= 0, "learn: a path the rules refuse is opened (the decider allowed it)");
+        char *const no_arguments[] = {"true", NULL};
+        errno = 0;
+        EXPECT(execve("/bin/true", no_arguments, NULL) < 0 && errno == EACCES,
+               "learn: exec is recorded and still refused (the new program would have no handler)");
         struct sigaction action;
         memset(&action, 0, sizeof(action));
         action.sa_handler = SIG_IGN;
