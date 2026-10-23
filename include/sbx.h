@@ -158,6 +158,18 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  */
 #define SBX_LOCK_INOTIFY 0x200u
 /*
+ * execve and execveat are allowed, through the broker and the host's
+ * static helper (docs/design.md, "SBX_LOCK_EXEC and sbx-exec"): the broker
+ * decides the target as a read of what it resolves to, and the new image
+ * comes up confined exactly as this one, with the same filter and pid,
+ * adopting the connection in libsbx_child.so's constructor. Needs the
+ * broker and sbx_lockdown_options.exec_helper and .child_library; not with
+ * SBX_LOCK_PASSTHROUGH. With it, a process may install its own SIGSYS
+ * handler (each new image must); a replaced handler only loses its own
+ * file access, since the filter refuses what it would have forwarded.
+ */
+#define SBX_LOCK_EXEC 0x40u
+/*
  * Unix sockets of the process's own: socket(AF_UNIX, SOCK_STREAM or
  * SOCK_SEQPACKET) is allowed, and bind and connect go to the broker, which
  * decides a path like any other (bind needs it writable, connect readable;
@@ -205,7 +217,7 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * namespaces, mounts, bpf, perf_event_open, io_uring, module loading, the
  * keyring. A host may add or remove any flag of it.
  */
-#define SBX_LOCK_CONTAIN (SBX_LOCK_PATHOPS | SBX_LOCK_INOTIFY | SBX_LOCK_SOCKETS | SBX_LOCK_SIGNALS)
+#define SBX_LOCK_CONTAIN (SBX_LOCK_PATHOPS | SBX_LOCK_INOTIFY | SBX_LOCK_SOCKETS | SBX_LOCK_SIGNALS | SBX_LOCK_EXEC)
 
 /*
  * The kernel logs every call the filter traps or refuses
@@ -259,6 +271,14 @@ struct sbx_lockdown_options {
      */
     const char *const *claims;
     unsigned claim_count;  /* at most SBX_CLAIMS_MAX */
+    /*
+     * With SBX_LOCK_EXEC: the path of sbx-exec (on Android, in the app's
+     * native-library folder, which may be executed), opened before the
+     * filter goes on, and the path of libsbx_child.so, which each new
+     * image preloads first.
+     */
+    const char *exec_helper;
+    const char *child_library;
 };
 
 /*

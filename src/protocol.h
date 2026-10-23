@@ -73,6 +73,11 @@ enum sbx_op {
      */
     SBX_UNIX_BIND = 23,
     SBX_UNIX_CONNECT = 24,
+    /*
+     * SBX_LOCK_EXEC: path = the program to run. Decided as a read of what it resolves to; the reply carries it
+     * opened read-only, and the broker answers the sender's /proc/<pid>/exe with it from then on.
+     */
+    SBX_EXEC = 25,
 };
 
 /* One call a learning lockdown let through: its number, its arguments, and the errno it would have had. */
