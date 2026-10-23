@@ -62,6 +62,10 @@ enum sbx_op {
                           address, result = its length */
     SBX_LEARN = 19,    /* SBX_LOCK_LEARN: body = struct sbx_learn_record, a call the filter would have refused;
                           the broker audits it and answers 0, and the handler then makes the call */
+    /* SBX_LOCK_PATHOPS. */
+    SBX_LINK = 20,     /* path = the existing name, path2 = the new one; flags = AT_SYMLINK_FOLLOW or 0 */
+    SBX_SYMLINK = 21,  /* path = the new name, path2 = the target as given (no directory travels for it) */
+    SBX_TRUNCATE = 22, /* path2 = the new length, an int64_t */
 };
 
 /* One call a learning lockdown let through: its number, its arguments, and the errno it would have had. */

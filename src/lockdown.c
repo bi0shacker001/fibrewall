@@ -451,13 +451,15 @@ static long exchange(struct sbx_request *request, const int *extra, int extra_co
 
 static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const char *path2,
                     int flags, uint32_t mode, void *out, size_t out_len) {
-    if (path == NULL || (op == SBX_RENAME && path2 == NULL)) return -EFAULT;
+    /* A rename's or link's second name, or a symlink's target; a utimensat's times or a truncate's length as bytes. */
+    int named2 = op == SBX_RENAME || op == SBX_LINK || op == SBX_SYMLINK;
+    if (path == NULL || (named2 && path2 == NULL)) return -EFAULT;
     size_t length = strnlen(path, SBX_PATH_MAX);
-    /* A rename's second name; a utimensat's two times travel in the same place, as bytes. */
-    size_t length2 = op == SBX_RENAME ? strnlen(path2, SBX_PATH_MAX)
-                   : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec) : 0;
+    size_t length2 = named2 ? strnlen(path2, SBX_PATH_MAX)
+                   : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec)
+                   : op == SBX_TRUNCATE ? sizeof(int64_t) : 0;
     if (length == SBX_PATH_MAX || length2 == SBX_PATH_MAX) return -ENAMETOOLONG;
-    if (length == 0 || (op == SBX_RENAME && length2 == 0)) return -ENOENT;
+    if (length == 0 || (named2 && length2 == 0)) return -ENOENT;
 
     struct sbx_request request;
     memset(&request, 0, sizeof(request));
@@ -475,7 +477,7 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
         extra[count++] = dirfd == AT_FDCWD ? current_directory() : dirfd;
         request.dirfd_sent = 1;
     }
-    if (op == SBX_RENAME && path2[0] != '/') {
+    if ((op == SBX_RENAME || op == SBX_LINK) && path2[0] != '/') {
         extra[count++] = dirfd2 == AT_FDCWD ? current_directory() : dirfd2;
         request.dirfd2_sent = 1;
     }
@@ -635,6 +637,22 @@ static long rename_path(int dirfd, const char *path, int dirfd2, const char *pat
         return kernel(syscall(__NR_renameat2, PASS_DIRFD, where, PASS_DIRFD, where2, flags));
     }
     return forward(SBX_RENAME, dirfd, path, dirfd2, path2, flags, 0, NULL, 0);
+}
+
+/* SBX_LOCK_PATHOPS: the broker makes these; without it the filter refuses them before they get here. */
+static long link_path(int dirfd, const char *path, int dirfd2, const char *path2, int flags) {
+    if (flags & ~AT_SYMLINK_FOLLOW) return -EINVAL;
+    return forward(SBX_LINK, dirfd, path, dirfd2, path2, flags, 0, NULL, 0);
+}
+
+static long symlink_path(const char *target, int dirfd, const char *path) {
+    return forward(SBX_SYMLINK, dirfd, path, AT_FDCWD, target, 0, 0, NULL, 0);
+}
+
+static long truncate_path(const char *path, long length) {
+    if (length < 0) return -EINVAL;
+    int64_t wanted = length;
+    return forward(SBX_TRUNCATE, AT_FDCWD, path, 0, (const char *) &wanted, 0, 0, NULL, 0);
 }
 
 static long statfs_path(const char *path, struct statfs *out, char *buffer) {
@@ -954,6 +972,12 @@ static long dispatch(long nr, ucontext_t *uc) {
         return utimens_path((int) a0, (const char *) a1, (const struct timespec *) a2, (int) a3, buffer);
     case __NR_getdents64:
         return list_directory((int) a0, (void *) a1, (unsigned) a2);
+    case __NR_linkat:
+        return link_path((int) a0, (const char *) a1, (int) a2, (const char *) a3, (int) a4);
+    case __NR_symlinkat:
+        return symlink_path((const char *) a0, (int) a1, (const char *) a2);
+    case __NR_truncate:
+        return truncate_path((const char *) a0, a1);
     case __NR_socket:
         return net_socket((int) a0, (int) a1, (int) a2);
     case __NR_connect:
@@ -991,6 +1015,10 @@ static long dispatch(long nr, ucontext_t *uc) {
         return rename_path(AT_FDCWD, (const char *) a0, AT_FDCWD, (const char *) a1, 0, buffer);
     case __NR_chmod:
         return chmod_path(AT_FDCWD, (const char *) a0, (uint32_t) a1, buffer);
+    case __NR_link:
+        return link_path(AT_FDCWD, (const char *) a0, AT_FDCWD, (const char *) a1, 0);
+    case __NR_symlink:
+        return symlink_path((const char *) a0, AT_FDCWD, (const char *) a1);
 #endif
     default:
         return -ENOSYS;
@@ -1313,7 +1341,20 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
 #endif
     };
     if (!unbrokered && !pass) {
-        for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) rule(refused_paths[i], REFUSE);
+        /* SBX_LOCK_PATHOPS sends link, symlink and truncate to the broker; SBX_LOCK_INOTIFY lets marks through. */
+        static const unsigned pathops[] = {
+            __NR_truncate, __NR_linkat, __NR_symlinkat,
+#ifdef __NR_link
+            __NR_link, __NR_symlink,
+#endif
+        };
+        if (flags & SBX_LOCK_PATHOPS) {
+            for (size_t i = 0; i < sizeof(pathops) / sizeof(pathops[0]); i++) rule(pathops[i], TRAP);
+        }
+        for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) {
+            if (refused_paths[i] == __NR_inotify_add_watch && (flags & SBX_LOCK_INOTIFY)) continue;
+            rule(refused_paths[i], REFUSE);
+        }
     }
     /* Refused: reaching past the process. */
     static const unsigned refused[] = {
@@ -1329,7 +1370,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
         __NR_keyctl, __NR_add_key, __NR_request_key, __NR_kcmp, __NR_pidfd_open, __NR_pidfd_getfd,
-        __NR_pidfd_send_signal, __NR_tkill,
+        __NR_pidfd_send_signal, __NR_tkill, __NR_init_module, __NR_finit_module, __NR_delete_module,
     };
     for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) rule(denied[i], DENY);
     ret(ALLOW);

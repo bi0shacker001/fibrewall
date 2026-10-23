@@ -585,8 +585,23 @@ stay refused as now, so no existing host changes behaviour.
 - `truncate(path, n)`: copy-up (without data when `n == 0`), then
   `truncate` of the upper's copy by the broker.
 
+**Built (2026-10-23, without layers):** `SBX_LOCK_PATHOPS` traps `linkat`,
+`symlinkat` and `truncate` (and `link`, `symlink` on x86_64) to the broker.
+Without layers, `link` needs **both** names writable (a link to a file the
+process may only read would let it write that file), `symlink` the new
+name, and `truncate` the file, which the broker opens non-blocking (a FIFO
+cannot hold it) and truncates. `linkat` with `AT_SYMLINK_FOLLOW` is decided
+on what the link resolves to. Copy-up joins these when layers are built.
+`SBX_LOCK_INOTIFY` lets `inotify_add_watch` through to the kernel: the
+owner's containment policy for Wine allows change notifications
+(Droidtop/tracker#584, 2026-10-23), at the cost that the process can learn
+the names of files changing in folders the rules do not grant (it can open
+none of them). `init_module`, `finit_module` and `delete_module` are on the
+refused list in every mode (the kernel refuses them anyway without
+`CAP_SYS_MODULE`; this keeps them refused if the process ever had it).
+
 Not brokered, still refused: `mknod`, `chown` and friends, xattrs on a path,
-`inotify`/`fanotify` marks (Wine's change notifications fail with the same
+`inotify`/`fanotify` marks without `SBX_LOCK_INOTIFY` (Wine's change notifications fail with the same
 error it already handles when `inotify` is unavailable; a later
 `SBX_WATCH` could add a mark on an `inotify` descriptor the process hands
 over, as the socket calls do).

@@ -526,6 +526,9 @@ static const char *op_name(uint32_t op) {
     case SBX_BIND: return "bind";
     case SBX_LISTEN: return "listen";
     case SBX_ACCEPT: return "accept";
+    case SBX_LINK: return "link";
+    case SBX_SYMLINK: return "symlink";
+    case SBX_TRUNCATE: return "truncate";
     default: return "unknown";
     }
 }
@@ -810,6 +813,51 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         if (parent < 0) { error = parent; break; }
         error = utimensat(parent, name, request->path2_len ? times : NULL, AT_SYMLINK_NOFOLLOW) == 0 ? 0 : -errno;
         close(parent);
+        break;
+    }
+    case SBX_LINK: {
+        /* Both names writable: a link to a file the process may only read would let it write that file. */
+        error = decide(&c, base, path, request->path_len, SBX_WRITE, (request->flags & AT_SYMLINK_FOLLOW) != 0, 0);
+        if (error != 0) break;
+        struct check c2 = c;
+        error = decide(&c2, base2, path2, request->path2_len, SBX_WRITE, 0, 1);
+        if (error != 0) break;
+        const char *name, *name2;
+        int parent = open_parent(&c, SBX_WRITE, &name);
+        if (parent < 0) { error = parent; break; }
+        int parent2 = open_parent(&c2, SBX_WRITE, &name2);
+        if (parent2 < 0) { close(parent); error = parent2; break; }
+        /* The existing name is already resolved, so nothing is left to follow. */
+        error = linkat(parent, name, parent2, name2, 0) == 0 ? 0 : -errno;
+        close(parent);
+        close(parent2);
+        break;
+    }
+    case SBX_SYMLINK: {
+        /* The target is stored as given: whatever later follows it is decided then. */
+        char target[SBX_PATH_MAX];
+        memcpy(target, path2, request->path2_len);
+        target[request->path2_len] = '\0';
+        error = decide(&c, base, path, request->path_len, SBX_WRITE, 0, 1);
+        if (error != 0) break;
+        const char *name;
+        int parent = open_parent(&c, SBX_WRITE, &name);
+        if (parent < 0) { error = parent; break; }
+        error = symlinkat(target, parent, name) == 0 ? 0 : -errno;
+        close(parent);
+        break;
+    }
+    case SBX_TRUNCATE: {
+        int64_t length;
+        memcpy(&length, path2, sizeof(length));
+        if (length < 0) { error = -EINVAL; break; }
+        error = decide(&c, base, path, request->path_len, SBX_WRITE, 1, 0);
+        if (error != 0) break;
+        /* Non-blocking, so a FIFO cannot hold the broker; the kernel then refuses to truncate it. */
+        int fd = open_decided(&c, O_WRONLY | O_NONBLOCK, 0, SBX_WRITE);
+        if (fd < 0) { error = fd; break; }
+        error = ftruncate(fd, (off_t) length) == 0 ? 0 : -errno;
+        close(fd);
         break;
     }
     case SBX_STATFS: {
@@ -1198,14 +1246,18 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         net_one(policy, request, body, body_len, fds, fd_count, pid);
         return;
     }
+    /* The second part: a name (rename, link), a target (symlink), bytes (utimens, truncate) or nothing. */
+    int named2 = request->op == SBX_RENAME || request->op == SBX_LINK || request->op == SBX_SYMLINK;
     if (request->version != SBX_PROTOCOL_VERSION ||
         (size_t) request->path_len + request->path2_len != body_len || request->path_len == 0 ||
         request->path_len >= SBX_PATH_MAX || request->path2_len >= SBX_PATH_MAX ||
         fd_count != 1 + request->dirfd_sent + request->dirfd2_sent ||
-        request->path2_len != (request->op == SBX_RENAME ? request->path2_len
+        (request->dirfd2_sent && request->op != SBX_RENAME && request->op != SBX_LINK) ||
+        request->path2_len != (named2 ? request->path2_len
                                : request->op == SBX_UTIMENS ? (request->path2_len ? 2 * sizeof(struct timespec) : 0)
+                               : request->op == SBX_TRUNCATE ? sizeof(int64_t)
                                : 0) ||
-        (request->op == SBX_RENAME && request->path2_len == 0)) {
+        (named2 && request->path2_len == 0)) {
         reply(answer, -EINVAL, NULL, 0, -1);
         return;
     }

@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -152,6 +153,34 @@ static int a_rename_out(void) {
     int error = result_of(rename(from, to));
     if (error == 0) rename(to, from);
     unlink(from);
+    return error;
+}
+/* Refused unless SBX_LOCK_PATHOPS (link, symlink, truncate) or SBX_LOCK_INOTIFY. */
+static int a_link(void) {
+    char from[400], to[400];
+    snprintf(from, sizeof(from), "%s/data.txt", game);
+    snprintf(to, sizeof(to), "%s/linked", save);
+    int error = result_of(link(from, to));
+    if (error == 0) unlink(to);
+    return error;
+}
+static int a_make_symlink(void) {
+    char to[400];
+    snprintf(to, sizeof(to), "%s/made-link", save);
+    int error = result_of(symlink("anything", to));
+    if (error == 0) unlink(to);
+    return error;
+}
+static int a_truncate(void) {
+    char p[400];
+    snprintf(p, sizeof(p), "%s/trunc.txt", save);
+    return result_of(truncate(p, 0));
+}
+static int a_inotify(void) {
+    int fd = inotify_init1(IN_CLOEXEC);
+    if (fd < 0) return errno;
+    int error = result_of(inotify_add_watch(fd, save, IN_CREATE));
+    close(fd);
     return error;
 }
 static int a_exec(void) {
@@ -279,6 +308,10 @@ static struct attempt attempts[] = {
     {"open /etc/hostname", a_etc, EACCES, 1, 0},
     {"open a read-only file for writing", a_write_game, EACCES, 0, 0},
     {"rename out of a writable rule", a_rename_out, EACCES, 0, 0},
+    {"link without SBX_LOCK_PATHOPS", a_link, EACCES, 0, 0},
+    {"symlink without SBX_LOCK_PATHOPS", a_make_symlink, EACCES, 0, 0},
+    {"truncate without SBX_LOCK_PATHOPS", a_truncate, EACCES, 0, 0},
+    {"inotify_add_watch without SBX_LOCK_INOTIFY", a_inotify, EACCES, 0, 0},
     {"execve", a_exec, EACCES, 0, 0},
     {"ptrace(ATTACH) a child", a_ptrace, EACCES, 1, 0},
     {"process_vm_readv the parent", a_vm_read, EACCES, 1, 0},
@@ -760,6 +793,86 @@ static int learn_check(void) {
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = 1;
     unlink(file);
     rmdir(folder);
+    return failed;
+}
+
+/* ---- SBX_LOCK_PATHOPS and SBX_LOCK_INOTIFY: link, symlink and truncate through the broker, marks allowed. ---- */
+
+static int pathops_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char source[400], hard[400], stolen[400], from_secret[400], sym[400], game_sym[400], followed[400];
+    char data[400], key[400];
+    snprintf(source, sizeof(source), "%s/p-source", save);
+    snprintf(hard, sizeof(hard), "%s/p-hard", save);
+    snprintf(stolen, sizeof(stolen), "%s/p-stolen", save);
+    snprintf(from_secret, sizeof(from_secret), "%s/p-secret", save);
+    snprintf(sym, sizeof(sym), "%s/p-sym", save);
+    snprintf(game_sym, sizeof(game_sym), "%s/p-sym", game);
+    snprintf(followed, sizeof(followed), "%s/p-followed", save);
+    snprintf(data, sizeof(data), "%s/data.txt", game);
+    snprintf(key, sizeof(key), "%s/key", secret);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_PATHOPS | SBX_LOCK_INOTIFY};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "pathops: lockdown");
+        if (locked != 0) _exit(1);
+        int fd = open(source, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+        EXPECT(fd >= 0 && write(fd, "four", 4) == 4, "pathops: a file in the writable rule");
+        if (fd >= 0) close(fd);
+        EXPECT(link(source, hard) == 0, "pathops: link between two writable names");
+        struct stat a, b;
+        EXPECT(stat(source, &a) == 0 && stat(hard, &b) == 0 && a.st_ino == b.st_ino, "pathops: and both name one file");
+        errno = 0;
+        EXPECT(refused(link(data, stolen)), "pathops: link of a read-only file into a writable rule is refused");
+        errno = 0;
+        EXPECT(refused(link(key, from_secret)), "pathops: link of a file outside the rules is refused");
+        EXPECT(symlink("../secret/key", sym) == 0, "pathops: symlink in the writable rule, target stored as given");
+        char target[64] = {0};
+        EXPECT(readlink(sym, target, sizeof(target) - 1) > 0 && strcmp(target, "../secret/key") == 0,
+               "pathops: readlink gives the target back unchanged");
+        errno = 0;
+        EXPECT(refused(open(sym, O_RDONLY)), "pathops: following it out of the rules is refused");
+        errno = 0;
+        EXPECT(refused(linkat(AT_FDCWD, sym, AT_FDCWD, followed, AT_SYMLINK_FOLLOW)),
+               "pathops: linkat following it out of the rules is refused");
+        errno = 0;
+        EXPECT(refused(symlink("anything", game_sym)), "pathops: symlink in a read-only rule is refused");
+        EXPECT(truncate(source, 2) == 0 && stat(source, &a) == 0 && a.st_size == 2, "pathops: truncate in the writable rule");
+        errno = 0;
+        EXPECT(refused(truncate(data, 0)), "pathops: truncate in a read-only rule is refused");
+        errno = 0;
+        EXPECT(refused(truncate(key, 0)), "pathops: truncate outside the rules is refused");
+        int watcher = inotify_init1(IN_CLOEXEC);
+        EXPECT(watcher >= 0 && inotify_add_watch(watcher, save, IN_CREATE) >= 0, "inotify: a mark with SBX_LOCK_INOTIFY");
+        if (watcher >= 0) close(watcher);
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    char content[16] = {0};
+    FILE *f = fopen(key, "r");
+    if (f) {
+        if (!fgets(content, sizeof(content), f)) content[0] = 0;
+        fclose(f);
+    }
+    int failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+    if (strcmp(content, "secret") != 0) {
+        printf("FAIL pathops: the file outside the rules was changed\n");
+        failed = 1;
+    }
+    unlink(source);
+    unlink(hard);
+    unlink(sym);
     return failed;
 }
 
@@ -1445,6 +1558,8 @@ int main(int argc, char **argv) {
     write_file(path, "granted");
     snprintf(path, sizeof(path), "%s/revoked.txt", save);
     write_file(path, "revoked");
+    snprintf(path, sizeof(path), "%s/trunc.txt", save);
+    write_file(path, "keep");
     snprintf(path, sizeof(path), "%s/key", secret);
     snprintf(link, sizeof(link), "%s/escape", game);
     if (symlink(path, link) != 0) { perror("symlink"); return 2; }
@@ -1458,7 +1573,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

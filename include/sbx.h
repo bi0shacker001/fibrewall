@@ -137,6 +137,22 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * broker (not with SBX_LOCK_UNBROKERED).
  */
 #define SBX_LOCK_LEARN 0x20u
+/*
+ * link, symlink and truncate by path go to the broker instead of being
+ * refused: link needs both names writable, symlink the new name (its
+ * target is stored as given and judged when something follows it),
+ * truncate the file. For Wine (dosdevices links, SetEndOfFile on a name).
+ * Without the broker (SBX_LOCK_UNBROKERED, SBX_LOCK_PASSTHROUGH) these
+ * calls go to the kernel already, so the flag changes nothing there.
+ */
+#define SBX_LOCK_PATHOPS 0x100u
+/*
+ * inotify marks (inotify_add_watch) are allowed, with the kernel deciding:
+ * the process may then learn the names of files changing in folders the
+ * rules do not grant, though it can open none of them. For Wine's change
+ * notifications. fanotify stays refused.
+ */
+#define SBX_LOCK_INOTIFY 0x200u
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
