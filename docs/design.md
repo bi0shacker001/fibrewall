@@ -768,6 +768,19 @@ changes behaviour:
    is what lets wineserver's socket, the X server, PulseAudio and the host's
    renderer sockets exist.
 
+**`SBX_LOCK_UNIX`, built (2026-10-23).** As planned, with these choices
+made in the code. Only stream and seqpacket Unix sockets are made (a
+datagram socket can `sendto` any path without a `connect`, so it stays
+`SBX_LOCK_LOG_SOCKET`'s alone). The broker reaches a path through the
+checked parent's descriptor (`/proc/self/fd/<parent>/<name>`), so a folder
+swapped after the check is not followed and `sun_path`'s 108 bytes do not
+limit the real path. A relative path is the process's current
+directory's, which travels as a descriptor. The peer sees the broker's
+credentials (`SO_PEERCRED`), the same UID. With `SBX_LOCK_INET` as well,
+inet `bind` and `connect` also trap (the filter cannot read the family) and
+go the brokered network's way under `sbx_policy_set_net`'s grants; `listen`
+and `accept` stay the process's own. Not with `SBX_LOCK_NET_BROKERED`.
+
 `SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
 four is "a program tree": it can run its own helpers and talk to the
 sockets the host named, and nothing else.

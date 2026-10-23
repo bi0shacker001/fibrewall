@@ -153,6 +153,24 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * notifications. fanotify stays refused.
  */
 #define SBX_LOCK_INOTIFY 0x200u
+/*
+ * Unix sockets of the process's own: socket(AF_UNIX, SOCK_STREAM or
+ * SOCK_SEQPACKET) is allowed, and bind and connect go to the broker, which
+ * decides a path like any other (bind needs it writable, connect readable;
+ * relative paths are the process's current directory's) or an abstract
+ * name by sbx_policy_add_unix_name, and makes the call on the process's
+ * socket. The server then sees the broker's credentials (SO_PEERCRED), the
+ * same UID. listen and accept are the process's own (the kernel refuses
+ * listen on an unbound socket). For wineserver, X, PulseAudio and a host's
+ * renderer sockets. Datagram Unix sockets stay SBX_LOCK_LOG_SOCKET's only,
+ * and with this flag their connect is decided by the broker too. The
+ * filter cannot tell an inet address from a Unix one, so with
+ * SBX_LOCK_INET as well, inet bind and connect also go to the broker,
+ * under sbx_policy_set_net's grants (and SBX_LOCK_INET may then be
+ * combined with SBX_LOCK_LOG_SOCKET). Needs the broker; not with
+ * SBX_LOCK_NET_BROKERED.
+ */
+#define SBX_LOCK_UNIX 0x80u
 
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
@@ -421,6 +439,16 @@ void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants);
  */
 #define SBX_SYSTEM_SOCKETS_MAX 8
 int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant);
+
+/*
+ * An abstract Unix socket name (without its leading NUL byte) that a
+ * process locked down with SBX_LOCK_UNIX may bind (mode SBX_WRITE) or
+ * connect to (SBX_READ). Abstract names belong to no folder, so no other
+ * rule covers them; none is allowed by default. At most
+ * SBX_UNIX_NAMES_MAX. Returns 0 or a negative errno.
+ */
+#define SBX_UNIX_NAMES_MAX 16
+int sbx_policy_add_unix_name(struct sbx_policy *policy, const char *name, unsigned mode);
 #endif
 
 /* Receives every decision with its result (0 or a negative errno). Defaults to logging refusals on stderr. */

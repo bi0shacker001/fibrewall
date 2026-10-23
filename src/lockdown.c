@@ -842,6 +842,42 @@ static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int 
     return passed;
 }
 
+/*
+ * SBX_LOCK_UNIX: bind and connect trap whatever the address, since the
+ * filter cannot read it. A Unix one goes to the broker with the socket
+ * (and the current directory for a relative path), which decides it and
+ * makes the call on that socket; an inet one (SBX_LOCK_INET as well) goes
+ * the brokered network's way, under the policy's network grants.
+ */
+static int unix_mode;
+
+static long unix_call(uint32_t op, int fd, const struct sockaddr *address, socklen_t length) {
+    if (address == NULL) return -EFAULT;
+    if ((int) length < (int) sizeof(sa_family_t) || length > sizeof(struct sockaddr_storage)) return -EINVAL;
+    int domain = socket_domain(fd);
+    if (domain < 0) return domain;
+    if (domain == AF_INET || domain == AF_INET6) {
+        return op == SBX_UNIX_CONNECT ? net_connect(fd, address, length) : net_bind(fd, address, length);
+    }
+    if (domain != AF_UNIX) return -EAFNOSUPPORT;
+    if (address->sa_family != AF_UNIX || length > sizeof(struct sockaddr_un)) return -EINVAL;
+    const struct sockaddr_un *un = (const struct sockaddr_un *) address;
+    int relative = length > offsetof(struct sockaddr_un, sun_path) && un->sun_path[0] != '/' && un->sun_path[0] != '\0';
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = (uint16_t) op;
+    request.path_len = (uint32_t) length;
+    request.tid = (int32_t) syscall(__NR_gettid);
+    request.dirfd_sent = 1;
+    request.dirfd2_sent = (uint8_t) relative;
+    int extra[2] = {fd, current_directory()};
+    int passed;
+    long result = exchange(&request, extra, relative ? 2 : 1, address, length, NULL, 0, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
 /* SIGSYS as a bit of the kernel's 64-bit signal mask. */
 #define SIGSYS_BIT (1ULL << (SIGSYS - 1))
 
@@ -981,8 +1017,10 @@ static long dispatch(long nr, ucontext_t *uc) {
     case __NR_socket:
         return net_socket((int) a0, (int) a1, (int) a2);
     case __NR_connect:
+        if (unix_mode) return unix_call(SBX_UNIX_CONNECT, (int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
         return net_connect((int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
     case __NR_bind:
+        if (unix_mode) return unix_call(SBX_UNIX_BIND, (int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
         return net_bind((int) a0, (const struct sockaddr *) a1, (socklen_t) a2);
     case __NR_listen:
         return net_listen((int) a0, (int) a1);
@@ -1145,6 +1183,41 @@ static void passthrough_block(unsigned nr, int two_directories) {
     ret(TRAP);
 }
 
+/*
+ * socket() with SBX_LOCK_UNIX: Unix stream and seqpacket sockets, a Unix
+ * datagram one with SBX_LOCK_LOG_SOCKET, inet stream and datagram ones with
+ * SBX_LOCK_INET; nothing else. One block per family: if the family
+ * matches, the type (without its flags) decides; every path returns.
+ */
+static void socket_rule(unsigned flags) {
+    struct family {
+        unsigned domain;
+        unsigned types[3];
+        unsigned count;
+    } families[3];
+    unsigned family_count = 0;
+    families[family_count++] = (struct family) {AF_UNIX, {SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM},
+                                                (flags & SBX_LOCK_LOG_SOCKET) ? 3u : 2u};
+    if (flags & SBX_LOCK_INET) {
+        families[family_count++] = (struct family) {AF_INET, {SOCK_STREAM, SOCK_DGRAM, 0}, 2};
+        families[family_count++] = (struct family) {AF_INET6, {SOCK_STREAM, SOCK_DGRAM, 0}, 2};
+    }
+    unsigned total = 2;  /* the load of the domain and the final refusal */
+    for (unsigned f = 0; f < family_count; f++) total += 5 + families[f].count;
+    jeq(__NR_socket, 0, (unsigned char) total);
+    load(ARG_LO(0));
+    for (unsigned f = 0; f < family_count; f++) {
+        unsigned count = families[f].count;
+        jeq(families[f].domain, 0, (unsigned char) (4 + count));
+        load(ARG_LO(1));
+        emit((struct sock_filter) BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf));
+        for (unsigned t = 0; t < count; t++) jeq(families[f].types[t], (unsigned char) (count - t), 0);
+        ret(REFUSE);
+        ret(ALLOW);
+    }
+    ret(REFUSE);
+}
+
 static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
     int learn = (flags & SBX_LOCK_LEARN) != 0;
@@ -1261,9 +1334,16 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         rule(__NR_accept, TRAP);
 #endif
     }
+    if (flags & SBX_LOCK_UNIX) {
+        /* The address is in memory the filter cannot read: the handler sends each to the broker. */
+        rule(__NR_connect, TRAP);
+        rule(__NR_bind, TRAP);
+    }
     /* A Unix datagram socket for the system log, or inet sockets, when asked; no other socket. */
     if (flags & SBX_LOCK_NET_BROKERED) {
         /* decided above */
+    } else if (flags & SBX_LOCK_UNIX) {
+        socket_rule(flags);
     } else if (flags & SBX_LOCK_LOG_SOCKET) {
         jeq(__NR_socket, 0, 7);
         load(ARG_LO(0));
@@ -1461,7 +1541,14 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (unbrokered && pass) return -EINVAL;
     /* Learning sends every record to the broker. */
     if ((options->flags & SBX_LOCK_LEARN) && unbrokered) return -EINVAL;
-    if ((options->flags & SBX_LOCK_INET) && (options->flags & SBX_LOCK_LOG_SOCKET)) return -EINVAL;
+    /* With SBX_LOCK_UNIX, bind goes to the broker, so the log's Unix socket can no longer take a name unseen. */
+    if ((options->flags & SBX_LOCK_INET) && (options->flags & SBX_LOCK_LOG_SOCKET) && !(options->flags & SBX_LOCK_UNIX)) {
+        return -EINVAL;
+    }
+    /* Brokered Unix sockets need the broker, and are not the brokered network's (which has its own Unix rules). */
+    if ((options->flags & SBX_LOCK_UNIX) && (options->flags & (SBX_LOCK_UNBROKERED | SBX_LOCK_NET_BROKERED))) {
+        return -EINVAL;
+    }
     /* The broker's network needs the broker, and replaces the process's own. */
     if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;
     if (unbrokered) broker_fd = -1;
@@ -1517,6 +1604,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         claim_count++;
     }
     passthrough = pass;
+    unix_mode = (options->flags & SBX_LOCK_UNIX) != 0;
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));

@@ -876,6 +876,149 @@ static int pathops_check(void) {
     return failed;
 }
 
+/* ---- SBX_LOCK_UNIX: Unix sockets of the process's own, bound and connected by the broker. ---- */
+
+/* A path into sun_path, cut to fit (the test's paths are short). */
+static void sun_path_set(struct sockaddr_un *address, const char *path) {
+    size_t n = strnlen(path, sizeof(address->sun_path) - 1);
+    memcpy(address->sun_path, path, n);
+    address->sun_path[n] = '\0';
+}
+
+static int unix_listener(const char *path) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    sun_path_set(&address, path);
+    unlink(path);
+    if (s < 0 || bind(s, (struct sockaddr *) &address, sizeof(address)) != 0 || listen(s, 8) != 0) {
+        if (s >= 0) close(s);
+        return -1;
+    }
+    return s;
+}
+
+static int unix_try(int bind_it, const char *path, int abstract) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return -errno;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    socklen_t length;
+    if (abstract) {
+        size_t n = strlen(path);
+        memcpy(address.sun_path + 1, path, n);
+        length = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + n);
+    } else {
+        sun_path_set(&address, path);
+        length = sizeof(address);
+    }
+    int r = bind_it ? bind(s, (struct sockaddr *) &address, length) : connect(s, (struct sockaddr *) &address, length);
+    int error = r == 0 ? 0 : -errno;
+    close(s);
+    return error;
+}
+
+static int unix_check(void) {
+    char inside[400], outside[400], sock_link[400], made[400];
+    snprintf(inside, sizeof(inside), "%s/server.sock", game);
+    snprintf(outside, sizeof(outside), "%s/server.sock", secret);
+    snprintf(sock_link, sizeof(sock_link), "%s/sock-link", save);
+    snprintf(made, sizeof(made), "%s/child.sock", save);
+    int inside_server = unix_listener(inside), outside_server = unix_listener(outside);
+    unlink(sock_link);
+    if (inside_server < 0 || outside_server < 0 || symlink(outside, sock_link) != 0) {
+        printf("FAIL unix: could not set up the servers\n");
+        return 1;
+    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    EXPECT(sbx_policy_add_unix_name(policy, "sbx-test-name", SBX_READ | SBX_WRITE) == 0, "unix: an abstract name in the policy");
+    EXPECT(sbx_policy_add_unix_name(policy, "", SBX_READ) == -EINVAL, "unix: an empty abstract name is refused");
+    sbx_policy_set_net(policy, SBX_NET_CONNECT | SBX_NET_LISTEN);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNIX | SBX_LOCK_UNBROKERED};
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "unix: not without the broker");
+        options.flags = SBX_LOCK_UNIX | SBX_LOCK_NET_BROKERED;
+        EXPECT(sbx_lockdown(pair[1], &options) == -EINVAL, "unix: not with the brokered network");
+        options.flags = SBX_LOCK_UNIX | SBX_LOCK_INET;
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "unix: lockdown with SBX_LOCK_INET as well");
+        if (locked != 0) _exit(1);
+        errno = 0;
+        EXPECT(refused(socket(AF_UNIX, SOCK_DGRAM, 0)), "unix: a datagram socket is still refused");
+        errno = 0;
+        EXPECT(refused(socket(AF_NETLINK, SOCK_RAW, 0)), "unix: netlink is still refused");
+        int seq = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        EXPECT(seq >= 0, "unix: a seqpacket socket");
+        if (seq >= 0) close(seq);
+        EXPECT(unix_try(0, inside, 0) == 0, "unix: connect to a socket in a readable rule");
+        EXPECT(unix_try(0, outside, 0) == -EACCES, "unix: connect to a socket outside the rules is refused");
+        EXPECT(unix_try(0, sock_link, 0) == -EACCES, "unix: connect through a link leading out is refused");
+        EXPECT(unix_try(1, inside, 0) == -EACCES, "unix: bind in a read-only rule is refused");
+        EXPECT(unix_try(1, "sbx-test-other", 1) == -EACCES, "unix: bind of an abstract name the policy lacks is refused");
+        EXPECT(unix_try(0, "sbx-test-other", 1) == -EACCES, "unix: connect to one is refused");
+
+        /* A server of its own in the writable rule, and a client of it. */
+        int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un address = {.sun_family = AF_UNIX};
+        sun_path_set(&address, made);
+        EXPECT(server >= 0 && bind(server, (struct sockaddr *) &address, sizeof(address)) == 0, "unix: bind in the writable rule");
+        EXPECT(listen(server, 4) == 0, "unix: listen on it");
+        int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        EXPECT(client >= 0 && connect(client, (struct sockaddr *) &address, sizeof(address)) == 0, "unix: connect to it");
+        int accepted = accept4(server, NULL, NULL, SOCK_CLOEXEC);
+        char byte = 0;
+        EXPECT(accepted >= 0 && write(client, "u", 1) == 1 && read(accepted, &byte, 1) == 1 && byte == 'u',
+               "unix: bytes cross it");
+        if (accepted >= 0) close(accepted);
+        if (client >= 0) close(client);
+        if (server >= 0) close(server);
+        EXPECT(chdir(save) == 0 && unix_try(1, "relative.sock", 0) == 0, "unix: bind of a relative path in the writable rule");
+        int named = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un abstract = {.sun_family = AF_UNIX};
+        memcpy(abstract.sun_path + 1, "sbx-test-name", 13);
+        socklen_t abstract_length = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + 13);
+        EXPECT(named >= 0 && bind(named, (struct sockaddr *) &abstract, abstract_length) == 0 && listen(named, 2) == 0,
+               "unix: bind and listen on an abstract name the policy lists");
+        EXPECT(unix_try(0, "sbx-test-name", 1) == 0, "unix: connect to it");
+        if (named >= 0) close(named);
+
+        /* Inet, through the broker under its network grants. */
+        int inet = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in loopback = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        socklen_t loopback_length = sizeof(loopback);
+        EXPECT(inet >= 0 && bind(inet, (struct sockaddr *) &loopback, sizeof(loopback)) == 0 && listen(inet, 2) == 0 &&
+                   getsockname(inet, (struct sockaddr *) &loopback, &loopback_length) == 0,
+               "unix+inet: bind and listen on 127.0.0.1 through the broker");
+        int inet_client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        EXPECT(inet_client >= 0 && connect(inet_client, (struct sockaddr *) &loopback, sizeof(loopback)) == 0,
+               "unix+inet: connect to it through the broker");
+        if (inet_client >= 0) close(inet_client);
+        if (inet >= 0) close(inet);
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    close(inside_server);
+    close(outside_server);
+    unlink(inside);
+    unlink(outside);
+    unlink(sock_link);
+    unlink(made);
+    char relative[400];
+    snprintf(relative, sizeof(relative), "%s/relative.sock", save);
+    unlink(relative);
+    if (WIFSIGNALED(status)) printf("FAIL unix: the child died by signal %d\n", WTERMSIG(status));
+    return !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -1573,7 +1716,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

@@ -100,6 +100,11 @@ struct sbx_policy {
     char *system_paths[SBX_SYSTEM_SOCKETS_MAX];
     unsigned system_grants[SBX_SYSTEM_SOCKETS_MAX];
     unsigned system_count;
+    /* SBX_LOCK_UNIX's abstract names: the name's bytes (no leading NUL) and the mode. */
+    char *unix_names[SBX_UNIX_NAMES_MAX];
+    size_t unix_name_lengths[SBX_UNIX_NAMES_MAX];
+    unsigned unix_name_modes[SBX_UNIX_NAMES_MAX];
+    unsigned unix_name_count;
 };
 
 static void default_audit(void *context, const struct sbx_access *access, int result) {
@@ -123,6 +128,7 @@ void sbx_policy_free(struct sbx_policy *policy) {
         free(policy->aliases[i].real_path);
     }
     for (unsigned i = 0; i < policy->system_count; i++) free(policy->system_paths[i]);
+    for (unsigned i = 0; i < policy->unix_name_count; i++) free(policy->unix_names[i]);
     free(policy->rules);
     free(policy->aliases);
     free(policy);
@@ -529,6 +535,8 @@ static const char *op_name(uint32_t op) {
     case SBX_LINK: return "link";
     case SBX_SYMLINK: return "symlink";
     case SBX_TRUNCATE: return "truncate";
+    case SBX_UNIX_BIND: return "bind";
+    case SBX_UNIX_CONNECT: return "connect";
     default: return "unknown";
     }
 }
@@ -1034,6 +1042,115 @@ static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *a
     }
 }
 
+static int socket_domain(int fd);
+
+int sbx_policy_add_unix_name(struct sbx_policy *policy, const char *name, unsigned mode) {
+    size_t length = name ? strlen(name) : 0;
+    if (!policy || length == 0 || (mode & ~MODE_BITS) || mode == SBX_DENY) return -EINVAL;
+    if (length >= sizeof(((struct sockaddr_un *) 0)->sun_path)) return -ENAMETOOLONG;
+    if (policy->unix_name_count >= SBX_UNIX_NAMES_MAX) return -ENOSPC;
+    char *copy = strdup(name);
+    if (!copy) return -ENOMEM;
+    policy->unix_names[policy->unix_name_count] = copy;
+    policy->unix_name_lengths[policy->unix_name_count] = length;
+    policy->unix_name_modes[policy->unix_name_count] = mode;
+    policy->unix_name_count++;
+    return 0;
+}
+
+/*
+ * SBX_LOCK_UNIX: bind or connect of the process's own Unix socket (fds[1]).
+ * A path is decided like any other (bind: writable, and created; connect:
+ * readable, following links) and reached through the checked parent's
+ * descriptor, as /proc/self/fd/<parent>/<name>: no race with a swapped
+ * folder, and no limit from sun_path's length on the real path. An
+ * abstract name needs sbx_policy_add_unix_name; an empty address (bind
+ * with the family alone) asks the kernel for a fresh abstract name, which
+ * reaches nothing.
+ */
+static void unix_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                     size_t body_len, int *fds, int fd_count, pid_t pid) {
+    int answer = fds[0];
+    int binding = request->op == SBX_UNIX_BIND;
+    size_t offset = offsetof(struct sockaddr_un, sun_path);
+    if (request->path2_len != 0 || request->path_len != body_len || body_len < sizeof(sa_family_t) ||
+        body_len > sizeof(struct sockaddr_un) || !request->dirfd_sent ||
+        fd_count != 1 + request->dirfd_sent + request->dirfd2_sent) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    int subject = fds[1];
+    if (socket_domain(subject) != AF_UNIX) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    memcpy(&address, body, body_len);
+    if (address.sun_family != AF_UNIX) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+    size_t n = body_len > offset ? body_len - offset : 0;
+    int result;
+    if (n == 0) {
+        /* bind with the family alone: the kernel picks an unused abstract name. connect needs a name. */
+        result = binding ? (bind(subject, (struct sockaddr *) &address, (socklen_t) body_len) == 0 ? 0 : -errno) : -EINVAL;
+        reply(answer, result, NULL, 0, -1);
+        return;
+    }
+    unsigned need = binding ? SBX_WRITE : SBX_READ;
+    if (address.sun_path[0] == '\0') {
+        /* An abstract name: only one the policy lists. */
+        char words[2 * sizeof(address.sun_path) + 2];
+        words[0] = '@';
+        size_t w = 1;
+        for (size_t i = 1; i < n && w + 1 < sizeof(words); i++) words[w++] = address.sun_path[i] ? address.sun_path[i] : '@';
+        words[w] = '\0';
+        unsigned mode = SBX_DENY;
+        for (unsigned i = 0; i < policy->unix_name_count; i++) {
+            if (policy->unix_name_lengths[i] == n - 1 && memcmp(policy->unix_names[i], address.sun_path + 1, n - 1) == 0) {
+                mode = policy->unix_name_modes[i];
+            }
+        }
+        result = net_decide(policy, request->op, words, pid, permits(mode, need) ? 0 : -EACCES);
+        if (result == 0) {
+            int done = binding ? bind(subject, (struct sockaddr *) &address, (socklen_t) body_len)
+                               : connect(subject, (struct sockaddr *) &address, (socklen_t) body_len);
+            result = done == 0 ? 0 : -errno;
+        }
+        reply(answer, result, NULL, 0, -1);
+        return;
+    }
+    size_t length = strnlen(address.sun_path, n);
+    char base[SBX_PATH_MAX] = "/";
+    if (request->dirfd2_sent) {
+        if (fd_path(fds[2], base) != 0 || base[0] != '/') { reply(answer, -ENOTDIR, NULL, 0, -1); return; }
+    }
+    struct check c;
+    c.policy = policy;
+    c.op = request->op;
+    c.pid = pid;
+    c.tid = request->tid;
+    c.flags = 0;
+    result = decide(&c, base, address.sun_path, length, need, !binding, binding);
+    if (result == 0) {
+        const char *name;
+        int parent = open_parent(&c, need, &name);
+        if (parent < 0) {
+            result = parent;
+        } else {
+            struct sockaddr_un via;
+            memset(&via, 0, sizeof(via));
+            via.sun_family = AF_UNIX;
+            int written = snprintf(via.sun_path, sizeof(via.sun_path), "/proc/self/fd/%d/%s", parent, name);
+            if (written < 0 || (size_t) written >= sizeof(via.sun_path)) {
+                result = -ENAMETOOLONG;
+            } else {
+                int done = binding ? bind(subject, (struct sockaddr *) &via, sizeof(via))
+                                   : connect(subject, (struct sockaddr *) &via, sizeof(via));
+                result = done == 0 ? 0 : -errno;
+            }
+            close(parent);
+        }
+    }
+    reply(answer, result, NULL, 0, -1);
+}
+
 static int socket_domain(int fd) {
     int domain = 0;
     socklen_t length = sizeof(domain);
@@ -1240,6 +1357,10 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
     if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_LEARN) {
         if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
         learn_one(policy, body, body_len, pid, answer);
+        return;
+    }
+    if (request->version == SBX_PROTOCOL_VERSION && (request->op == SBX_UNIX_BIND || request->op == SBX_UNIX_CONNECT)) {
+        unix_one(policy, request, body, body_len, fds, fd_count, pid);
         return;
     }
     if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {

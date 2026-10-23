@@ -66,6 +66,13 @@ enum sbx_op {
     SBX_LINK = 20,     /* path = the existing name, path2 = the new one; flags = AT_SYMLINK_FOLLOW or 0 */
     SBX_SYMLINK = 21,  /* path = the new name, path2 = the target as given (no directory travels for it) */
     SBX_TRUNCATE = 22, /* path2 = the new length, an int64_t */
+    /*
+     * SBX_LOCK_UNIX. body = the struct sockaddr_un as the process gave it; the process's socket is the first
+     * descriptor after the answer socket (dirfd_sent = 1), and its current directory the second
+     * (dirfd2_sent = 1) when the path is relative. The broker binds or connects that same socket.
+     */
+    SBX_UNIX_BIND = 23,
+    SBX_UNIX_CONNECT = 24,
 };
 
 /* One call a learning lockdown let through: its number, its arguments, and the errno it would have had. */
