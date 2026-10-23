@@ -294,11 +294,13 @@ static void broker_checks(void) {
         DWORD wrote = 0;
         check("and writes it", WriteFile(handle, "put", 3, &wrote, NULL) && wrote == 3);
         CloseHandle(handle);
+        word[0] = 0;
         r = sbx_open(path, SBX_OPEN_READ, &handle);
         if (r == 0) {
             read_word(handle, word, sizeof(word));
             CloseHandle(handle);
         }
+        if (r != 0 || strcmp(word, "put") != 0) printf("info reading it back: sbx_open %d, read \"%s\"\n", r, word);
         check("which reads back", r == 0 && strcmp(word, "put") == 0);
     }
     check("SBX_OPEN_EXCLUSIVE refuses an existing file",
@@ -433,7 +435,7 @@ static void confined_run(int less, const struct result *control, size_t control_
         char game8[MAX_PATH * 3], save8[MAX_PATH * 3];
         utf8_path(game8, sizeof(game8), L"game");
         utf8_path(save8, sizeof(save8), L"save");
-        EXPECT(sbx_policy_add(policy, game8, SBX_READ) == 0 && sbx_policy_add(policy, save8, SBX_WRITE) == 0 &&
+        EXPECT(sbx_policy_add(policy, game8, SBX_READ) == 0 && sbx_policy_add(policy, save8, SBX_READ | SBX_WRITE) == 0 &&
                    sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC) == 0,
                "the policy");
         sbx_policy_set_audit(policy, count_refusals, NULL);
