@@ -168,7 +168,7 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * handler (each new image must); a replaced handler only loses its own
  * file access, since the filter refuses what it would have forwarded.
  */
-#define SBX_LOCK_EXEC 0x40u
+#define SBX_LOCK_EXEC 0x1000u
 /*
  * Unix sockets of the process's own: socket(AF_UNIX, SOCK_STREAM or
  * SOCK_SEQPACKET) is allowed, and bind and connect go to the broker, which
