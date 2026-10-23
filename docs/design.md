@@ -1057,6 +1057,168 @@ real lockdown answers, and a new SIGSYS handler is still refused. A real
 lockdown in the same run still refuses all of them, and the trampoline is
 not let through by its filter.
 
+## Windows (design, 2026-10-23, Droidtop/tracker#606)
+
+Computer-side plugins (droidtop's Python plugins reused in droidtop-agent
+and Pythia) run on Windows too, and the owner's rule is that a call that is
+not allowed cannot run. Python is not trusted: `ctypes`, raw sockets and
+`subprocess` must all end at a refusal from the kernel. Windows comes first
+("Windows, for now", owner, 2026-10-23). **macOS is later**, not built and
+not designed beyond this line: a deny-by-default Seatbelt profile under the
+same broker and the same client call, when the owner asks for it.
+
+### What Windows offers, and why this shape
+
+Windows has no seccomp and no way to trap a system call in user space, and
+a running process cannot be moved into an AppContainer. So confinement is
+decided **at spawn**, by the trusted parent, and the confined process asks
+the broker **explicitly** for what it needs: an open by path that the
+AppContainer's token does not allow is simply refused by the kernel, never
+forwarded. The reference is Chromium's Windows sandbox (a restricted token
+or AppContainer, a job object, a broker that opens and duplicates handles),
+without its interception layer: Chromium patches `NtCreateFile` and friends
+to forward calls, and we do not, because the plugin API already asks for
+files explicitly (`droidtop.host.open`) and an interception layer is a
+second path mechanism to keep correct.
+
+| Wall | Mechanism | What it stops |
+| --- | --- | --- |
+| Identity | an **AppContainer** with **no capabilities**; a **less-privileged AppContainer** (LPAC, `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`, Windows 10 1703+) where available | every file, registry key, named object and device whose ACL does not name the container's SID (LPAC: not even the `ALL APPLICATION PACKAGES` grants most of the system carries); every network connection, loopback included (no `internetClient`, `privateNetworkClientServer`) |
+| Process tree | `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` = restricted, and a **job object**: one active process, no breakaway, kill on close, die on unhandled exception | new processes (both walls refuse them), outliving the host |
+| UI | the job's UI limits: desktop, display settings, exit Windows, global atoms, user handles, clipboard read and write, system parameters | reaching other windows and the clipboard |
+| Memory | the job's per-process memory limit (`sbx_spawn_spec.memory_limit`) | exhausting the computer's memory |
+| Handles | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: the child inherits exactly the handles in the spec (standard handles and the broker channel) | inheriting the parent's other handles |
+
+### The broker on Windows
+
+The broker runs on a thread of the trusted parent. Its channel is a
+**message-mode named pipe** the parent creates under a random name, with
+one instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`),
+and connects to itself at once; the child inherits the client end. No one
+can connect to it by name afterwards, and the container could not open it
+by name anyway. The child finds its end through the environment variable
+`SBX_BROKER` (the handle's value).
+
+A request is `{version, op, flags, path}` (UTF-8, at most `SBX_PATH_MAX`
+bytes); the reply is `{result, handle}`. For an allowed open the broker:
+
+1. converts the path to an absolute one (`GetFullPathNameW`) and refuses a
+   device or `\\?\` form, then matches it against the rules,
+   **case-insensitively** (Windows rules are case-insensitive by default);
+2. opens the parent folder under **its own identity**, and checks the
+   folder's final path (`GetFinalPathNameByHandleW`) still lies under the
+   rule: a junction or symlink anywhere above the leaf that leads out is
+   refused;
+3. opens the leaf **relative to that folder handle** (`NtCreateFile` with a
+   root directory) without following a reparse point; a leaf that is a
+   reparse point is refused when writing, and when reading is followed only
+   if its final path lies under the same rule;
+4. asks the decider, as on Linux, and reports to the audit;
+5. duplicates the handle into the child (`DuplicateHandle` with exactly the
+   access asked for: read, write, or a folder's list access; never
+   `DELETE`, `WRITE_DAC` or `WRITE_OWNER`), closing its own copy.
+
+A handle carries only its own access. A folder handle does not open what is
+under it: an open relative to it is still checked against the container's
+token, and refused. So every file is a request, and the broker's checks are
+the only way in.
+
+Only open is brokered at first, which is what the plugin API needs
+(`droidtop.host.open`, reading and writing within a granted folder, and a
+folder's listing through a folder handle). mkdir, unlink and rename are
+added the same way when a host needs them; they cannot be done through a
+handle the broker gave, because the container lacks access to the folder.
+
+### Static read-only grants
+
+The confined program must load its own code (the bundled Python runtime
+and its standard library) through the loader, which opens by path and
+cannot ask the broker. Such a folder is marked
+`sbx_policy_add(policy, path, SBX_READ | SBX_STATIC)`: at spawn, the folder
+gets an access-control entry for the container's SID granting read and
+execute, inherited by everything under it. On Linux and Android
+`SBX_STATIC` is ignored and the rule is an ordinary brokered read rule.
+
+The entry stays on the folder after the process ends, keyed to the
+container's SID (Windows applications and Chromium do the same); it grants
+nothing to any other container or user. A static grant can only be
+`SBX_READ`: `sbx_spawn` refuses a static rule that also allows writing.
+
+### API
+
+The cross-platform shape: confinement at spawn, a client call for files,
+and a portable handle type. Linux and Android keep `sbx_lockdown`, the trap
+and `SCM_RIGHTS` exactly as they are.
+
+```c
+typedef int sbx_handle;        /* POSIX: a descriptor */
+typedef void *sbx_handle;      /* Windows: a HANDLE */
+
+/* Client (the confined process). Linux and Android: open(), which the
+   lockdown traps and the broker answers. Windows: a request on the
+   inherited channel. Returns 0 and *out, or a negative errno. */
+int sbx_open(const char *path, unsigned flags, sbx_handle *out);
+/* flags: SBX_OPEN_READ, _WRITE, _CREATE, _TRUNCATE, _EXCLUSIVE, _APPEND, _DIRECTORY */
+
+/* Windows: confinement at spawn. */
+struct sbx_spawn_spec {
+    const char *path;                 /* UTF-8 */
+    char *const *argv, *const *envp;  /* envp NULL: only SBX_BROKER */
+    const sbx_handle *handles; unsigned handle_count;  /* inherited as they are */
+    sbx_handle std_in, std_out, std_err;               /* NULL: none */
+    const char *container;            /* the AppContainer profile's name, created when missing */
+    int less_privileged;              /* LPAC where the system has it */
+    unsigned long long memory_limit;  /* bytes; 0: no limit */
+    struct sbx_policy *policy;        /* the broker's rules; NULL: no broker */
+};
+struct sbx_process { sbx_handle process, job; unsigned long pid; int less_privileged; };
+int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out);
+int sbx_process_wait(struct sbx_process *process, int *exit_code); /* then closes the job: the tree dies */
+```
+
+`sbx_spawn` keeps its Linux form (`pid_t *`, descriptors 3 and up,
+`RLIMIT_*`); the spec is per system, as each system's limits and handles
+are. On Windows the broker is started by `sbx_spawn` itself when the spec
+has a policy, since it needs the child's process handle to duplicate into;
+it serves until the child closes its end, then frees the policy. Rule paths
+on Windows are absolute drive or UNC paths. `sbx_policy_alias`,
+`sbx_policy_set_net` and system sockets are Linux and Android only.
+
+**Fail closed.** `sbx_spawn` returns an error, and starts nothing, when any
+wall cannot be put up: no AppContainer support, a profile or static grant
+that cannot be made, a job that cannot be assigned. There is no unconfined
+mode. A host runs no computer-side plugins on a system whose backend is not
+built or whose escape tests do not pass.
+
+**Not decided here**: what the broker allows. The permission checks and the
+bundled Python belong to the droidtop-agent / Pythia lane (its broker in
+Rust calls this library's spawn and serves or wraps its decider). The
+client call's shape above is proposed to that lane on Droidtop/tracker#606.
+
+### Tests
+
+`tests/sbx_test_win.c` runs on GitHub's Windows runners in CI. It starts
+itself as a child twice with the same attempts: unconfined, as a control in
+which each attempt must succeed (or the host refused it on its own, and the
+attempt proves nothing), then confined, where each must fail. The attempts:
+
+- read a file outside the rules by path, and write one in a folder the
+  broker allows (the token refuses both);
+- list the user's profile folder; write in the static read-only grant;
+- create a process, and create one with `CREATE_BREAKAWAY_FROM_JOB`;
+- connect to a TCP port the parent listens on at 127.0.0.1;
+- create a key under `HKEY_CURRENT_USER\Software`;
+- open the parent process for reading its memory;
+- open a named event the parent created in its session's namespace;
+- read the clipboard;
+- commit more memory than the job allows.
+
+Then, confined only, what must work and what the broker must refuse:
+`sbx_open` of an allowed file reads it; creating and writing in a writable
+rule; refused outside the rules, through `..`, writing in a read-only rule,
+and through a junction planted in a writable folder that leads out; and an
+open relative to a folder handle the broker gave is refused by the token.
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the
@@ -1112,6 +1274,8 @@ adb shell 'cd /data/local/tmp && chmod 755 sbx_test-arm64-v8a gpu_probe-arm64-v8
 - **An Android AAR** with a Kotlin API over the same C core.
 - **Desktop-only hardening**: Landlock and namespaces, under the same
   broker.
+- **macOS**: a deny-by-default Seatbelt profile under the same broker and
+  `sbx_open`, after Windows and only when the owner asks (Droidtop/tracker#606).
 - **Layers, path containment and a tree of confined programs** (Wine and
   proot under the broker), designed in "Layers, containment, and Wine and
   proot under the broker"; nothing of it is built.
