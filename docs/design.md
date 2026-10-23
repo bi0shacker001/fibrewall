@@ -1219,6 +1219,39 @@ rule; refused outside the rules, through `..`, writing in a read-only rule,
 and through a junction planted in a writable folder that leads out; and an
 open relative to a folder handle the broker gave is refused by the token.
 
+## When a trap kills: the trace ring and the kernel's audit (built 2026-10-23, Droidtop/tracker#550)
+
+A trapped call ends the process with signal 31 and nothing else whenever
+the kernel cannot hand SIGSYS to the handler: SIGSYS blocked on the thread,
+or a second trap while the handler itself runs (the kernel blocks the
+signal it is delivering). There is no tombstone, and the broker never hears
+of the call, so the rig sees "Process locked down" and then signal 31
+(#550 and #604, every lockdown core on dev.392). Two records exist for that
+case.
+
+- **The trace ring** (`sbx_trace(fd, slots)`, before `sbx_lockdown`). A file
+  the host opened is mapped shared; the handler's first act for every trap
+  is to note the call there (number, first argument, the address after the
+  call, the trap data, then the thread), and to mark it left when done.
+  Stores only, no system call before the note, so the note cannot itself
+  trap; the kernel keeps the page when the process dies, and the host reads
+  the file afterwards. An entry entered and never left is the call the
+  process died handling. Layout: `struct sbx_trace_header` and
+  `struct sbx_trace_entry` in `sbx.h`.
+- **The kernel's audit** (`SBX_LOCK_AUDIT`, `SECCOMP_FILTER_FLAG_LOG`). The
+  kernel logs every trapped or refused call as audit type 1326, with its
+  number and address. That covers the case no code of ours sees at all,
+  such as a trap on a thread with SIGSYS blocked. It logs thousands of lines
+  in a busy process, so it is for diagnosing only.
+
+The tests reproduce one such death. While the handler waits for the broker,
+another signal's handler makes a trapped call. That process ends with
+signal 31, and the ring shows the call being handled, entered and never
+left. In an Android app process this is not exotic: ART's signal chain
+calls sigprocmask from its handlers, and the lockdown traps sigprocmask.
+Fixing it, rather than seeing it, is a separate change (the handler would
+have to take a nested trap).
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the
