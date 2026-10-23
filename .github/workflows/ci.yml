@@ -174,4 +174,9 @@ jobs:
             on { print }' README.md > notes.md
           test -s notes.md || { echo "README.md has no entry for v$version"; exit 1; }
           printf '\nBuilt and tested by CI run %s.\n' "$GITHUB_RUN_ID" >> notes.md
-          gh release create "v$version" --target "$GITHUB_SHA" --title "sandbox $version" --notes-file notes.md
+          # A tag made by hand (the coordinator tags on request) is released as it stands, never moved.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            gh release create "v$version" --verify-tag --title "sandbox $version" --notes-file notes.md
+          else
+            gh release create "v$version" --target "$GITHUB_SHA" --title "sandbox $version" --notes-file notes.md
+          fi
