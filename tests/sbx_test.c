@@ -641,7 +641,9 @@ static int sigsys_check(void) {
         pthread_join(blocker, NULL);
         handler_file = file;
         install_masked(SIGUSR1);
-        EXPECT(sbx_lockdown(pair[1], NULL) == 0, "sigsys: lockdown once no thread blocks SIGSYS");
+        int locked_down = sbx_lockdown(pair[1], NULL);
+        errno = locked_down < 0 ? -locked_down : 0;  /* EXPECT prints errno: make it the result */
+        EXPECT(locked_down == 0, "sigsys: lockdown once no thread blocks SIGSYS");
         raise(SIGUSR1);
         EXPECT(handler_opened >= 0, "sigsys: a handler installed before lockdown with every signal masked makes trapped calls");
         install_masked(SIGUSR2);
