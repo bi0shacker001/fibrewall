@@ -972,7 +972,7 @@ int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out) {
     startup.StartupInfo.hStdError = spec->std_err;
     startup.lpAttributeList = attributes;
     if (!CreateProcessW(path, line.data, NULL, NULL, list_count ? TRUE : FALSE,
-                        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS,
                         block.data, NULL, &startup.StartupInfo, &info)) {
         result = -errno_of(GetLastError());
         goto fail;
