@@ -54,6 +54,7 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out) {
     request.length = (uint32_t) length;
     memcpy(request.path, path, length);
     struct sbxw_reply reply;
+    memset(&reply, 0, sizeof(reply));
     DWORD got = 0;
     AcquireSRWLockExclusive(&channel_lock);
     HANDLE pipe = broker_channel();
