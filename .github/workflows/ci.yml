@@ -89,7 +89,7 @@ jobs:
         run: |
           cmake -S . -B build             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-26
           cmake --build build -j
-          cp build/sbx_test build/gpu_probe .
+          cp build/sbx_test build/gpu_probe build/libsbx_child.so .
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -105,7 +105,7 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
           # The GPU probe is a measurement, not a gate: its output is the answer (see tests/android/gpu_probe.c).
           script: |
-            adb push sbx_test gpu_probe /data/local/tmp/
+            adb push sbx_test gpu_probe libsbx_child.so /data/local/tmp/
             adb shell 'uname -a; cat /proc/sys/kernel/seccomp/actions_avail; cd /data/local/tmp && chmod 755 sbx_test gpu_probe && TMPDIR=/data/local/tmp ./sbx_test; echo "exit=$?"' | tee result.txt
             adb logcat -c || true
             adb shell 'cd /data/local/tmp && ./gpu_probe; echo "probe_exit=$?"' || true
@@ -132,6 +132,8 @@ jobs:
             cmake --build "build-$abi" -j
             cp "build-$abi/sbx_test" "sbx_test-$abi"
             cp "build-$abi/gpu_probe" "gpu_probe-$abi"
+            mkdir -p "child-$abi" && cp "build-$abi/libsbx_child.so" "child-$abi/libsbx_child.so"
+            (cd "child-$abi" && zip -q "../libsbx_child-$abi.zip" libsbx_child.so)
           done
       - name: Publish
         env:
@@ -140,5 +142,5 @@ jobs:
           gh release view probe-latest >/dev/null 2>&1 || \
             gh release create probe-latest --prerelease --title "Test and GPU probe binaries (rolling)" \
               --notes "Built from main by CI. Rebuilt on every push; see the commit in the asset upload time."
-          gh release upload probe-latest sbx_test-* gpu_probe-* --clobber
+          gh release upload probe-latest sbx_test-* gpu_probe-* libsbx_child-*.zip --clobber
           gh release edit probe-latest --notes "Built from ${GITHUB_SHA} by CI run ${GITHUB_RUN_ID}."

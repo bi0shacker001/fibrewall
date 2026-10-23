@@ -35,11 +35,16 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c src/open.c)
+add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c src/open.c src/attach.c)
 target_include_directories(sbx PUBLIC include PRIVATE src)
 target_link_libraries(sbx PUBLIC Threads::Threads)
 target_compile_options(sbx PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)
 set_target_properties(sbx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# libsbx_child.so: on LD_PRELOAD, each process of a tree attaches to the host's broker before main.
+add_library(sbx_child SHARED src/child.c)
+target_link_libraries(sbx_child PRIVATE sbx)
+target_compile_options(sbx_child PRIVATE -Wall -Wextra -Werror)
 
 if(SBX_SANITIZE)
   target_compile_options(sbx PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)

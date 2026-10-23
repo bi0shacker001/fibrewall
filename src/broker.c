@@ -1416,8 +1416,8 @@ int sbx_broker_prepare(int fd) {
     return setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0 ? 0 : -errno;
 }
 
-void sbx_broker_serve(struct sbx_policy *policy, int fd) {
-    sbx_broker_prepare(fd);
+/* Answers fd's requests until the other end closes it. Leaves fd open and the policy to the caller. */
+static void serve_loop(const struct sbx_policy *policy, int fd) {
     struct {
         struct sbx_request request;
         char body[SBX_PATH_MAX * 2];
@@ -1462,8 +1462,196 @@ void sbx_broker_serve(struct sbx_policy *policy, int fd) {
         }
         for (int i = 0; i < fd_count; i++) close(fds[i]);
     }
+}
+
+void sbx_broker_serve(struct sbx_policy *policy, int fd) {
+    sbx_broker_prepare(fd);
+    serve_loop(policy, fd);
     close(fd);
     sbx_policy_free(policy);
+}
+
+/*
+ * ---- One broker for a tree of processes (sbx_broker_listen) ----
+ *
+ * A SOCK_SEQPACKET socket at a path in a folder only the host can enter.
+ * Each connection's first message is the token, sent with
+ * SCM_CREDENTIALS: the sender must have the broker's own UID (the kernel's
+ * word) and the token must match, or the connection is closed unanswered.
+ * After the one-byte answer, the connection is served like a socketpair's:
+ * every request names its sender's pid in its own credentials, so the
+ * processes a confined one forks share its connection and are still told
+ * apart. One thread per connection; the policy is shared, so its decider
+ * and audit must be safe to call from several threads.
+ */
+#define TOKEN_MAX 128
+
+struct sbx_listener {
+    struct sbx_policy *policy;
+    int fd;
+    char token[TOKEN_MAX];
+    size_t token_length;
+    char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+    int users;   /* the listener itself and each connection; the last one out frees it all */
+    int closing;
+};
+
+static void listener_release(struct sbx_listener *listener) {
+    if (__atomic_sub_fetch(&listener->users, 1, __ATOMIC_ACQ_REL) != 0) return;
+    sbx_policy_free(listener->policy);
+    free(listener);
+}
+
+/* Equal without saying where they differ. */
+static int same_token(const char *a, size_t a_length, const char *b, size_t b_length) {
+    unsigned char difference = a_length != b_length;
+    size_t n = a_length < b_length ? a_length : b_length;
+    for (size_t i = 0; i < n; i++) difference |= (unsigned char) (a[i] ^ b[i]);
+    return difference == 0;
+}
+
+struct connection {
+    struct sbx_listener *listener;
+    int fd;
+};
+
+static void *connection_thread(void *argument) {
+    struct connection *connection = argument;
+    struct sbx_listener *listener = connection->listener;
+    int fd = connection->fd;
+    free(connection);
+    char token[TOKEN_MAX];
+    union {
+        char buffer[CMSG_SPACE(sizeof(struct ucred))];
+        struct cmsghdr align;
+    } control;
+    struct iovec part = {token, sizeof(token)};
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    message.msg_control = control.buffer;
+    message.msg_controllen = sizeof(control.buffer);
+    ssize_t n;
+    do n = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+    while (n < 0 && errno == EINTR);
+    int trusted = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&message); n > 0 && c; c = CMSG_NXTHDR(&message, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+            struct ucred credentials;
+            memcpy(&credentials, CMSG_DATA(c), sizeof(credentials));
+            trusted = credentials.uid == geteuid() && credentials.pid > 0;
+        } else if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+            /* No descriptors belong in the greeting. */
+            size_t count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < count; i++) {
+                int received;
+                memcpy(&received, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+                close(received);
+            }
+            trusted = 0;
+        }
+    }
+    if (trusted && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) &&
+        same_token(token, (size_t) n, listener->token, listener->token_length)) {
+        char ok = 1;
+        if (send(fd, &ok, 1, MSG_NOSIGNAL) == 1) serve_loop(listener->policy, fd);
+    } else {
+        struct sbx_access access = {.op = "attach", .asked = "a connection without the broker's UID and token",
+                                    .resolved = listener->path, .pid = 0, .rule_verdict = -EACCES};
+        listener->policy->audit(listener->policy->audit_context, &access, -EACCES);
+    }
+    close(fd);
+    listener_release(listener);
+    return NULL;
+}
+
+static void *accept_thread(void *argument) {
+    struct sbx_listener *listener = argument;
+    for (;;) {
+        int fd = accept4(listener->fd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            break;  /* closed by sbx_listener_close */
+        }
+        if (__atomic_load_n(&listener->closing, __ATOMIC_ACQUIRE)) {
+            close(fd);
+            break;
+        }
+        sbx_broker_prepare(fd);
+        struct connection *connection = malloc(sizeof(*connection));
+        if (!connection) {
+            close(fd);
+            continue;
+        }
+        connection->listener = listener;
+        connection->fd = fd;
+        __atomic_add_fetch(&listener->users, 1, __ATOMIC_ACQ_REL);
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_t thread;
+        int error = pthread_create(&thread, &attributes, connection_thread, connection);
+        pthread_attr_destroy(&attributes);
+        if (error != 0) {
+            close(fd);
+            free(connection);
+            listener_release(listener);
+        }
+    }
+    listener_release(listener);
+    return NULL;
+}
+
+int sbx_broker_listen(struct sbx_policy *policy, const char *socket_path, const char *token,
+                      struct sbx_listener **out) {
+    if (out) *out = NULL;
+    if (!policy || !socket_path || socket_path[0] != '/' || !token || !out) return -EINVAL;
+    size_t token_length = strlen(token);
+    if (token_length < 16 || token_length >= TOKEN_MAX) return -EINVAL;
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    if (strlen(socket_path) >= sizeof(address.sun_path)) return -ENAMETOOLONG;
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
+    struct sbx_listener *listener = calloc(1, sizeof(*listener));
+    if (!listener) return -ENOMEM;
+    listener->policy = policy;
+    memcpy(listener->token, token, token_length);
+    listener->token_length = token_length;
+    memcpy(listener->path, address.sun_path, sizeof(listener->path));
+    listener->users = 2;  /* the accept thread and sbx_listener_close */
+    listener->fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    int error = 0;
+    if (listener->fd < 0) error = -errno;
+    else if (bind(listener->fd, (struct sockaddr *) &address, sizeof(address)) != 0) error = -errno;
+    else if (listen(listener->fd, 64) != 0) error = -errno;
+    if (error == 0) {
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_t thread;
+        error = -pthread_create(&thread, &attributes, accept_thread, listener);
+        pthread_attr_destroy(&attributes);
+    }
+    if (error != 0) {
+        if (listener->fd >= 0) {
+            close(listener->fd);
+            unlink(listener->path);
+        }
+        free(listener);  /* the policy stays the caller's on failure */
+        return error;
+    }
+    *out = listener;
+    return 0;
+}
+
+void sbx_listener_close(struct sbx_listener *listener) {
+    if (!listener) return;
+    __atomic_store_n(&listener->closing, 1, __ATOMIC_RELEASE);
+    unlink(listener->path);
+    /* Wakes the accept thread: shutdown makes a blocked accept fail. */
+    shutdown(listener->fd, SHUT_RDWR);
+    close(listener->fd);
+    listener_release(listener);
 }
 
 struct session {

@@ -781,6 +781,27 @@ inet `bind` and `connect` also trap (the filter cannot read the family) and
 go the brokered network's way under `sbx_policy_set_net`'s grants; `listen`
 and `accept` stay the process's own. Not with `SBX_LOCK_NET_BROKERED`.
 
+**`sbx_broker_listen` and `libsbx_child.so`, built (2026-10-23).** The
+listener is a `SOCK_SEQPACKET` socket at a path the host makes in a folder
+only its UID can enter. A connection's first message is the token (16 to
+127 bytes, random per launch) with `SCM_CREDENTIALS`. The sender's UID must
+be the broker's, and the token must match (compared in constant time). Any
+other connection is closed unanswered and audited as `attach`. One thread
+per connection rather than a pool, for now. The client sets `SO_PASSCRED`
+on its own end, so every request carries its sender's pid whichever
+process of the tree sends it: forked children share their parent's
+connection. `sbx_attach` keeps the connection open across `exec` and puts
+its number in `SBX_BROKER_FD`. `sbx_attach_from_environment` (the
+library's constructor) overwrites the token's value in the environment
+strings, so `/proc/<pid>/environ` no longer shows it. It ends the process
+with 127 before `main` when `SBX_BROKER` is set but the attach fails.
+Without `SBX_BROKER` it does nothing. `SBX_OWN_OPENS` passes the
+`own_opens` list (a Wrapper driver's GPU node). This confines the first
+process of a tree and everything it forks; what it `exec`s needs
+`sbx-exec` (Droidtop/tracker#584, option 1), since the handler does not
+survive `exec` and the new image's loader opens files before any
+constructor runs.
+
 `SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
 four is "a program tree": it can run its own helpers and talk to the
 sockets the host named, and nothing else.

@@ -469,6 +469,47 @@ void sbx_policy_set_audit(struct sbx_policy *policy, sbx_audit_fn audit, void *c
 int sbx_broker_prepare(int fd);
 void sbx_broker_serve(struct sbx_policy *policy, int fd);
 int sbx_broker_start(struct sbx_policy *policy, int fd);
+
+/*
+ * One broker for a tree of processes: listens on a SOCK_SEQPACKET socket
+ * at socket_path (absolute, under 108 bytes, in a folder only the host's
+ * UID can enter; it must not exist yet) and serves every connection that
+ * opens with token (16 to 127 bytes, random for each launch) from a
+ * process of the broker's own UID (SCM_CREDENTIALS). Each connection is
+ * served on its own thread with the one policy, so its decider and audit
+ * are called from several threads. A process attaches with
+ * sbx_attach() or libsbx_child.so; the processes it forks share its
+ * connection, and each request names its own sender. Takes the policy
+ * on success (freed when the listener is closed and the last connection
+ * ends); returns 0 and the listener, or a negative errno.
+ */
+struct sbx_listener;
+int sbx_broker_listen(struct sbx_policy *policy, const char *socket_path, const char *token,
+                      struct sbx_listener **out);
+
+/* Stops accepting and removes the socket; connections already made are served until they close. */
+void sbx_listener_close(struct sbx_listener *listener);
+
+/*
+ * Attaches the calling process to a listening broker and confines it:
+ * connects to socket_path, sends token, and on the broker's answer calls
+ * sbx_lockdown on that connection with options. The connection is kept
+ * open across exec (its number is put in SBX_BROKER_FD), for the images
+ * the process runs. Returns 0, or a negative errno with nothing installed.
+ */
+int sbx_attach(const char *socket_path, const char *token, const struct sbx_lockdown_options *options);
+
+/*
+ * sbx_attach from the environment, as libsbx_child.so's constructor
+ * calls it before main: SBX_BROKER (the socket's path), SBX_TOKEN,
+ * SBX_FLAGS (lockdown flags, decimal or 0x hex) and SBX_OWN_OPENS
+ * (device paths separated by ':', see own_opens). Returns 1 when
+ * SBX_BROKER is not set (nothing to attach to), 0 when attached, or a
+ * negative errno (the constructor then ends the process before main). On
+ * success the token's value is overwritten in the environment strings and
+ * SBX_BROKER and SBX_TOKEN are removed.
+ */
+int sbx_attach_from_environment(void);
 #endif
 
 #ifdef __cplusplus

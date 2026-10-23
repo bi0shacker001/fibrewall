@@ -1027,6 +1027,103 @@ static int unix_check(void) {
     return !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 }
 
+/* ---- sbx_broker_listen and libsbx_child.so: a tree of processes attaches by path and token. ---- */
+
+#define TEST_TOKEN "sbx-test-token-0123456789abcdef"
+
+/* Runs in an image started with libsbx_child.so on LD_PRELOAD: confined before main. */
+static int attached_main(const char *game_folder, const char *secret_folder) {
+    char data[400], key[400];
+    snprintf(data, sizeof(data), "%s/data.txt", game_folder);
+    snprintf(key, sizeof(key), "%s/key", secret_folder);
+    EXPECT(getenv("SBX_TOKEN") == NULL && getenv("SBX_BROKER") == NULL, "attached: the token and broker left the environment");
+    EXPECT(getenv("SBX_BROKER_FD") != NULL, "attached: the connection's number is in SBX_BROKER_FD");
+    int fd = open(data, O_RDONLY | O_CLOEXEC);
+    EXPECT(fd >= 0, "attached: a file the rules allow opens through the broker");
+    if (fd >= 0) close(fd);
+    errno = 0;
+    EXPECT(refused(open(key, O_RDONLY | O_CLOEXEC)), "attached: one outside the rules is refused before main ever ran");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int ok = 1;
+        int f = open(data, O_RDONLY | O_CLOEXEC);
+        ok &= f >= 0;
+        if (f >= 0) close(f);
+        ok &= open(key, O_RDONLY | O_CLOEXEC) < 0 && errno == EACCES;
+        _exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "attached: a forked child shares the connection and stays confined");
+    return failures ? 1 : 0;
+}
+
+static int run_attached(const char *self, const char *library, const char *broker, const char *token) {
+    char preload[600], broker_env[200], token_env[200];
+    snprintf(preload, sizeof(preload), "LD_PRELOAD=%s", library);
+    snprintf(broker_env, sizeof(broker_env), "SBX_BROKER=%s", broker);
+    snprintf(token_env, sizeof(token_env), "SBX_TOKEN=%s", token);
+    char *envp[] = {preload, broker_env, token_env, "SBX_FLAGS=0",
+                    "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+    char *argv[] = {(char *) self, "--attached", game, secret, NULL};
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        execve(self, argv, envp);
+        _exit(126);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+static int listen_check(const char *self) {
+    char library[600];
+    snprintf(library, sizeof(library), "%s", self);
+    char *slash = strrchr(library, '/');
+    if (!slash) return 1;
+    snprintf(slash + 1, sizeof(library) - (size_t) (slash + 1 - library), "libsbx_child.so");
+    char broker_path[400];
+    snprintf(broker_path, sizeof(broker_path), "%s/broker.sock", root);
+    struct sbx_listener *listener = NULL;
+    struct sbx_policy *small = sbx_policy_new();
+    EXPECT(sbx_broker_listen(small, broker_path, "short", &listener) == -EINVAL, "listen: a short token is refused");
+    sbx_policy_free(small);
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    int listened = sbx_broker_listen(policy, broker_path, TEST_TOKEN, &listener);
+    errno = -listened;
+    EXPECT(listened == 0, "listen: a broker on a socket path");
+    if (listened != 0) {
+        sbx_policy_free(policy);
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        _exit(sbx_attach(broker_path, "the-wrong-token-for-this-broker", NULL) == -EACCES ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "listen: an attach with the wrong token is refused");
+    int failed = 0;
+    if (access(library, R_OK) != 0) {
+        printf("FAIL listen: libsbx_child.so is not beside the test (%s)\n", library);
+        failed = 1;
+    } else {
+        int code = run_attached(self, library, broker_path, TEST_TOKEN);
+        EXPECT(code == 0, "listen: an image started with libsbx_child.so attached and passed its checks");
+        failed |= code != 0;
+        code = run_attached(self, library, broker_path, "the-wrong-token-for-this-broker");
+        EXPECT(code == 127, "listen: with the wrong token it ends before main (127)");
+        failed |= code != 127;
+    }
+    sbx_listener_close(listener);
+    EXPECT(access(broker_path, F_OK) != 0, "listen: closing removes the socket");
+    return failed || failures;
+}
+
 /* ---- Unbrokered: paths go to the kernel, the rest of the wall stands. ---- */
 
 static int unbrokered_check(void) {
@@ -1684,6 +1781,7 @@ static void audit(void *context, const struct sbx_access *access, int result) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "--spawned") == 0) return spawned_main();
+    if (argc > 3 && strcmp(argv[1], "--attached") == 0) return attached_main(argv[2], argv[3]);
     char self[512];
     ssize_t self_len = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (self_len <= 0) { perror("readlink"); return 2; }
@@ -1724,7 +1822,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | pathops_check() | unix_check() | listen_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
