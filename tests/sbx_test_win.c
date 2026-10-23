@@ -532,7 +532,8 @@ int main(int argc, char **argv) {
         int spawned = sbx_spawn(&spec, &process);
         CloseHandle(write_end);
         if (error_out) CloseHandle(error_out);
-        printf("     sbx_spawn: %d, less-privileged: %d\n", spawned, spawned == 0 ? process.less_privileged : -1);
+        printf("     sbx_spawn: %d (Windows error %lu), less-privileged: %d\n", spawned, sbx_spawn_error(),
+               spawned == 0 ? process.less_privileged : -1);
         EXPECT(spawned == 0, "the confined child starts");
         if (spawned == 0) {
             check_count = collect(read_end, confined, &confined_count, checks, 64);

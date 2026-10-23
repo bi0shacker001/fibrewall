@@ -302,6 +302,13 @@ struct sbx_process {
  */
 int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out);
 
+/*
+ * The Windows error code behind the last sbx_spawn failure (0 when it was
+ * not a Windows error), for a host's log: errno values cannot say which
+ * system call refused.
+ */
+unsigned long sbx_spawn_error(void);
+
 /* Waits for the program to end, sets *exit_code (may be NULL), then closes the job and the process handle. */
 int sbx_process_wait(struct sbx_process *process, int *exit_code);
 

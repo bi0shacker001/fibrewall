@@ -104,7 +104,13 @@
 
 /* ---- Errors ---- */
 
+/* The Windows error behind the last failure mapped here, for sbx_spawn_error(). */
+static volatile DWORD last_error;
+
+unsigned long sbx_spawn_error(void) { return last_error; }
+
 static int errno_of(DWORD error) {
+    last_error = error;
     switch (error) {
     case ERROR_FILE_NOT_FOUND:
     case ERROR_PATH_NOT_FOUND:
@@ -135,12 +141,19 @@ static int errno_of(DWORD error) {
     case ERROR_NOT_SUPPORTED:
     case ERROR_CALL_NOT_IMPLEMENTED:
         return ENOSYS;
+    case ERROR_INVALID_HANDLE:
+        return EBADF;
+    case ERROR_BAD_ENVIRONMENT:
+        return EINVAL;
+    case ERROR_BAD_EXE_FORMAT:
+        return ENOEXEC;
     default:
         return EIO;
     }
 }
 
 static int errno_of_status(NTSTATUS status) {
+    last_error = (DWORD) status;
     switch (status) {
     case STATUS_OBJECT_NAME_NOT_FOUND_:
     case STATUS_OBJECT_PATH_NOT_FOUND_:
@@ -839,6 +852,7 @@ int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out) {
     unsigned list_count = 0;
 
     if (out) memset(out, 0, sizeof(*out));
+    last_error = 0;
     if (!spec || !out || !spec->path || !spec->argv || !spec->argv[0] || !spec->container ||
         spec->handle_count > SBX_SPAWN_HANDLES_MAX || (spec->handle_count && !spec->handles)) {
         result = -EINVAL;
