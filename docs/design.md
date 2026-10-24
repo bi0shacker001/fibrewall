@@ -220,8 +220,14 @@ because the kernel ties what they hold to the process that opened them. A
 broker-opened `/dev/hwbinder` fails to `mmap` in the confined process. GPU
 nodes that keep per-process state behave the same way: kgsl, Mali, DRM
 render nodes. `sbx_lockdown_options.own_opens` names such paths. The
-process opens them itself just before the filter goes on, and after that
-an open of exactly one of those paths gets a duplicate. Each host keeps the
+process opens them itself just before the filter goes on, three spare times
+besides, and after that an open of exactly one of those paths takes a spare
+whole: an open file of its own, as an open of the real device gives. Only
+when the spares are gone does it get a duplicate of the first. Binder keeps
+its state per open file and maps each one once, so duplicates collided: the
+Adreno driver's own copy of libhidl, starting after the lockdown on a Retroid
+Pocket 5, failed `mmap` of `/dev/hwbinder` with EBUSY and aborted (#550,
+2026-10-24). stat and access answer from the first descriptor. Each host keeps the
 list for its platform. Enginehost's is `/dev/hwbinder`, `/dev/kgsl-3d0`,
 `/dev/mali0` and `/dev/dri/renderD128`; `/dev/vndbinder` is left out,
 because an app cannot open it at all. A native-kind process that never

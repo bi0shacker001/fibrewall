@@ -371,6 +371,28 @@ static void working(void) {
     char path[512], path2[512], buffer[512];
     struct stat st;
 
+    /* An own-opened device: each open its own open file, as binder needs (a duplicate would share flags). */
+    {
+        int first = open("/dev/zero", O_RDWR | O_CLOEXEC), second = open("/dev/zero", O_RDWR | O_CLOEXEC);
+        EXPECT(first >= 0 && second >= 0, "an own-opened device opens twice");
+        if (first >= 0 && second >= 0) {
+            fcntl(first, F_SETFL, fcntl(first, F_GETFL) | O_NONBLOCK);
+            EXPECT((fcntl(second, F_GETFL) & O_NONBLOCK) == 0, "each open of an own-opened device is an open file of its own");
+        }
+        int more[4];
+        int opened = 0;
+        for (int k = 0; k < 4; k++) {
+            more[k] = open("/dev/zero", O_RDONLY);
+            if (more[k] >= 0) opened++;
+        }
+        EXPECT(opened == 4, "past its spares, an own-opened device still opens (as a duplicate)");
+        EXPECT(first < 0 || (fcntl(first, F_GETFD) & FD_CLOEXEC), "a spare keeps the close-on-exec it was asked for");
+        EXPECT(more[0] < 0 || !(fcntl(more[0], F_GETFD) & FD_CLOEXEC), "a spare opened without O_CLOEXEC has it cleared");
+        for (int k = 0; k < 4; k++) if (more[k] >= 0) close(more[k]);
+        if (first >= 0) close(first);
+        if (second >= 0) close(second);
+    }
+
     /* ART's SafeCopy: its own memory through process_vm_readv on getpid() (the parent's stays refused, above). */
     {
         char from[8] = "own mem", to[8] = {0};

@@ -32,7 +32,7 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.6"
+#define SBX_VERSION "0.1.7"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
 #define SBX_VERSION_PATCH 2
@@ -288,7 +288,10 @@ struct sbx_lockdown_options {
      * and hwbinder (a broker-opened /dev/hwbinder fails to mmap), and GPU
      * nodes that keep per-process state (kgsl, Mali, DRM render nodes).
      * After lockdown an open of exactly one of these paths is answered with
-     * a duplicate, and stat or access of it from that descriptor (libhidl
+     * one of three spare descriptors opened beside it, each an open file of
+     * its own (binder maps each open file once; two users of one would
+     * collide), then with a duplicate once those are taken; stat or access
+     * of it is answered from the first descriptor (libhidl
      * checks /dev/hwbinder with access before it opens it): they are local
      * files (sbx_local_add), read and written. Paths that do not exist or
      * cannot be opened are skipped.

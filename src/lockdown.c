@@ -235,12 +235,49 @@ static int local_index(const char *path) {
 
 static int local_fd(int i) { return __atomic_load_n(&locals[i].fd, __ATOMIC_ACQUIRE); }
 
+/*
+ * Spare opens of each own-opened device, opened with it before lockdown: an
+ * open of the device after lockdown takes one whole, so it gets an open file
+ * of its own, as an open of the real device would. Binder keeps its state
+ * per open file and maps each one once, so two users given duplicates of one
+ * descriptor shared it, and the second mmap failed with EBUSY: the Adreno
+ * driver's own copy of libhidl, starting after the lockdown, aborted the
+ * process with "Mmapping /dev/hwbinder failed: Device or resource busy"
+ * (Droidtop/tracker#550, Retroid Pocket 5, 2026-10-24). Once a device's
+ * spares are gone, an open gets a duplicate, as before. Filled before the
+ * filter goes on and only claimed after, so the handler needs no lock.
+ */
+#define OWN_OPEN_SPARES 3
+static struct {
+    const char *path;  /* the device's entry in locals[] */
+    int fd;
+    int taken;
+} spares[SBX_OWN_OPENS_MAX * OWN_OPEN_SPARES];
+static unsigned spare_count;
+
+/* A spare of the device at path, claimed, with close-on-exec as flags ask; -1 when none is left. */
+static int take_spare(const char *path, int flags) {
+    for (unsigned k = 0; k < spare_count; k++) {
+        if (strcmp(spares[k].path, path) != 0) continue;
+        int free_slot = 0;
+        if (!__atomic_compare_exchange_n(&spares[k].taken, &free_slot, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        int fd = spares[k].fd;
+        if (!(flags & O_CLOEXEC)) fcntl(fd, F_SETFD, 0);
+        return fd;
+    }
+    return -1;
+}
+
 /* A duplicate of a local file for an open of exactly its path, or -ENOENT when path is not one. */
 static long local_open(const char *path, int flags) {
     int i = local_index(path);
     if (i < 0) return -ENOENT;
     int writing = (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0;
     if (writing && !(locals[i].mode & SBX_WRITE)) return -EACCES;
+    if (locals[i].mode & LOCAL_DEVICE) {
+        int spare = take_spare(locals[i].path, flags);
+        if (spare >= 0) return spare;
+    }
     long fd = fcntl(local_fd(i), (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
     if (fd < 0) return -errno;
     /* A handed-over file reads from its start (the duplicate shares its offset with every other one). */
@@ -2190,7 +2227,20 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         if (!path || path[0] != '/') continue;
         int fd = open(path, O_RDWR | O_CLOEXEC);
         if (fd < 0) continue;
-        if (add_local(path, fd, SBX_READ | SBX_WRITE | LOCAL_DEVICE) != 0) close(fd);
+        if (add_local(path, fd, SBX_READ | SBX_WRITE | LOCAL_DEVICE) != 0) {
+            close(fd);
+            continue;
+        }
+        /* The entry's own descriptor answers stat, access and duplicates; the spares go to opens. */
+        int entry = local_index(path);
+        for (unsigned s = 0; entry >= 0 && s < OWN_OPEN_SPARES && spare_count < sizeof(spares) / sizeof(spares[0]); s++) {
+            int spare = open(path, O_RDWR | O_CLOEXEC);
+            if (spare < 0) break;
+            spares[spare_count].path = locals[entry].path;
+            spares[spare_count].fd = spare;
+            spares[spare_count].taken = 0;
+            spare_count++;
+        }
     }
     int error = 0;
     for (unsigned k = 0; k < options->claim_count && error == 0; k++) {
