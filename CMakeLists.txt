@@ -1,7 +1,7 @@
 # sandbox: a process sandbox library (seccomp lockdown + syscall broker).
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.18)
-project(sandbox VERSION 0.1.4 LANGUAGES C)
+project(sandbox VERSION 0.1.5 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -84,7 +84,8 @@ endif()
 if(SBX_TESTS)
   add_executable(sbx_test tests/sbx_test.c)
   target_link_libraries(sbx_test PRIVATE sbx)
-  target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror)
+  # Frame records in the test's own functions: the fault test walks them (fault_check).
+  target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror -fno-omit-frame-pointer)
 endif()
 
 # The native-kind feasibility probe: GPU drawing from a locked-down process with no ART (Android only).

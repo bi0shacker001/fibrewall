@@ -22,4 +22,7 @@
  */
 int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int helper_fd, const char *child_library);
 
+/* Nonzero makes sbx_trace_fault skip the unwind and walk frame records alone (for its test). */
+extern int sbx_trace_fault_frame_pointers_only;
+
 #endif

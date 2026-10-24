@@ -864,8 +864,17 @@ __attribute__((noinline)) static void fault_caller(volatile int *where) {
     __asm__ volatile("" ::: "memory");
 }
 
-/* A fatal signal in a locked-down process: its place and its callers noted after the ring's entries. */
-static int fault_check(const char *program_path) {
+/* The recorder's frame-pointer walk alone, without the unwind (src/internal.h). */
+extern int sbx_trace_fault_frame_pointers_only;
+
+/*
+ * A fatal signal in a locked-down process: its place and its callers noted
+ * after the ring's entries. [frame_pointers] runs it with the walk of the
+ * thread's frame records alone, which is what a device whose unwinder stops
+ * at the signal chain gets.
+ */
+static int fault_check(const char *program_path, int frame_pointers) {
+    const char *how = frame_pointers ? "fault (frame pointers)" : "fault";
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     char ring_file[PATH_MAX];
     snprintf(ring_file, sizeof(ring_file), "%s/sbx-fault-XXXXXX", tmp);
@@ -883,6 +892,7 @@ static int fault_check(const char *program_path) {
         action.sa_flags = SA_SIGINFO;
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGSEGV, &action, NULL) != 0) _exit(2);
+        sbx_trace_fault_frame_pointers_only = frame_pointers;
         if (sbx_trace(ring_fd, 16) != 0 || sbx_lockdown(pair[1], NULL) != 0) _exit(2);
         fault_caller((volatile int *) (uintptr_t) 0x10);
         _exit(3);
@@ -891,17 +901,17 @@ static int fault_check(const char *program_path) {
     int status = 0;
     waitpid(child, &status, 0);
     int died = WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV;
-    printf("%s fault: the process still dies of the signal (status %#x)\n", died ? "ok  " : "FAIL", status);
+    printf("%s %s: the process still dies of the signal (status %#x)\n", died ? "ok  " : "FAIL", how, status);
     struct sbx_trace_fault fault;
     memset(&fault, 0, sizeof(fault));
     int got = pread(ring_fd, &fault, sizeof(fault), (off_t) SBX_TRACE_FAULT_OFFSET(16)) == (ssize_t) sizeof(fault);
     int noted = got && fault.state == SBX_TRACE_LEFT && fault.signal == SIGSEGV && fault.tid == child &&
                 fault.address == 0x10 && fault.pc != 0 && fault.frames >= 1 && fault.frame[0].pc == fault.pc;
-    printf("%s fault: noted whole, with its signal, thread, address and place (%u frames)\n",
-           noted ? "ok  " : "FAIL", got ? fault.frames : 0);
+    printf("%s %s: noted whole, with its signal, thread, address and place (%u frames)\n",
+           noted ? "ok  " : "FAIL", how, got ? fault.frames : 0);
     const char *self = strrchr(program_path, '/') ? strrchr(program_path, '/') + 1 : program_path;
     int named = noted && fault.frame[0].base != 0 && strcmp(fault.frame[0].module, self) == 0;
-    printf("%s fault: the place is named by its file (%s) and load address\n", named ? "ok  " : "FAIL",
+    printf("%s %s: the place is named by its file (%s) and load address\n", named ? "ok  " : "FAIL", how,
            noted ? fault.frame[0].module : "");
     /* The caller: a return address inside fault_caller, below where fault_here starts. */
     int unwound = 0;
@@ -909,7 +919,11 @@ static int fault_check(const char *program_path) {
         uint64_t pc = fault.frame[k].pc;
         if (pc > (uint64_t) (uintptr_t) fault_caller && pc < (uint64_t) (uintptr_t) fault_caller + 256) unwound = 1;
     }
-    printf("%s fault: the unwind went past the signal into the caller\n", unwound ? "ok  " : "FAIL");
+    printf("%s %s: the record reaches past the signal into the caller\n", unwound ? "ok  " : "FAIL", how);
+    for (uint32_t k = 0; !unwound && noted && k < fault.frames; k++)
+        printf("info %s: #%u %#llx %s+%#llx (caller at %#llx)\n", how, k, (unsigned long long) fault.frame[k].pc,
+               fault.frame[k].module, (unsigned long long) (fault.frame[k].pc - fault.frame[k].base),
+               (unsigned long long) (uintptr_t) fault_caller);
     close(ring_fd);
     unlink(ring_file);
     return !died | !noted | !named | !unwound;
@@ -2723,7 +2737,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

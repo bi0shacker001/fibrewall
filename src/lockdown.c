@@ -1439,6 +1439,76 @@ static void fault_frame(struct sbx_trace_frame *frame, uint64_t pc, int is_retur
 
 static int fault_taken;
 
+/* Tests set this to exercise the frame-pointer walk alone (internal.h). */
+int sbx_trace_fault_frame_pointers_only;
+
+/* How far above the faulting sp a frame record may lie: a thread's stack, at most. */
+#define FRAME_WALK_SPAN (8u << 20)
+
+/*
+ * The faulting thread's callers from its own frame records, starting at
+ * the frame pointer the signal saved: on arm64 x29 points at {previous x29,
+ * return address}, on x86_64 rbp at {previous rbp, return address}.
+ * Android's arm64 code keeps frame pointers. Each record must lie above the
+ * last, within FRAME_WALK_SPAN of sp and aligned, or the walk stops. A read
+ * that faults anyway ends the process (SIGSEGV is blocked in this handler),
+ * so each frame is counted as soon as it is written: what was found stays.
+ */
+static unsigned walk_frame_pointers(struct sbx_trace_fault *fault, const ucontext_t *uc, unsigned frames) {
+#if defined(__aarch64__)
+    uintptr_t fp = (uintptr_t) uc->uc_mcontext.regs[29];
+    const uintptr_t align = 16;
+#else
+    uintptr_t fp = (uintptr_t) uc->uc_mcontext.gregs[REG_RBP];
+    const uintptr_t align = 8;
+#endif
+    uintptr_t low = (uintptr_t) fault->sp;
+    int chain = fp >= low && fp - low < FRAME_WALK_SPAN && fp % align == 0;
+    /*
+     * A leaf function sets up no frame record, so the chain starts at its
+     * caller's and would skip the caller itself. That caller's return
+     * address is in x30 on arm64 and on top of the stack on x86_64. It is
+     * kept when it falls in a loaded library and is not the chain's first
+     * address anyway, and dropped when it is inside the faulting function
+     * itself (a non-leaf has since used x30 for its own calls). Where no
+     * symbol says which function either is in, it is kept and named "link"
+     * so a reader takes it as a lead, not a proven caller.
+     */
+#if defined(__aarch64__)
+    uint64_t link = (uint64_t) uc->uc_mcontext.regs[30] & 0x0000ffffffffffffull;
+#else
+    uint64_t link = low % 8 == 0 ? (uint64_t) *(const uintptr_t *) low : 0;
+#endif
+    uint64_t first = chain ? (uint64_t) ((const uintptr_t *) fp)[1] & 0x0000ffffffffffffull : 0;
+    if (link != 0 && link != first && frames < SBX_TRACE_FRAMES) {
+        Dl_info at_link, at_pc;
+        memset(&at_link, 0, sizeof(at_link));
+        memset(&at_pc, 0, sizeof(at_pc));
+        if (dladdr((const void *) (uintptr_t) (link - 1), &at_link) != 0) {
+            int known = dladdr((const void *) (uintptr_t) fault->pc, &at_pc) != 0 && at_pc.dli_saddr != NULL &&
+                        at_link.dli_saddr != NULL;
+            int same = known && at_link.dli_saddr == at_pc.dli_saddr && at_link.dli_fbase == at_pc.dli_fbase;
+            if (!same) {
+                fault_frame(&fault->frame[frames], link, 1);
+                if (!known) copy_name(fault->frame[frames].name, sizeof(fault->frame[frames].name), "link");
+                __atomic_store_n(&fault->frames, ++frames, __ATOMIC_RELEASE);
+            }
+        }
+    }
+    while (chain && frames < SBX_TRACE_FRAMES && fp >= low && fp - low < FRAME_WALK_SPAN && fp % align == 0) {
+        const uintptr_t *record = (const uintptr_t *) fp;
+        uintptr_t next = record[0];
+        /* Pointer authentication may sign the saved address; a user address has no high bits. */
+        uint64_t ret = (uint64_t) record[1] & 0x0000ffffffffffffull;
+        if (ret == 0) break;
+        fault_frame(&fault->frame[frames], ret, 1);
+        __atomic_store_n(&fault->frames, ++frames, __ATOMIC_RELEASE);
+        if (next <= fp) break;
+        fp = next;
+    }
+    return frames;
+}
+
 void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *context) {
     struct sbx_trace_header *ring = __atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE);
     if (!ring || !info || !context) return;
@@ -1462,14 +1532,18 @@ void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *conte
     /* The faulting place first, from the registers: it holds even when the unwind below finds nothing. */
     unsigned frames = 0;
     if (fault->pc != 0) fault_frame(&fault->frame[frames++], fault->pc, 0);
+    __atomic_store_n(&fault->frames, frames, __ATOMIC_RELEASE);
     /*
      * The unwind starts in this handler and passes through the signal
-     * frame; its own frames are dropped up to the faulting pc. When the
-     * faulting pc is not among them (no unwind information past the signal
-     * frame), every frame is kept, the handler's included, rather than none.
+     * frame; its own frames are dropped up to the faulting pc. When it does
+     * not reach the faulting pc (on an arm64 Retroid Pocket 5 it stopped at
+     * ART's signal chain, and the record showed only this handler's frames;
+     * Droidtop/tracker#550, 2026-10-24), the callers come from the faulting
+     * thread's frame records instead.
      */
     struct unwound unwound = {.count = 0};
-    _Unwind_Backtrace(unwind_one, &unwound);
+    if (!sbx_trace_fault_frame_pointers_only) _Unwind_Backtrace(unwind_one, &unwound);
+    /* The unwind is used when it found the faulting pc with callers after it. */
     unsigned first = 0;
     for (unsigned k = 0; k < unwound.count; k++) {
         if (unwound.pc[k] == fault->pc) {
@@ -1477,8 +1551,12 @@ void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *conte
             break;
         }
     }
-    for (unsigned k = first; k < unwound.count && frames < SBX_TRACE_FRAMES; k++) {
-        fault_frame(&fault->frame[frames++], unwound.pc[k], 1);
+    if (first > 0 && first < unwound.count) {
+        for (unsigned k = first; k < unwound.count && frames < SBX_TRACE_FRAMES; k++) {
+            fault_frame(&fault->frame[frames++], unwound.pc[k], 1);
+        }
+    } else {
+        frames = walk_frame_pointers(fault, uc, frames);
     }
     fault->frames = frames;
     __atomic_store_n(&fault->state, SBX_TRACE_LEFT, __ATOMIC_RELEASE);

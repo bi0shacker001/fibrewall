@@ -32,7 +32,7 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.4"
+#define SBX_VERSION "0.1.5"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
 #define SBX_VERSION_PATCH 2

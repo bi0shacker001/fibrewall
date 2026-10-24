@@ -73,6 +73,8 @@ Not built yet:
 
 ### Releases
 
+- **v0.1.5** (2026-10-24): `sbx_trace_fault` reaches the faulting thread's callers where the unwinder stops at the signal chain, by walking its frame records (arm64 x29, x86_64 rbp) and the leaf's link ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)).
+
 - **v0.1.4** (2026-10-24): 64-bit only, the owner's rule ([Droidtop/tracker#646](https://github.com/Droidtop/tracker/issues/646)):
   - the library builds for x86_64 and arm64 (Linux and Android arm64-v8a, x86_64). On any other architecture `lockdown.c` stops at an `#error`; the ENOSYS stubs that let 32-bit hosts link are gone, and CI no longer builds armeabi-v7a or x86.
 

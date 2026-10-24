@@ -1568,7 +1568,14 @@ the lockdown refuses, so the crash went unexplained.
   the pc, sp and link register, and up to 32 frames. The first frame comes
   from the registers, so it holds even when nothing can be unwound. The rest
   come from `_Unwind_Backtrace` through the signal frame, with the handler's
-  own frames dropped. Each frame carries its library's file name and load
+  own frames dropped, when that unwind reaches the faulting pc. Where it does
+  not (on an arm64 Retroid Pocket 5 it stopped at ART's signal chain, and the
+  first record showed only the handler's own frames, which read as a crash in
+  the sandbox; #550, 2026-10-24), the callers come from the faulting thread's
+  frame records: x29 or rbp, each record bounded to 8 MB above sp, aligned and
+  rising. First comes the leaf's caller from x30 (arm64) or the top of the
+  stack (x86_64), dropped when it is inside the faulting function and named
+  "link" when no symbol can say. Each frame carries its library's file name and load
   address (pc minus base is the offset to look up in that file) and the
   nearest exported symbol, from `dladdr`. It makes no system call the
   lockdown traps: stores into the shared mapping, plus gettid. Only the
