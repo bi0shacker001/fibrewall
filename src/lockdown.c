@@ -1965,6 +1965,13 @@ int sbx_trace(int fd, unsigned slots) {
     (void) slots;
     return -ENOSYS;
 }
+
+/* No ring without a lockdown, so nothing to note. */
+void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *context) {
+    (void) signal_number;
+    (void) info;
+    (void) context;
+}
 #endif
 
 #ifdef SBX_ARCH
