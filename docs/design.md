@@ -155,7 +155,9 @@ The filter:
   fanotify marks, file handles. Also execve(at), socket (a Unix datagram
   socket for the system log can be allowed with `SBX_LOCK_LOG_SOCKET`, or
   inet sockets with `SBX_LOCK_INET`), bind and connect (open again with
-  the sockets those flags allow), ptrace, process_vm_readv/writev, process_madvise, bpf,
+  the sockets those flags allow), ptrace, process_vm_writev, process_vm_readv of
+  another process (of its own memory it is allowed: ART's SafeCopy reads so
+  before it accepts a SIGSEGV as an implicit null check), process_madvise, bpf,
   perf_event_open, io_uring. Also a call through another architecture's
   entry (x32 or `int 0x80` on x86_64).
 - **Refuses with EPERM.**

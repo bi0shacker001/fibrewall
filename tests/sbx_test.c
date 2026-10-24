@@ -371,6 +371,14 @@ static void working(void) {
     char path[512], path2[512], buffer[512];
     struct stat st;
 
+    /* ART's SafeCopy: its own memory through process_vm_readv on getpid() (the parent's stays refused, above). */
+    {
+        char from[8] = "own mem", to[8] = {0};
+        struct iovec l = {to, sizeof(to)}, r = {from, sizeof(from)};
+        EXPECT(process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t) sizeof(from) && memcmp(from, to, sizeof(to)) == 0,
+               "process_vm_readv of its own memory (ART's SafeCopy)");
+    }
+
     snprintf(path, sizeof(path), "%s/data.txt", game);
     int fd = open(path, O_RDONLY);
     EXPECT(fd >= 0, "game file opens for reading");

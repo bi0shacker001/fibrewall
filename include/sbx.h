@@ -32,7 +32,7 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.5"
+#define SBX_VERSION "0.1.6"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
 #define SBX_VERSION_PATCH 2
@@ -245,7 +245,8 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * file system view is the one thing restricted, through the broker; link,
  * symlink and truncate are brokered like the rest, and sockets, signals,
  * inotify, shared memory and descriptors are allowed outright. Clear
- * escapes stay refused whatever the flags: ptrace, process_vm_*, new
+ * escapes stay refused whatever the flags: ptrace, process_vm_* (but a
+ * read of the process's own memory), new
  * namespaces, mounts, bpf, perf_event_open, io_uring, module loading, the
  * keyring. A host may add or remove any flag of it.
  */

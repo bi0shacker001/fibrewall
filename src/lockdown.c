@@ -13,7 +13,8 @@
  *     past the process: truncate, link, symlink, mknod, chmod, chown,
  *     utimes on a path, inotify and fanotify marks, file handles, path
  *     xattrs, execve, socket (but a datagram Unix socket for the system
- *     log when asked), bind, connect, ptrace, process_vm_readv/writev,
+ *     log when asked), bind, connect, ptrace, process_vm_writev,
+ *     process_vm_readv of any other process,
  *     process_madvise, bpf, perf_event_open and io_uring;
  *   - refuses with EPERM namespaces and mounts (clone with a CLONE_NEW*
  *     flag, unshare, setns, mount and the new mount API, pivot_root,
@@ -1993,9 +1994,20 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
             rule(refused_paths[i], REFUSE);
         }
     }
+    /*
+     * Reading its own memory reaches nothing past the process, and ART does
+     * it: art::SafeCopy reads with process_vm_readv on getpid(), and
+     * FaultManager::IsInGeneratedCode calls SafeCopy before it decides that a
+     * SIGSEGV is one of ART's implicit null checks. Refused, every null
+     * receiver in Java became a fatal SIGSEGV at nterp_op_invoke_virtual
+     * instead of a NullPointerException: KiriKiri and mkxp-z died so locked
+     * down on a Retroid Pocket 5 (Droidtop/tracker#550, 2026-10-24). Any
+     * other process's memory stays refused.
+     */
+    own_process_only(__NR_process_vm_readv, pid, REFUSE);
     /* Refused: reaching past the process. */
     static const unsigned refused[] = {
-        __NR_execve, __NR_execveat, __NR_ptrace, __NR_process_vm_readv, __NR_process_vm_writev,
+        __NR_execve, __NR_execveat, __NR_ptrace, __NR_process_vm_writev,
         __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup, __NR_io_uring_enter,
         __NR_io_uring_register,
     };
