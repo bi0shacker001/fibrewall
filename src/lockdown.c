@@ -128,15 +128,11 @@
 static const int x86_args[6] = {REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_R9};
 #define ARG(uc, i) ((long) (uc)->uc_mcontext.gregs[x86_args[i]])
 #define SET_RESULT(uc, v) ((uc)->uc_mcontext.gregs[REG_RAX] = (long) (v))
+#else
+/* The owner's rule: 64-bit only, no 32-bit stubs (Droidtop/tracker#646). */
+#error "sbx locks down on x86_64 and arm64 only"
 #endif
 
-/*
- * Everything from here to sbx_lockdown is for the two architectures the
- * handler knows (their system-call numbers and registers). Elsewhere (a
- * 32-bit build of a host that also ships those ABIs) the library builds,
- * and sbx_lockdown and sbx_local_add answer ENOSYS.
- */
-#ifdef SBX_ARCH
 
 /* SECCOMP_RET_DATA of our traps, which tells them from anyone else's SIGSYS. */
 #define SBX_TRAP_DATA 0x5b0
@@ -1461,8 +1457,6 @@ void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *conte
     fault->pc = (uint64_t) uc->uc_mcontext.pc;
     fault->sp = (uint64_t) uc->uc_mcontext.sp;
     fault->lr = (uint64_t) uc->uc_mcontext.regs[30];
-#else
-    (void) uc;
 #endif
     fault->tid = (int32_t) syscall(__NR_gettid);
     /* The faulting place first, from the registers: it holds even when the unwind below finds nothing. */
@@ -1948,33 +1942,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     ret(ALLOW);
     return filter_length <= FILTER_MAX ? 0 : -E2BIG;
 }
-#else
-int sbx_local_add(const char *path, int fd) {
-    (void) path;
-    if (fd >= 0) close(fd);
-    return -ENOSYS;
-}
 
-int sbx_local_add_mode(const char *path, int fd, unsigned mode) {
-    (void) mode;
-    return sbx_local_add(path, fd);
-}
-
-int sbx_trace(int fd, unsigned slots) {
-    (void) fd;
-    (void) slots;
-    return -ENOSYS;
-}
-
-/* No ring without a lockdown, so nothing to note. */
-void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *context) {
-    (void) signal_number;
-    (void) info;
-    (void) context;
-}
-#endif
-
-#ifdef SBX_ARCH
 /*
  * Takes SIGSYS out of every installed handler's mask, read and written with
  * the raw call: ART's sigchain interposes sigaction(), and what blocks
@@ -2030,14 +1998,8 @@ static int sigsys_blocked_somewhere(void) {
     closedir(tasks);
     return found;
 }
-#endif
 
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
-#ifndef SBX_ARCH
-    (void) broker_fd;
-    (void) options;
-    return -ENOSYS;
-#else
     if (locked) return -EALREADY;
     struct sbx_lockdown_options none = {.flags = 0};
     if (!options) options = &none;
@@ -2202,18 +2164,9 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     broker = -1;
     cwd = -1;
     return error;
-#endif
 }
 
 int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, const char *library) {
-#ifndef SBX_ARCH
-    (void) flags;
-    (void) broker_fd;
-    (void) cwd_fd;
-    (void) exec_helper_fd;
-    (void) library;
-    return -ENOSYS;
-#else
     if (locked) return -EALREADY;
     if (!(flags & SBX_LOCK_EXEC) || (flags & (SBX_LOCK_UNBROKERED | SBX_LOCK_PASSTHROUGH))) return -EINVAL;
     if (broker_fd < 0 || cwd_fd < 0 || exec_helper_fd < 0) return -EBADF;
@@ -2256,5 +2209,4 @@ int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, con
     }
     locked = 1;
     return 0;
-#endif
 }

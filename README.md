@@ -73,6 +73,9 @@ Not built yet:
 
 ### Releases
 
+- **v0.1.4** (2026-10-24): 64-bit only, the owner's rule ([Droidtop/tracker#646](https://github.com/Droidtop/tracker/issues/646)):
+  - the library builds for x86_64 and arm64 (Linux and Android arm64-v8a, x86_64). On any other architecture `lockdown.c` stops at an `#error`; the ENOSYS stubs that let 32-bit hosts link are gone, and CI no longer builds armeabi-v7a or x86.
+
 - **v0.1.3** (2026-10-24), for cores that die of a segmentation fault under Enginehost's lockdown ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)):
   - `sbx_trace_fault`: a fatal signal noted in the trace ring with its address, the faulting place and an unwind of its callers, each named by library and symbol; the ring's version is 2 ([docs/design.md](docs/design.md), "When a trap kills").
 

@@ -64,17 +64,17 @@ jobs:
         run: .\build\Release\sbx_test_win.exe
 
   android-build:
-    # Compiles for every Android ABI (tests for the 64-bit ones); the x86_64 build also runs on the emulator below.
+    # Compiles, with its tests, for the two Android ABIs that ship; the x86_64 build also runs on the emulator below.
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        # The 32-bit ABIs build (the lockdown answers ENOSYS there): a host that ships them still links the library.
-        abi: [arm64-v8a, x86_64, armeabi-v7a, x86]
+        # 64-bit only (Droidtop/tracker#646): a 32-bit build stops at an #error in lockdown.c.
+        abi: [arm64-v8a, x86_64]
     steps:
       - uses: actions/checkout@v4
       - name: Build with the NDK
         run: |
-          cmake -S . -B build             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-26 -DSBX_TESTS=${{ (matrix.abi == 'armeabi-v7a' || matrix.abi == 'x86') && 'OFF' || 'ON' }}
+          cmake -S . -B build             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-26
           cmake --build build -j
 
   android-emulator:

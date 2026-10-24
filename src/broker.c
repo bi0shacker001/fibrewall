@@ -63,10 +63,6 @@
 #define __NR_renameat2 316
 #elif defined(__aarch64__)
 #define __NR_renameat2 276
-#elif defined(__arm__)
-#define __NR_renameat2 382
-#elif defined(__i386__)
-#define __NR_renameat2 353
 #endif
 #endif
 
@@ -1572,8 +1568,6 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
 }
 
 const char *sbx_syscall_name(long nr) {
-#if defined(__x86_64__) || defined(__aarch64__)
-    /* Only these architectures lock down, so only their records arrive (32-bit ARM has no mmap, for one). */
     switch (nr) {
 #define NAME(call) case __NR_##call: return #call;
 #ifdef __NR_execve
@@ -1630,10 +1624,6 @@ const char *sbx_syscall_name(long nr) {
 #undef NAME
     default: return NULL;
     }
-#else
-    (void) nr;
-    return NULL;
-#endif
 }
 
 /*
@@ -1643,7 +1633,6 @@ const char *sbx_syscall_name(long nr) {
  * here as well.
  */
 static const char *allowed_by(long nr, const int64_t *args) {
-#if defined(__x86_64__) || defined(__aarch64__)
     switch (nr) {
     case __NR_socket: {
         unsigned type = (unsigned) args[1] & 0xf;
@@ -1683,11 +1672,6 @@ static const char *allowed_by(long nr, const int64_t *args) {
     default:
         return NULL;
     }
-#else
-    (void) nr;
-    (void) args;
-    return NULL;
-#endif
 }
 
 /*
