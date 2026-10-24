@@ -54,8 +54,10 @@
 #include <sys/ucontext.h>
 #include <sys/uio.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <unwind.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -1362,7 +1364,7 @@ int sbx_trace(int fd, unsigned slots) {
     if (locked) return -EALREADY;
     if (__atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE)) return -EALREADY;
     if (slots < 16 || slots > 4096) return -EINVAL;
-    size_t size = sizeof(struct sbx_trace_header) + (size_t) slots * sizeof(struct sbx_trace_entry);
+    size_t size = SBX_TRACE_FAULT_OFFSET(slots) + sizeof(struct sbx_trace_fault);
     if (ftruncate(fd, 0) != 0 || ftruncate(fd, (off_t) size) != 0) return -errno;
     void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) return -errno;
@@ -1400,6 +1402,92 @@ static void trace_leave(struct sbx_trace_entry *entry) {
     if (!entry) return;
     uint32_t state = __atomic_load_n(&entry->state, __ATOMIC_RELAXED);
     __atomic_store_n(&entry->state, (state & ~0xffu) | SBX_TRACE_LEFT, __ATOMIC_RELEASE);
+}
+
+/* The return addresses an unwind from the handler finds, the handler's own frames first. */
+struct unwound {
+    uint64_t pc[SBX_TRACE_FRAMES + 16];
+    unsigned count;
+};
+
+static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *context, void *data) {
+    struct unwound *unwound = data;
+    uint64_t pc = (uint64_t) _Unwind_GetIP(context);
+    if (pc == 0) return _URC_END_OF_STACK;
+    unwound->pc[unwound->count++] = pc;
+    return unwound->count < sizeof(unwound->pc) / sizeof(unwound->pc[0]) ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+
+/* Copies at most size - 1 bytes and terminates: no snprintf in a signal handler. */
+static void copy_name(char *out, size_t size, const char *name) {
+    size_t k = 0;
+    for (; name && name[k] && k + 1 < size; k++) out[k] = name[k];
+    out[k] = '\0';
+}
+
+/* A frame: pc, and the library and symbol it falls in. A return address is looked up one byte back, inside its call. */
+static void fault_frame(struct sbx_trace_frame *frame, uint64_t pc, int is_return) {
+    frame->pc = pc;
+    Dl_info found;
+    memset(&found, 0, sizeof(found));
+    if (dladdr((const void *) (uintptr_t) (is_return ? pc - 1 : pc), &found) == 0) return;
+    frame->base = (uint64_t) (uintptr_t) found.dli_fbase;
+    frame->symbol = (uint64_t) (uintptr_t) found.dli_saddr;
+    const char *file = found.dli_fname;
+    for (const char *c = file; c && *c; c++) {
+        if (*c == '/') file = c + 1;
+    }
+    copy_name(frame->module, sizeof(frame->module), file);
+    copy_name(frame->name, sizeof(frame->name), found.dli_sname);
+}
+
+static int fault_taken;
+
+void sbx_trace_fault(int signal_number, const siginfo_t *info, const void *context) {
+    struct sbx_trace_header *ring = __atomic_load_n(&trace_ring, __ATOMIC_ACQUIRE);
+    if (!ring || !info || !context) return;
+    if (__atomic_exchange_n(&fault_taken, 1, __ATOMIC_ACQ_REL)) return;
+    struct sbx_trace_fault *fault = (struct sbx_trace_fault *) ((char *) ring + SBX_TRACE_FAULT_OFFSET(ring->slots));
+    const ucontext_t *uc = context;
+    __atomic_store_n(&fault->state, SBX_TRACE_ENTERED, __ATOMIC_RELEASE);
+    fault->signal = signal_number;
+    fault->code = info->si_code;
+    fault->address = (uint64_t) (uintptr_t) info->si_addr;
+#if defined(__x86_64__)
+    fault->pc = (uint64_t) uc->uc_mcontext.gregs[REG_RIP];
+    fault->sp = (uint64_t) uc->uc_mcontext.gregs[REG_RSP];
+    fault->lr = (uint64_t) uc->uc_mcontext.gregs[REG_RBP];
+#elif defined(__aarch64__)
+    fault->pc = (uint64_t) uc->uc_mcontext.pc;
+    fault->sp = (uint64_t) uc->uc_mcontext.sp;
+    fault->lr = (uint64_t) uc->uc_mcontext.regs[30];
+#else
+    (void) uc;
+#endif
+    fault->tid = (int32_t) syscall(__NR_gettid);
+    /* The faulting place first, from the registers: it holds even when the unwind below finds nothing. */
+    unsigned frames = 0;
+    if (fault->pc != 0) fault_frame(&fault->frame[frames++], fault->pc, 0);
+    /*
+     * The unwind starts in this handler and passes through the signal
+     * frame; its own frames are dropped up to the faulting pc. When the
+     * faulting pc is not among them (no unwind information past the signal
+     * frame), every frame is kept, the handler's included, rather than none.
+     */
+    struct unwound unwound = {.count = 0};
+    _Unwind_Backtrace(unwind_one, &unwound);
+    unsigned first = 0;
+    for (unsigned k = 0; k < unwound.count; k++) {
+        if (unwound.pc[k] == fault->pc) {
+            first = k + 1;
+            break;
+        }
+    }
+    for (unsigned k = first; k < unwound.count && frames < SBX_TRACE_FRAMES; k++) {
+        fault_frame(&fault->frame[frames++], unwound.pc[k], 1);
+    }
+    fault->frames = frames;
+    __atomic_store_n(&fault->state, SBX_TRACE_LEFT, __ATOMIC_RELEASE);
 }
 
 static void handle_sigsys(int signal_number, siginfo_t *info, void *context);

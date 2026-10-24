@@ -73,6 +73,9 @@ Not built yet:
 
 ### Releases
 
+- **v0.1.3** (2026-10-24), for cores that die of a segmentation fault under Enginehost's lockdown ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)):
+  - `sbx_trace_fault`: a fatal signal noted in the trace ring with its address, the faulting place and an unwind of its callers, each named by library and symbol; the ring's version is 2 ([docs/design.md](docs/design.md), "When a trap kills").
+
 - **v0.1.2** (2026-10-23), for Ren'Py under Enginehost's lockdown ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)):
   - `SBX_LOCK_WATCH`: inotify marks decided and added by the broker, scoped to readable paths and narrowed to a folder's own events where it holds a name the process may not read ([docs/design.md](docs/design.md), "SBX_LOCK_WATCH").
 

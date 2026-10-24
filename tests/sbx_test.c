@@ -848,6 +848,73 @@ static int trace_check(void) {
     return failed | !header_ok | !found | killed | stuck;
 }
 
+/* The fault test's handler: notes the fault, then lets the default action end the process. */
+static void note_fault(int signal_number, siginfo_t *info, void *context) {
+    sbx_trace_fault(signal_number, info, context);
+    signal(signal_number, SIG_DFL);
+}
+
+/* Not inlined, so the unwind has a caller to find above it. */
+__attribute__((noinline)) static void fault_here(volatile int *where) {
+    *where = 1;
+}
+
+__attribute__((noinline)) static void fault_caller(volatile int *where) {
+    fault_here(where);
+    __asm__ volatile("" ::: "memory");
+}
+
+/* A fatal signal in a locked-down process: its place and its callers noted after the ring's entries. */
+static int fault_check(const char *program_path) {
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    char ring_file[PATH_MAX];
+    snprintf(ring_file, sizeof(ring_file), "%s/sbx-fault-XXXXXX", tmp);
+    int ring_fd = mkstemp(ring_file);
+    if (ring_fd < 0) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    if (sbx_broker_start(sbx_policy_new(), pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_sigaction = note_fault;
+        action.sa_flags = SA_SIGINFO;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGSEGV, &action, NULL) != 0) _exit(2);
+        if (sbx_trace(ring_fd, 16) != 0 || sbx_lockdown(pair[1], NULL) != 0) _exit(2);
+        fault_caller((volatile int *) (uintptr_t) 0x10);
+        _exit(3);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int died = WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV;
+    printf("%s fault: the process still dies of the signal (status %#x)\n", died ? "ok  " : "FAIL", status);
+    struct sbx_trace_fault fault;
+    memset(&fault, 0, sizeof(fault));
+    int got = pread(ring_fd, &fault, sizeof(fault), (off_t) SBX_TRACE_FAULT_OFFSET(16)) == (ssize_t) sizeof(fault);
+    int noted = got && fault.state == SBX_TRACE_LEFT && fault.signal == SIGSEGV && fault.tid == child &&
+                fault.address == 0x10 && fault.pc != 0 && fault.frames >= 1 && fault.frame[0].pc == fault.pc;
+    printf("%s fault: noted whole, with its signal, thread, address and place (%u frames)\n",
+           noted ? "ok  " : "FAIL", got ? fault.frames : 0);
+    const char *self = strrchr(program_path, '/') ? strrchr(program_path, '/') + 1 : program_path;
+    int named = noted && fault.frame[0].base != 0 && strcmp(fault.frame[0].module, self) == 0;
+    printf("%s fault: the place is named by its file (%s) and load address\n", named ? "ok  " : "FAIL",
+           noted ? fault.frame[0].module : "");
+    /* The caller: a return address inside fault_caller, below where fault_here starts. */
+    int unwound = 0;
+    for (uint32_t k = 1; noted && k < fault.frames; k++) {
+        uint64_t pc = fault.frame[k].pc;
+        if (pc > (uint64_t) (uintptr_t) fault_caller && pc < (uint64_t) (uintptr_t) fault_caller + 256) unwound = 1;
+    }
+    printf("%s fault: the unwind went past the signal into the caller\n", unwound ? "ok  " : "FAIL");
+    close(ring_fd);
+    unlink(ring_file);
+    return !died | !noted | !named | !unwound;
+}
+
 static int learn_check(void) {
     const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
     char folder[PATH_MAX], file[PATH_MAX + 32];
@@ -2656,7 +2723,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

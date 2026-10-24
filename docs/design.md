@@ -1555,6 +1555,28 @@ case.
   such as a trap on a thread with SIGSYS blocked. It logs thousands of lines
   in a busy process, so it is for diagnosing only.
 
+A third death leaves neither: a fault in the confined code itself, after the
+lockdown (#550, 2026-10-24: KiriKiri, mkxp-z and LÖVE died of SIGSEGV about a
+second after "Process locked down", with no refusal before it). Android
+writes a tombstone for a crash by starting crash_dump, a new process, which
+the lockdown refuses, so the crash went unexplained.
+
+- **The fault record** (`sbx_trace_fault(signal, info, context)`, version 2
+  of the ring). The host's own handler for SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+  SIGTRAP or SIGABRT calls it, then passes the signal on as before. It notes,
+  after the ring's entries, the signal, its code and address, the thread,
+  the pc, sp and link register, and up to 32 frames. The first frame comes
+  from the registers, so it holds even when nothing can be unwound. The rest
+  come from `_Unwind_Backtrace` through the signal frame, with the handler's
+  own frames dropped. Each frame carries its library's file name and load
+  address (pc minus base is the offset to look up in that file) and the
+  nearest exported symbol, from `dladdr`. It makes no system call the
+  lockdown traps: stores into the shared mapping, plus gettid. Only the
+  first fault is noted. The library installs no handler itself: a host
+  knows how signals are chained in its process (ART's sigchain on Android)
+  and a library does not. Layout: `struct sbx_trace_fault` in `sbx.h`, at
+  `SBX_TRACE_FAULT_OFFSET(slots)`.
+
 One such death needed no blocked mask at all. While the handler waits for
 the broker, another signal's handler on the same thread makes a trapped
 call. The kernel had blocked SIGSYS for the handler's duration, so the

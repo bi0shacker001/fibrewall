@@ -32,7 +32,7 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.2"
+#define SBX_VERSION "0.1.3"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
 #define SBX_VERSION_PATCH 2
@@ -75,6 +75,8 @@ typedef int sbx_handle;    /* a descriptor */
 int sbx_open(const char *path, unsigned flags, sbx_handle *out);
 
 #ifndef _WIN32
+
+#include <signal.h>
 
 /* ---- The confined half ---- */
 
@@ -349,7 +351,7 @@ int sbx_local_add(const char *path, int fd);
  * dies. The ring wraps; seq says which entries are newest.
  */
 #define SBX_TRACE_MAGIC 0x54584253u  /* "SBXT" */
-#define SBX_TRACE_VERSION 1u
+#define SBX_TRACE_VERSION 2u
 #define SBX_TRACE_ENTERED 1u
 #define SBX_TRACE_LEFT 2u
 
@@ -373,10 +375,60 @@ struct sbx_trace_entry {
 };
 
 /*
+ * A fatal signal, noted after the ring's entries (version 2): where a
+ * process died when it did not die in the handler, a segmentation fault in
+ * the confined code, say. Under a lockdown the platform's own crash report
+ * often cannot be written (Android's needs a new process, which the
+ * lockdown refuses), so this is the one record of where it happened.
+ * Frames are the addresses an unwind from the fault found, each with the
+ * library it falls in (its load address, so pc - base is the offset in
+ * that file) and the nearest symbol the library exports.
+ */
+#define SBX_TRACE_FRAMES 32
+
+struct sbx_trace_frame {
+    uint64_t pc;
+    uint64_t base;    /* load address of the library holding pc; 0 when none does */
+    uint64_t symbol;  /* address of the nearest exported symbol; 0 when none */
+    char module[64];  /* the library's file name without its folders, NUL-terminated; may be cut short */
+    char name[64];    /* that symbol's name, NUL-terminated; empty when none */
+};
+
+struct sbx_trace_fault {
+    uint32_t state;    /* 0 none; SBX_TRACE_ENTERED while being written; SBX_TRACE_LEFT once whole */
+    int32_t tid;       /* the thread that took the signal */
+    int32_t signal;
+    int32_t code;      /* si_code: SEGV_MAPERR, SEGV_ACCERR, ... */
+    uint64_t address;  /* si_addr: the address the fault was about */
+    uint64_t pc;       /* where the thread was */
+    uint64_t sp;
+    uint64_t lr;       /* arm64's link register; x86_64's frame pointer */
+    uint32_t frames;   /* frames filled in frame[] */
+    uint32_t reserved;
+    struct sbx_trace_frame frame[SBX_TRACE_FRAMES];
+};
+
+/* Where the fault record of a ring with slots entries starts in its file. */
+#define SBX_TRACE_FAULT_OFFSET(slots) \
+    (sizeof(struct sbx_trace_header) + (size_t) (slots) * sizeof(struct sbx_trace_entry))
+
+/*
+ * Notes a fatal signal in the trace ring, for the host's own handler of
+ * SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP or SIGABRT: called with that
+ * handler's arguments, before it passes the signal on to whatever handled
+ * it before. The first call wins; later ones (another thread faulting
+ * meanwhile, or a fault inside this one) return at once. It makes no
+ * system call the lockdown traps: the record is plain stores into the
+ * ring's shared mapping, and finding names takes only the dynamic
+ * linker's lock (dladdr). Does nothing without a ring.
+ */
+void sbx_trace_fault(int signal, const siginfo_t *info, const void *context);
+
+/*
  * Gives the handler a trace ring: fd is a regular file the caller opened
- * read and write, which this sizes (ftruncate) to a header and slots
- * entries and maps shared, keeping the mapping for the life of the
- * process; fd may be closed afterwards. Call before sbx_lockdown. slots
+ * read and write, which this sizes (ftruncate) to a header, slots entries
+ * and a fault record (struct sbx_trace_fault) and maps shared, keeping the
+ * mapping for the life of the process; fd may be closed afterwards. Call before sbx_lockdown. slots
  * from 16 to 4096. Returns 0 or a negative errno.
  */
 int sbx_trace(int fd, unsigned slots);
