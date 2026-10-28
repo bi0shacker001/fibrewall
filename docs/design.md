@@ -1544,6 +1544,104 @@ open relative to a folder handle the broker gave is refused by the token;
 and a decider that grants one open of a path no rule covers lets the first
 through and refuses the second with `-EACCES`.
 
+### What is left on Windows (design, 2026-10-28, Droidtop/tracker#606)
+
+Design only, for the owner's review. What is built is the spawn, the
+broker, `sbx_open`, static grants, and the escape suite in a plain
+AppContainer and in LPAC. With the droidtop-agent / Pythia lane's answers
+in, what remains is what a real Python plugin host needs, in this order:
+
+1. **Real Python under it, in CI (`tests/python_win.py`).** The escape
+   suite drives a C test program. The owner's rule is about untrusted
+   Python: "`ctypes`, raw sockets and `subprocess` must all end at a
+   refusal from the kernel". The new test spawns the runner's own
+   `python.exe` with `sbx_spawn`, in both container kinds:
+   - The interpreter's folder and standard library are an `SBX_STATIC`
+     read grant, as the agent will grant its bundled runtime. The plugin
+     script goes in a separate folder.
+   - The script tries, and each attempt must be refused:
+     - `subprocess.run` and `os.startfile`;
+     - `ctypes.windll.kernel32.CreateProcessW`;
+     - a `socket` to 127.0.0.1 and to a public address;
+     - `ctypes` calls to `RegCreateKeyExW` and `OpenProcess` of the parent;
+     - opening a file in the user's profile by path;
+     - `os.listdir` of the profile.
+   - It must succeed at: importing the standard library (`json`, `ssl`,
+     `ctypes` itself), reading and writing through a channel handle in the
+     handle list (the agent's plugin-API pipe), and `sbx_open` through a
+     small extension module. The extension module is built in CI, standing
+     in for the agent's `droidtop.host`.
+   - An unconfined control run makes the same attempts first, as the C
+     suite does. Without it, a refusal proves nothing.
+   This is the Windows counterpart of `program_tree_check`. It is what
+   shows the backend is safe for Python, not only for a C program written
+   to be tested.
+2. **Removing a container (`sbx_container_remove`).** Both
+   `CreateAppContainerProfile` and the static grants' access entries
+   (`SetNamedSecurityInfoW`) outlive the plugin today. When the agent
+   removes a plugin, it calls
+   `sbx_container_remove(name, paths, count)`. That removes the access
+   entries naming the container's SID from each granted path, then deletes
+   the profile. It is safe to repeat, and safe on a path that no longer
+   exists. A test checks that no entry for the SID is left on the granted
+   folder.
+3. **Asking first (`sbx_spawn_probe`).** It says before any plugin is
+   started whether this system can confine at all, and why not:
+   - no AppContainer support (before Windows 8);
+   - no LPAC (before Windows 10 1703; plain AppContainer is used);
+   - a job object that cannot be nested;
+   - creating a profile is refused by policy.
+
+   The agent shows that reason, and keeps computer-side plugins off. That
+   is fail closed with an explanation, rather than a bare spawn error.
+4. **A CPU limit.** `sbx_spawn_spec.cpu_percent` is the job's hard CPU
+   rate cap (`JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`), with 0 meaning none.
+   A runaway plugin then can't take the computer, just as `memory_limit`
+   keeps it from taking the memory.
+5. **ARM64 Windows.** Windows on ARM computers run the agent natively.
+   - CI adds a build for `ARM64` (MSVC's cross tools), and the suite and
+     the Python test on GitHub's `windows-11-arm` runner.
+   - The backend has no architecture-specific code, so this is expected
+     to be build and test only.
+6. **A consumer build in CI.** A small parent project includes the
+   library with `add_subdirectory` and the DLL C runtime (`/MD`), and
+   links. That guards what the agent relies on (`70d69f8`): the library
+   never forces `/MT` on a consumer.
+7. **Aliases on Windows, only if the agent asks.** `sbx_policy_alias`
+   (a virtual path such as `/droidtop-host/open/<token>` mapped to a real
+   one) would let the agent's module hand plugins token paths instead of
+   real ones. The agent's flow works without it: the decider allows one
+   real path once (tested). It is listed here so the choice is
+   deliberate, not forgotten.
+
+Not planned: network for plugins (none, per the agent lane), and brokered
+operations other than open (the agent does them itself).
+
+**macOS, for when the owner asks** (deferred: "Windows, for now"). The same
+API and broker:
+- **Spawn:** `posix_spawn` into a sandbox profile applied before `exec`.
+  That is `sandbox_init_with_parameters` with a deny-by-default SBPL
+  profile, as Chromium's macOS sandbox does: no file access but the
+  runtime's read-only folders, no network, no `process-fork` or
+  `process-exec`, and `mach-lookup` limited to what the runtime needs.
+- **Broker:** a Unix socket, passing descriptors with `SCM_RIGHTS`.
+- **Files:** `sbx_open` sends the request; nothing traps. That is the same
+  client call as on Windows.
+- **Tests:** the escape suite and the Python test on GitHub's `macos-14`
+  runners.
+- **Open question:** Apple has deprecated `sandbox_init`, though the
+  system and Chromium still use it. The alternative is the App Sandbox
+  entitlement, which needs a signed app and can't confine a child
+  differently from its parent. So `sandbox_init` stays the plan unless the
+  owner prefers otherwise.
+
+**Questions for the owner:**
+1. **Order:** is 1–6 above the right order, with 7 only on the agent's
+   request?
+2. **CPU cap:** should there be a default the agent always applies (for
+   example 50%), or none unless the agent sets one?
+3. **ARM64 Windows:** is it wanted now, or after x64 ships?
+
 ## When a trap kills: the trace ring and the kernel's audit (built 2026-10-23, Droidtop/tracker#550)
 
 A trapped call ends the process with signal 31 and nothing else whenever
