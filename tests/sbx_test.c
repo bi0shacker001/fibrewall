@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include "sbx.h"
 #include "sbx_contract.h"
+#include "protocol.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -44,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -1047,6 +1049,102 @@ static int learn_check(void) {
 }
 
 /* ---- SBX_LOCK_PATHOPS and SBX_LOCK_INOTIFY: link, symlink and truncate through the broker, marks allowed. ---- */
+
+/*
+ * The broker's wire protocol, driven directly. A test (unconfined) builds a
+ * request and sends it to a broker thread, then reads the reply, so a
+ * malformed or hostile message can be tested without a confined child making
+ * it -- the handler would only ever send well-formed ones. The broker learns
+ * the sender's pid from SO_PASSCRED, which it sets itself. The first
+ * descriptor is the socket the broker answers on; any others follow it.
+ * Returns the reply's result, or -EIO if no reply arrived.
+ */
+static int64_t broker_request(int to, const struct sbx_request *request, const void *body, size_t body_len,
+                              const int *extra, int extra_count) {
+    int answer[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, answer) != 0) return -EIO;
+    struct timeval timeout = {10, 0};
+    setsockopt(answer[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    int fds[4];
+    int n = 0;
+    fds[n++] = answer[1];
+    for (int i = 0; i < extra_count && n < 4; i++) fds[n++] = extra[i];
+    struct iovec parts[2] = {{(void *) request, sizeof(*request)}, {(void *) body, body_len}};
+    union {
+        char buffer[CMSG_SPACE(sizeof(int) * 4)];
+        struct cmsghdr align;
+    } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = parts;
+    message.msg_iovlen = body_len ? 2 : 1;
+    message.msg_control = control.buffer;
+    message.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&message);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int) * n);
+    memcpy(CMSG_DATA(cm), fds, sizeof(int) * n);
+    int64_t result = -EIO;
+    if (sendmsg(to, &message, MSG_NOSIGNAL) >= 0) {
+        struct sbx_reply header;
+        char data[512];
+        struct iovec rparts[2] = {{&header, sizeof(header)}, {data, sizeof(data)}};
+        struct msghdr rmsg;
+        memset(&rmsg, 0, sizeof(rmsg));
+        rmsg.msg_iov = rparts;
+        rmsg.msg_iovlen = 2;
+        ssize_t got = recvmsg(answer[0], &rmsg, 0);
+        if (got >= (ssize_t) sizeof(header)) result = header.result;
+    }
+    close(answer[0]);
+    close(answer[1]);
+    return result;
+}
+
+/* The broker refuses malformed requests rather than misreading or dropping them. */
+static int harness_check(void) {
+    int before = failures;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    int client = pair[1];
+    char path[400];
+    int plen = snprintf(path, sizeof(path), "%s/data.txt", game);
+
+    /* Sanity: a well-formed stat of a granted path answers 0, proving the harness itself works. */
+    struct sbx_request good = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT, .path_len = (uint32_t) plen};
+    EXPECT(broker_request(client, &good, path, (size_t) plen, NULL, 0) == 0, "harness: a well-formed stat answers 0");
+
+    /*
+     * dirfd_sent is a count of 0 or 1. A request claiming 2 (with two extra
+     * descriptors so the fd count still adds up) must be refused, not read as
+     * if one of them were the directory.
+     */
+    int dir = open(game, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int two[2] = {dir, dir};
+    struct sbx_request bad_dirfd = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT,
+                                    .path_len = (uint32_t) plen, .dirfd_sent = 2};
+    EXPECT(broker_request(client, &bad_dirfd, path, (size_t) plen, two, 2) == -EINVAL,
+           "harness: dirfd_sent > 1 is refused with EINVAL");
+    if (dir >= 0) close(dir);
+
+    /* A wrong protocol version is refused. */
+    struct sbx_request bad_version = {.version = SBX_PROTOCOL_VERSION + 1, .op = SBX_STAT, .path_len = (uint32_t) plen};
+    EXPECT(broker_request(client, &bad_version, path, (size_t) plen, NULL, 0) == -EINVAL,
+           "harness: a wrong protocol version is refused");
+
+    /* A zero-length path is refused. */
+    struct sbx_request empty = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT, .path_len = 0};
+    EXPECT(broker_request(client, &empty, "", 0, NULL, 0) == -EINVAL, "harness: a zero-length path is refused");
+
+    close(client);
+    return failures != before;
+}
 
 /*
  * A FIFO in a writable rule must not stall the broker. The broker opens it
@@ -2942,7 +3040,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

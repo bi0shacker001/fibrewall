@@ -84,6 +84,8 @@ endif()
 if(SBX_TESTS)
   add_executable(sbx_test tests/sbx_test.c)
   target_link_libraries(sbx_test PRIVATE sbx)
+  # src/ for protocol.h: the broker-protocol harness builds requests in the real wire format.
+  target_include_directories(sbx_test PRIVATE src)
   # Frame records in the test's own functions: the fault test walks them (fault_check).
   target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror -fno-omit-frame-pointer)
 endif()

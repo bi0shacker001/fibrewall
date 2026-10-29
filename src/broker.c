@@ -1761,6 +1761,8 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
                       size_t body_len, int *fds, int fd_count, pid_t pid) {
     if (fd_count < 1) return;
     int answer = fds[0];
+    /* dirfd_sent and dirfd2_sent are counts of 0 or 1; a larger value is a malformed request, never ours. */
+    if (request->dirfd_sent > 1 || request->dirfd2_sent > 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
     tree_note(policy->tree, pid);
     if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_SIGNAL) {
         if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
