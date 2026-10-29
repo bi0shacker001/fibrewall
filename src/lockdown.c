@@ -119,6 +119,13 @@
 #ifndef __NR_mount_setattr
 #define __NR_mount_setattr 442
 #endif
+/* Terminal input injection; the same values on the two arches above. */
+#ifndef TIOCSTI
+#define TIOCSTI 0x5412
+#endif
+#ifndef TIOCLINUX
+#define TIOCLINUX 0x541c
+#endif
 
 #if defined(__aarch64__)
 #define SBX_ARCH AUDIT_ARCH_AARCH64
@@ -1991,6 +1998,20 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         own_process_only(__NR_rt_tgsigqueueinfo, pid, otherwise);
         if (flags & SBX_LOCK_SIGNAL_TREE) rule(__NR_tkill, TRAP);
     }
+    /*
+     * TIOCSTI and TIOCLINUX push bytes into the input queue of a terminal
+     * the process inherited; a confined process could use either to plant a
+     * command that the shell runs after it exits. Refuse them on any
+     * descriptor, whatever the fd rules below. The kernel reads the ioctl
+     * request as a 32-bit int, so match the low word alone: the high bits
+     * are discarded and cannot be used to slip a request past this.
+     */
+    jeq(__NR_ioctl, 0, 4);
+    load(ARG_LO(1));
+    jeq(TIOCSTI, 1, 0);
+    jeq(TIOCLINUX, 0, 1);
+    ret(DENY);
+    load(offsetof(struct seccomp_data, nr));
     /* Sealed descriptors: kept, but no longer used. */
     if (sealed_count > 0) {
         sealed_block(__NR_ioctl, 0, sealed, sealed_count);

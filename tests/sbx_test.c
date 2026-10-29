@@ -2190,6 +2190,46 @@ static int contract_check(void) {
     return failures ? 1 : 0;
 }
 
+/*
+ * A-02: ioctl(fd, TIOCSTI) and ioctl(fd, TIOCLINUX) push bytes into the
+ * input queue of a terminal the process inherited, so a confined process
+ * could plant a command the shell runs after it exits. The filter refuses
+ * both on any descriptor; a harmless ioctl still reaches the kernel.
+ */
+#ifndef TIOCLINUX
+#define TIOCLINUX 0x541c
+#endif
+static int tiocsti_check(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(30);
+        int fds[2];
+        if (pipe(fds) != 0) _exit(70);
+        char c = 'x';
+        /* Control: unconfined, a pipe is not a tty, so TIOCSTI fails but not with EPERM. */
+        errno = 0;
+        EXPECT(ioctl(fds[0], TIOCSTI, &c) < 0 && errno != EPERM, "tiocsti: unconfined TIOCSTI is not EPERM");
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNBROKERED};
+        int locked = sbx_lockdown(-1, &options);
+        errno = -locked;
+        EXPECT(locked == 0, "tiocsti: lockdown");
+        if (locked != 0) _exit(1);
+        errno = 0;
+        EXPECT(ioctl(fds[0], TIOCSTI, &c) < 0 && errno == EPERM, "tiocsti: TIOCSTI refused with EPERM");
+        errno = 0;
+        EXPECT(ioctl(fds[0], TIOCLINUX, &c) < 0 && errno == EPERM, "tiocsti: TIOCLINUX refused with EPERM");
+        /* A harmless ioctl still reaches the kernel: FIONREAD on the pipe succeeds. */
+        int pending = -1;
+        errno = 0;
+        EXPECT(ioctl(fds[0], FIONREAD, &pending) == 0, "tiocsti: a harmless ioctl still works");
+        _exit(failures ? 1 : 0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 static int inet_check(void) {
     fflush(stdout);
     pid_t child = fork();
@@ -2851,7 +2891,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

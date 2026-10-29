@@ -166,9 +166,15 @@ The filter:
   - The keyring, kcmp, the pidfd calls, tkill.
   - kill, tgkill and the sigqueue calls aimed at any process but this one.
   - A new SIGSYS handler.
+  - The terminal-input ioctls `TIOCSTI` and `TIOCLINUX`, on any descriptor:
+    either pushes bytes into the input queue of a terminal the process
+    inherited, which would outlive it as a command the shell then runs. The
+    request is matched as the kernel reads it, in its low 32 bits alone, so
+    the high bits cannot slip one past.
 - **Traps and makes it on the thread's saved mask:** `rt_sigprocmask`, with
   SIGSYS always left open ("SIGSYS stays open", below).
-- **Allows everything else,** including every call on a descriptor.
+- **Allows everything else,** including every call on a descriptor (but for
+  the two terminal-input ioctls above).
 
 Android's own app filter stays underneath. Filters stack, and the most
 restrictive answer wins.
