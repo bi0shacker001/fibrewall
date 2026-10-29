@@ -25,4 +25,14 @@ int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int helper_fd, const ch
 /* Nonzero makes sbx_trace_fault skip the unwind and walk frame records alone (for its test). */
 extern int sbx_trace_fault_frame_pointers_only;
 
+/*
+ * A canonical byte image of a policy's rules, aliases, net grants, system
+ * sockets and abstract Unix names, in their stored order. The contract's
+ * report hashes it (with the lockdown flags and options) into
+ * policy_digest. Returns a malloc'd buffer the caller frees and sets *len,
+ * or NULL on allocation failure. The format is private and may change
+ * between versions; the backend_version in the report pins it.
+ */
+unsigned char *sbx_policy_serialize(const struct sbx_policy *policy, size_t *len);
+
 #endif

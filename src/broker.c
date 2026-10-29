@@ -34,6 +34,7 @@
 #define _GNU_SOURCE
 #include "sbx.h"
 #include "protocol.h"
+#include "internal.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2090,4 +2091,68 @@ int sbx_broker_start(struct sbx_policy *policy, int fd) {
         return -error;
     }
     return 0;
+}
+
+/*
+ * ---- Canonical serialization for the contract's policy digest (internal.h) ----
+ */
+static void put_u32(unsigned char **p, uint32_t v) {
+    for (int i = 0; i < 4; i++) *(*p)++ = (unsigned char) (v >> (8 * i));
+}
+static void put_u64(unsigned char **p, uint64_t v) {
+    for (int i = 0; i < 8; i++) *(*p)++ = (unsigned char) (v >> (8 * i));
+}
+static void put_bytes(unsigned char **p, const void *b, size_t n) {
+    if (n) memcpy(*p, b, n);
+    *p += n;
+}
+
+unsigned char *sbx_policy_serialize(const struct sbx_policy *policy, size_t *len) {
+    if (len) *len = 0;
+    if (!policy) return NULL;
+    size_t size = 5 + 4 + 8;  /* magic, net, rule count */
+    for (size_t i = 0; i < policy->count; i++) size += 8 + 4 + 4 + policy->rules[i].length;
+    size += 8;
+    for (size_t i = 0; i < policy->alias_count; i++)
+        size += 8 + policy->aliases[i].virtual_length + 8 + policy->aliases[i].real_length;
+    size += 4;
+    for (unsigned i = 0; i < policy->system_count; i++)
+        size += 4 + 8 + (policy->system_paths[i] ? strlen(policy->system_paths[i]) : 0);
+    size += 4;
+    for (unsigned i = 0; i < policy->unix_name_count; i++) size += 4 + 8 + policy->unix_name_lengths[i];
+
+    unsigned char *out = malloc(size);
+    if (!out) return NULL;
+    unsigned char *p = out;
+    put_bytes(&p, "SBXP1", 5);
+    put_u32(&p, policy->net);
+    put_u64(&p, policy->count);
+    for (size_t i = 0; i < policy->count; i++) {
+        put_u64(&p, policy->rules[i].length);
+        put_u32(&p, policy->rules[i].mode);
+        put_u32(&p, policy->rules[i].flags);
+        put_bytes(&p, policy->rules[i].path, policy->rules[i].length);
+    }
+    put_u64(&p, policy->alias_count);
+    for (size_t i = 0; i < policy->alias_count; i++) {
+        put_u64(&p, policy->aliases[i].virtual_length);
+        put_bytes(&p, policy->aliases[i].virtual_path, policy->aliases[i].virtual_length);
+        put_u64(&p, policy->aliases[i].real_length);
+        put_bytes(&p, policy->aliases[i].real_path, policy->aliases[i].real_length);
+    }
+    put_u32(&p, policy->system_count);
+    for (unsigned i = 0; i < policy->system_count; i++) {
+        size_t n = policy->system_paths[i] ? strlen(policy->system_paths[i]) : 0;
+        put_u32(&p, policy->system_grants[i]);
+        put_u64(&p, n);
+        put_bytes(&p, policy->system_paths[i], n);
+    }
+    put_u32(&p, policy->unix_name_count);
+    for (unsigned i = 0; i < policy->unix_name_count; i++) {
+        put_u32(&p, policy->unix_name_modes[i]);
+        put_u64(&p, policy->unix_name_lengths[i]);
+        put_bytes(&p, policy->unix_names[i], policy->unix_name_lengths[i]);
+    }
+    if (len) *len = size;
+    return out;
 }

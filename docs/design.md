@@ -1609,6 +1609,45 @@ new program keeps the filter but not the handler, so its first trapped call
 ended it with signal 31. Learning now records exec and refuses it, as a real
 lockdown does.
 
+## The confinement contract (built 2026-10-29, Droidtop/tracker#651)
+
+`include/sbx_contract.h` adds a report of what a policy and options
+actually enforce, so a consumer can require a guarantee and be refused
+rather than silently given less (the review's finding A-26). It is
+additive; `sbx_lockdown` and the rest are unchanged.
+
+A consumer fills `struct sbx_requirements` with `required`, `preferred`
+and `forbidden` bit sets, and reads back `struct sbx_report`:
+- `effective`: the `SBX_G_*` guarantees the chosen flags and options
+  install, each derived from what the filter and broker actually build,
+  never from what was asked;
+- `blocking`: guarantees the options themselves rule out (for example
+  `SBX_LOCK_SOCKETS` rules out `SBX_G_NET_NONE`; no-IPC is always ruled
+  out here, since `socketpair` and shared memory are always allowed);
+- `residual`: the `SBX_R_*` authority that remains (the host's uid, held
+  device descriptors, the kernel surface, and so on);
+- `unavailable`: the required or preferred guarantees that are not
+  effective;
+- `policy_digest`: SHA-256 over the lockdown flags, the broker policy
+  (when one is given) and the options; `backend` and `backend_version`
+  pin the mapping and the digest format.
+
+`sbx_negotiate` is a dry run: it fills the report and returns `-EPERM`
+(with a one-line `reason`) when a required guarantee would be missing or a
+forbidden residual would remain, without touching the process.
+`sbx_lockdown_checked` negotiates first and installs nothing on `-EPERM`,
+so a failed requirement never leaves a half-confined process. Called on
+the confined side, the digest covers the flags and options only; the
+broker's rules live in another process, so a host that wants them in the
+digest calls `sbx_negotiate` with the policy on the broker side.
+
+The guarantee-to-flag mapping is the capability matrix in
+`docs/review/phase0-architecture.md`. Guarantees the library does not yet
+install (a separate identity on Linux, resource limits on the lockdown
+path, brokered IPC, tree teardown) are never reported effective; a strict
+consumer that requires them is refused, which is the point. The Windows
+backend's report is a later change; the bits are the shared vocabulary.
+
 ## What it does not stop
 
 - **Anything on a descriptor the process already holds.** It runs with the

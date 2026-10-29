@@ -19,6 +19,7 @@
  */
 #define _GNU_SOURCE
 #include "sbx.h"
+#include "sbx_contract.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -2106,6 +2107,89 @@ static int unbrokered_check(void) {
 
 /* ---- Inet: inet sockets and nothing else that reaches out. ---- */
 
+/* ---- The confinement contract: sbx_negotiate's report, and sbx_lockdown_checked's gate. ---- */
+
+static int contract_check(void) {
+    struct sbx_report r;
+    struct sbx_requirements req;
+
+    struct sbx_lockdown_options base = {.flags = 0};
+    memset(&r, 0, sizeof(r));
+    r.size = sizeof(r);
+    EXPECT(sbx_negotiate(NULL, &base, NULL, &r) == 0, "contract: a plain lockdown negotiates");
+    uint64_t want = SBX_G_FS_MEDIATED | SBX_G_NET_NONE | SBX_G_SIGNALS_SELF | SBX_G_EXEC_NONE | SBX_G_NOT_LEARNING |
+                    SBX_G_NO_DEVICES;
+    EXPECT((r.effective & want) == want, "contract: a plain lockdown's guarantees are effective");
+    EXPECT(r.blocking & SBX_G_IPC_NONE, "contract: IPC-none is ruled out on this backend");
+    EXPECT((r.residual & (SBX_R_HOST_UID | SBX_R_KERNEL_SURFACE)) == (SBX_R_HOST_UID | SBX_R_KERNEL_SURFACE),
+           "contract: the host uid and kernel surface are residual");
+    EXPECT(r.backend[0] != '\0' && r.backend_version != 0, "contract: the backend is named and versioned");
+
+    memset(&req, 0, sizeof(req));
+    req.size = sizeof(req);
+    req.required = SBX_G_NET_NONE;
+    EXPECT(sbx_negotiate(NULL, &base, &req, &r) == 0, "contract: requiring no-network is met by a plain lockdown");
+    req.required = SBX_G_IPC_NONE;
+    EXPECT(sbx_negotiate(NULL, &base, &req, &r) == -EPERM && r.reason[0], "contract: requiring no-IPC fails, with a reason");
+    req.required = 0;
+    req.forbidden = SBX_R_HOST_UID;
+    EXPECT(sbx_negotiate(NULL, &base, &req, &r) == -EPERM, "contract: forbidding the host uid fails a same-uid lockdown");
+
+    struct sbx_lockdown_options inet = {.flags = SBX_LOCK_INET};
+    memset(&req, 0, sizeof(req));
+    req.size = sizeof(req);
+    req.required = SBX_G_NET_NONE;
+    EXPECT(sbx_negotiate(NULL, &inet, &req, &r) == -EPERM, "contract: INET cannot satisfy no-network");
+    EXPECT((r.blocking & SBX_G_NET_NONE) && (r.residual & SBX_R_NETWORK_ANY), "contract: INET blocks no-network, leaves network residual");
+
+    struct sbx_lockdown_options contain = {.flags = SBX_LOCK_CONTAIN, .exec_helper = "h", .child_library = "/l"};
+    EXPECT(sbx_negotiate(NULL, &contain, NULL, &r) == 0, "contract: the containment preset negotiates");
+    EXPECT((r.effective & SBX_G_EXEC_CONFINED) && !(r.effective & SBX_G_SIGNALS_SELF), "contract: CONTAIN confines exec, opens signals");
+    EXPECT((r.residual & SBX_R_UID_SIGNALS) && (r.residual & SBX_R_UID_SOCKETS), "contract: CONTAIN leaves uid signals and sockets residual");
+
+    struct sbx_report r2;
+    memset(&r2, 0, sizeof(r2));
+    r2.size = sizeof(r2);
+    sbx_negotiate(NULL, &base, NULL, &r);
+    sbx_negotiate(NULL, &base, NULL, &r2);
+    EXPECT(memcmp(r.policy_digest, r2.policy_digest, 32) == 0, "contract: the same policy digests the same");
+    sbx_negotiate(NULL, &inet, NULL, &r2);
+    EXPECT(memcmp(r.policy_digest, r2.policy_digest, 32) != 0, "contract: different flags digest differently");
+
+    memset(&r, 0, sizeof(r));
+    EXPECT(sbx_negotiate(NULL, &base, NULL, &r) == -EINVAL, "contract: a report without its size is refused");
+
+    /* The gate installs or refuses, and nothing in between. */
+    fflush(stdout);
+    pid_t met = fork();
+    if (met == 0) {
+        struct sbx_lockdown_options o = {.flags = SBX_LOCK_UNBROKERED};
+        struct sbx_requirements want_none = {.size = sizeof(want_none), .required = SBX_G_NET_NONE};
+        struct sbx_report rep = {.size = sizeof(rep)};
+        if (sbx_lockdown_checked(-1, &o, &want_none, &rep) != 0) _exit(1);
+        _exit(socket(AF_INET, SOCK_STREAM, 0) < 0 && errno == EACCES ? 0 : 2);  /* locked: no sockets */
+    }
+    int status = 0;
+    waitpid(met, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "contract: a met requirement locks down, and the filter holds");
+
+    fflush(stdout);
+    pid_t unmet = fork();
+    if (unmet == 0) {
+        struct sbx_lockdown_options o = {.flags = SBX_LOCK_UNBROKERED};
+        struct sbx_requirements impossible = {.size = sizeof(impossible), .required = SBX_G_IPC_NONE};
+        struct sbx_report rep = {.size = sizeof(rep)};
+        if (sbx_lockdown_checked(-1, &o, &impossible, &rep) != -EPERM) _exit(1);
+        int s = socket(AF_INET, SOCK_STREAM, 0);  /* not locked: a socket is still possible */
+        if (s >= 0) close(s);
+        _exit(s >= 0 ? 0 : 2);
+    }
+    waitpid(unmet, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "contract: an unmet requirement installs nothing");
+
+    return failures ? 1 : 0;
+}
+
 static int inet_check(void) {
     fflush(stdout);
     pid_t child = fork();
@@ -2767,7 +2851,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

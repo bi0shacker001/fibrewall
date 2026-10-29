@@ -45,7 +45,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c src/open.c src/attach.c)
+add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c src/open.c src/attach.c src/contract.c)
 target_include_directories(sbx PUBLIC include PRIVATE src)
 target_link_libraries(sbx PUBLIC Threads::Threads)
 target_compile_options(sbx PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)
