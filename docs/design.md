@@ -1518,7 +1518,14 @@ int sbx_process_wait(struct sbx_process *process, int *exit_code); /* then close
 
 `sbx_spawn` keeps its Linux form (`pid_t *`, descriptors 3 and up,
 `RLIMIT_*`); the spec is per system, as each system's limits and handles
-are. On Windows the broker is started by `sbx_spawn` itself when the spec
+are. The same `struct sbx_limit` budgets ride on `sbx_lockdown_options`, so a
+process confined through `sbx_lockdown` or `sbx_attach` is bounded like one
+`sbx_spawn` starts, which those paths were not before (review A-18). Each is
+set as both the soft and hard limit, only ever lowering (no privilege needed),
+after the library's own setup opens and just before the filter, so a low
+`RLIMIT_NOFILE` cannot break the lockdown itself. cgroup-v2 budgets (memory,
+pids, cpu) and the Windows job's CPU-rate/CPU-time/handle limits are the rest
+of A-18 and are not in this step. On Windows the broker is started by `sbx_spawn` itself when the spec
 has a policy, since it needs the child's process handle to duplicate into;
 it serves until the child closes its end, then frees the policy. Rule paths
 on Windows are absolute drive or UNC paths. `sbx_policy_alias`,

@@ -47,6 +47,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -2161,6 +2162,20 @@ static int sigsys_blocked_somewhere(void) {
     return found;
 }
 
+/*
+ * Sets the options' resource limits on the process (review A-18). Each is both
+ * the soft and hard limit; only lowering is attempted, which needs no
+ * privilege. Called after the library's own setup opens and just before the
+ * filter, so a low RLIMIT_NOFILE cannot break the lockdown itself.
+ */
+static int apply_limits(const struct sbx_lockdown_options *options) {
+    for (unsigned i = 0; i < options->limit_count; i++) {
+        struct rlimit limit = {options->limits[i].value, options->limits[i].value};
+        if (setrlimit(options->limits[i].resource, &limit) != 0) return -errno;
+    }
+    return 0;
+}
+
 int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (locked) return -EALREADY;
     struct sbx_lockdown_options none = {.flags = 0};
@@ -2204,6 +2219,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     if (options->sealed_count > SBX_SEALED_MAX || (options->sealed_count && !options->sealed_fds)) return -EINVAL;
     if (options->own_open_count > SBX_OWN_OPENS_MAX || (options->own_open_count && !options->own_opens)) return -EINVAL;
+    if (options->limit_count > SBX_LIMITS_MAX || (options->limit_count && !options->limits)) return -EINVAL;
     for (unsigned k = 0; k < options->sealed_count; k++) {
         if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
     }
@@ -2241,6 +2257,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     }
     if (unbrokered) {
         /* Nothing is forwarded, so no handler and no current directory to keep. */
+        int limited = apply_limits(options);
+        if (limited != 0) { if (helper >= 0) close(helper); return limited; }
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
         struct sock_fprog program = {.len = filter_length, .filter = filter};
         long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, install, &program);
@@ -2314,6 +2332,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     sigemptyset(&action.sa_mask);
     if (error != 0) {
         /* Nothing installed yet. */
+    } else if ((error = apply_limits(options)) != 0) {
+        /* The rlimits were refused; nothing is installed yet (A-18). */
     } else if (sigaction(SIGSYS, &action, &previous) != 0) {
         error = -errno;
     } else if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {

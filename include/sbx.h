@@ -280,6 +280,13 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
 #define SBX_OWN_OPENS_MAX 16
 #define SBX_CLAIMS_MAX 32
 #define SBX_LOCALS_MAX 512
+#define SBX_LIMITS_MAX 8
+
+/* A resource limit (rlimit): both the soft and hard limit are set to value. Used by sbx_lockdown and sbx_spawn. */
+struct sbx_limit {
+    int resource;           /* RLIMIT_* */
+    unsigned long value;    /* soft and hard */
+};
 
 struct sbx_lockdown_options {
     unsigned flags;
@@ -326,6 +333,17 @@ struct sbx_lockdown_options {
      */
     const char *exec_helper;
     const char *child_library;
+    /*
+     * Resource limits (rlimits) set on the process just before the filter
+     * goes on, so a process confined through sbx_lockdown or sbx_attach is
+     * bounded like one started by sbx_spawn, which these paths were not before
+     * (review A-18). Each is applied as both the soft and hard limit; lowering
+     * a limit needs no privilege, so a budget only ever tightens. They are set
+     * after the library's own setup opens, so a low RLIMIT_NOFILE does not
+     * break the lockdown itself.
+     */
+    const struct sbx_limit *limits;
+    unsigned limit_count;  /* at most SBX_LIMITS_MAX */
 };
 
 /*
@@ -467,12 +485,9 @@ int sbx_local_add_mode(const char *path, int fd, unsigned mode);
 /* ---- Starting a sandboxed program (the native kind) ---- */
 
 #define SBX_SPAWN_FDS_MAX 16
-#define SBX_SPAWN_LIMITS_MAX 8
+#define SBX_SPAWN_LIMITS_MAX SBX_LIMITS_MAX
 
-struct sbx_limit {
-    int resource;           /* RLIMIT_* */
-    unsigned long value;    /* soft and hard */
-};
+/* struct sbx_limit is defined above, with sbx_lockdown_options, which shares it. */
 
 struct sbx_spawn_spec {
     const char *path;       /* the program (on Android: a file in the app's native-library directory) */

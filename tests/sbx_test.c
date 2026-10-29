@@ -2390,6 +2390,39 @@ static int unbrokered_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- Resource budgets on the lockdown path (review A-18): rlimits set before the filter. ---- */
+
+static int limits_check(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct sbx_limit lim = {RLIMIT_NOFILE, 64};
+        /* Validated before anything is installed: too many budgets is refused (checked while still unlocked). */
+        struct sbx_lockdown_options toomany = {.flags = SBX_LOCK_UNBROKERED, .limits = &lim, .limit_count = SBX_LIMITS_MAX + 1};
+        EXPECT(sbx_lockdown(-1, &toomany) == -EINVAL, "limits: too many budgets is refused");
+        /* Before this change sbx_lockdown set no limits (only sbx_spawn did); now the options carry them (A-18). */
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNBROKERED, .limits = &lim, .limit_count = 1};
+        int locked = sbx_lockdown(-1, &options);
+        errno = -locked;
+        EXPECT(locked == 0, "limits: unbrokered lockdown carrying an rlimit");
+        if (locked != 0) _exit(1);
+        struct rlimit got;
+        EXPECT(getrlimit(RLIMIT_NOFILE, &got) == 0 && got.rlim_cur == 64 && got.rlim_max == 64,
+               "limits: RLIMIT_NOFILE is set to the budget, soft and hard");
+        /* The budget bites: once the open descriptors reach the limit, a further open answers EMFILE. */
+        int hit_emfile = 0;
+        for (int i = 0; i < 256 && !hit_emfile; i++) {
+            int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (fd < 0) hit_emfile = (errno == EMFILE);
+        }
+        EXPECT(hit_emfile, "limits: opening past RLIMIT_NOFILE answers EMFILE");
+        _exit(failures ? 1 : 0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- Inet: inet sockets and nothing else that reaches out. ---- */
 
 /* ---- The confinement contract: sbx_negotiate's report, and sbx_lockdown_checked's gate. ---- */
@@ -3237,7 +3270,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
