@@ -407,9 +407,12 @@ static unsigned claim_count;
  * The directory argument of the handler's own calls to the kernel in
  * passthrough. Every path the handler sends there is absolute, and the
  * kernel ignores the directory argument of an absolute path, so this is
- * never a descriptor: it is the one value the filter lets through
- * untrapped. Code that uses it itself reaches only what the kernel would
- * give the process anyway, which is what passthrough means.
+ * never a descriptor. It is a sentinel, not a key: the filter no longer
+ * trusts an argument value to tell the handler's calls apart from a
+ * worker's -- those are bound to the handler's gateway address instead
+ * (allow_from_gateway, review A-06) -- so a worker that issues the same
+ * call with this value still traps to the broker and reaches only what
+ * passthrough would allow it anyway.
  */
 #define PASS_DIRFD (-0x5b1)
 
@@ -626,8 +629,9 @@ static long route(int dirfd, const char *path, char *buffer, const char **where)
     char link[32];
     fd_link(link, dirfd == AT_FDCWD ? current_directory() : dirfd);
     size_t length = strnlen(path, SBX_PATH_MAX);
-    long n = syscall(__NR_readlinkat, PASS_DIRFD, link, buffer, SBX_PATH_MAX - 1);
-    if (n < 0) return errno == ENOENT ? -EBADF : -errno;
+    long n = through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) link, (long) (uintptr_t) buffer,
+                     SBX_PATH_MAX - 1, 0, 0);
+    if (n < 0) return n == -ENOENT ? -EBADF : n;
     if (buffer[0] == '/' && (size_t) n + 1 + length < SBX_PATH_MAX) {
         buffer[n] = '/';
         memcpy(buffer + n + 1, path, length);
@@ -650,7 +654,7 @@ static long open_path(int dirfd, const char *path, int flags, uint32_t mode, cha
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_openat, PASS_DIRFD, where, flags, mode));
+    if (to == ROUTE_KERNEL) return through(__NR_openat, PASS_DIRFD, (long) (uintptr_t) where, flags, mode, 0, 0);
     return forward(SBX_OPEN, dirfd, path, 0, NULL, flags, mode, NULL, 0);
 }
 
@@ -660,7 +664,7 @@ static long stat_path(int dirfd, const char *path, struct stat *st, int flags, c
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_newfstatat, PASS_DIRFD, where, st, flags));
+    if (to == ROUTE_KERNEL) return through(__NR_newfstatat, PASS_DIRFD, (long) (uintptr_t) where, (long) (uintptr_t) st, flags, 0, 0);
     return forward(SBX_STAT, dirfd, path, 0, NULL, flags & AT_SYMLINK_NOFOLLOW, 0, st, sizeof(struct stat));
 }
 
@@ -671,8 +675,8 @@ static long access_path(int dirfd, const char *path, int mode, int flags, char *
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
     if (to == ROUTE_KERNEL) {
-        if (flags == 0) return kernel(syscall(__NR_faccessat, PASS_DIRFD, where, mode));
-        return kernel(syscall(__NR_faccessat2, PASS_DIRFD, where, mode, flags));
+        if (flags == 0) return through(__NR_faccessat, PASS_DIRFD, (long) (uintptr_t) where, mode, 0, 0, 0);
+        return through(__NR_faccessat2, PASS_DIRFD, (long) (uintptr_t) where, mode, flags, 0, 0);
     }
     return forward(SBX_ACCESS, dirfd, path, 0, NULL, 0, (uint32_t) mode, NULL, 0);
 }
@@ -682,7 +686,7 @@ static long readlink_path(int dirfd, const char *path, char *out, long size, cha
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_readlinkat, PASS_DIRFD, where, out, size));
+    if (to == ROUTE_KERNEL) return through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) where, (long) (uintptr_t) out, size, 0, 0);
     return forward(SBX_READLINK, dirfd, path, 0, NULL, 0, (uint32_t) size, out, (size_t) size);
 }
 
@@ -690,7 +694,7 @@ static long mkdir_path(int dirfd, const char *path, uint32_t mode, char *buffer)
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_mkdirat, PASS_DIRFD, where, mode));
+    if (to == ROUTE_KERNEL) return through(__NR_mkdirat, PASS_DIRFD, (long) (uintptr_t) where, mode, 0, 0, 0);
     return forward(SBX_MKDIR, dirfd, path, 0, NULL, 0, mode, NULL, 0);
 }
 
@@ -698,7 +702,7 @@ static long unlink_path(int dirfd, const char *path, int flags, char *buffer) {
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_unlinkat, PASS_DIRFD, where, flags));
+    if (to == ROUTE_KERNEL) return through(__NR_unlinkat, PASS_DIRFD, (long) (uintptr_t) where, flags, 0, 0, 0);
     return forward(SBX_UNLINK, dirfd, path, 0, NULL, flags & AT_REMOVEDIR, 0, NULL, 0);
 }
 
@@ -711,7 +715,7 @@ static long rename_path(int dirfd, const char *path, int dirfd2, const char *pat
     long to2 = route(dirfd2, path2, buffer2, &where2);
     if (to2 < 0) return to2;
     if (to == ROUTE_KERNEL && to2 == ROUTE_KERNEL) {
-        return kernel(syscall(__NR_renameat2, PASS_DIRFD, where, PASS_DIRFD, where2, flags));
+        return through(__NR_renameat2, PASS_DIRFD, (long) (uintptr_t) where, PASS_DIRFD, (long) (uintptr_t) where2, flags, 0);
     }
     return forward(SBX_RENAME, dirfd, path, dirfd2, path2, flags, 0, NULL, 0);
 }
@@ -737,8 +741,8 @@ static long statfs_path(const char *path, struct statfs *out, char *buffer) {
     long to = route(AT_FDCWD, path, buffer, &where);
     if (to < 0) return to;
     if (to == ROUTE_BROKER) return forward(SBX_STATFS, AT_FDCWD, path, 0, NULL, 0, 0, out, sizeof(struct statfs));
-    long fd = syscall(__NR_openat, PASS_DIRFD, where, O_PATH | O_CLOEXEC, 0);
-    if (fd < 0) return -errno;
+    long fd = through(__NR_openat, PASS_DIRFD, (long) (uintptr_t) where, O_PATH | O_CLOEXEC, 0, 0, 0);
+    if (fd < 0) return fd;
     long result = kernel(syscall(__NR_fstatfs, (int) fd, out));
     close((int) fd);
     return result;
@@ -749,7 +753,7 @@ static long change_directory(const char *path, char *buffer) {
     long to = route(AT_FDCWD, path, buffer, &where);
     if (to < 0) return to;
     long fd;
-    if (to == ROUTE_KERNEL) fd = kernel(syscall(__NR_openat, PASS_DIRFD, where, O_PATH | O_DIRECTORY | O_CLOEXEC, 0));
+    if (to == ROUTE_KERNEL) fd = through(__NR_openat, PASS_DIRFD, (long) (uintptr_t) where, O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
     else fd = forward(SBX_CHDIR, AT_FDCWD, path, 0, NULL, 0, 0, NULL, 0);
     if (fd < 0) return fd;
     set_directory((int) fd);
@@ -764,8 +768,8 @@ static long get_directory(char *out, size_t size) {
     }
     char link[32];
     fd_link(link, current_directory());
-    long n = syscall(__NR_readlinkat, PASS_DIRFD, link, out, size);
-    if (n < 0) return -errno;
+    long n = through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) link, (long) (uintptr_t) out, (long) size, 0, 0);
+    if (n < 0) return n;
     if ((size_t) n >= size) return -ERANGE;
     out[n] = '\0';
     return n + 1;
@@ -775,7 +779,7 @@ static long chmod_path(int dirfd, const char *path, uint32_t mode, char *buffer)
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_fchmodat, PASS_DIRFD, where, mode));
+    if (to == ROUTE_KERNEL) return through(__NR_fchmodat, PASS_DIRFD, (long) (uintptr_t) where, mode, 0, 0, 0);
     return forward(SBX_CHMOD, dirfd, path, 0, NULL, 0, mode, NULL, 0);
 }
 
@@ -783,7 +787,7 @@ static long utimens_path(int dirfd, const char *path, const struct timespec *tim
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
-    if (to == ROUTE_KERNEL) return kernel(syscall(__NR_utimensat, PASS_DIRFD, where, times, flags));
+    if (to == ROUTE_KERNEL) return through(__NR_utimensat, PASS_DIRFD, (long) (uintptr_t) where, (long) (uintptr_t) times, flags, 0, 0);
     return forward(SBX_UTIMENS, dirfd, path, 0, (const char *) times, flags & AT_SYMLINK_NOFOLLOW, 0, NULL, 0);
 }
 
@@ -1731,29 +1735,6 @@ static void sealed_block(unsigned nr, unsigned arg, const int *fds, unsigned cou
 }
 
 /*
- * In passthrough, nr is let through when its directory argument (both of
- * them, for a rename) is PASS_DIRFD: the handler's own calls to the
- * kernel. Any other use of nr traps.
- */
-static void passthrough_block(unsigned nr, int two_directories) {
-    if (!two_directories) {
-        jeq(nr, 0, 4);
-        load(ARG_LO(0));
-        jeq((unsigned) PASS_DIRFD, 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
-        return;
-    }
-    jeq(nr, 0, 6);
-    load(ARG_LO(0));
-    jeq((unsigned) PASS_DIRFD, 0, 3);
-    load(ARG_LO(2));
-    jeq((unsigned) PASS_DIRFD, 0, 1);
-    ret(ALLOW);
-    ret(TRAP);
-}
-
-/*
  * Allows nr only when it is made from the handler's gateway -- the trampoline
  * the handler routes its own calls through, at trampoline_after() -- and traps
  * any other caller to the broker. The handler's own privileged calls (a
@@ -1875,22 +1856,29 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
             __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat, __NR_unlinkat,
             __NR_fchmodat,
         };
-        for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) passthrough_block(one[i], 0);
-        /* utimensat: futimens (no path) is a descriptor call; with a path, the handler's own calls pass. */
-        jeq(__NR_utimensat, 0, 8);
+        for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) allow_from_gateway(one[i]);
+        /*
+         * utimensat: futimens (no path) is a descriptor call any code may make, so a null path is
+         * allowed whatever its caller; with a path it is a path op, allowed only from the handler's
+         * gateway (trampoline_after), not by a forgeable argument value (review A-06).
+         */
+        uint64_t utimens_after = (uint64_t) trampoline_after();
+        jeq(__NR_utimensat, 0, 10);
         load(ARG_LO(1));
         jeq(0, 0, 2);
         load(ARG_HI(1));
-        jeq(0, 2, 0);
-        load(ARG_LO(0));
-        jeq((unsigned) PASS_DIRFD, 0, 1);
+        jeq(0, 4, 0);
+        load(offsetof(struct seccomp_data, instruction_pointer));
+        jeq((unsigned) utimens_after, 0, 3);
+        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+        jeq((unsigned) (utimens_after >> 32), 0, 1);
         ret(ALLOW);
         ret(TRAP);
         /* getdents64 names no path, but an isolated process may be refused a brokered folder's listing (list_directory). */
         allow_from_gateway(__NR_getdents64);
-        passthrough_block(__NR_renameat2, 1);
+        allow_from_gateway(__NR_renameat2);
 #ifdef __NR_renameat
-        passthrough_block(__NR_renameat, 1);
+        allow_from_gateway(__NR_renameat);
 #endif
     }
     /* Brokered. */

@@ -263,9 +263,16 @@ app. Only paths under `claims` go to the broker. The handler makes every
 other path call itself, with the kernel deciding, as if there were no
 filter. Its calls name an absolute path (a relative one is rewritten as
 `/proc/self/fd/<directory>/<path>`, which the kernel walks from that same
-directory) and carry a directory argument that is no descriptor, the one
-value the filter lets through untrapped. Code that uses that value itself
-gets only what the kernel would give the process anyway. A relative path
+directory) and carry a directory argument that is no descriptor, a sentinel
+the kernel ignores for an absolute path. The filter tells the handler's own
+calls apart from a worker's not by that sentinel -- a value a worker could
+forge -- but by the address they are made from: the handler routes every one
+through its syscall gateway (the trampoline), and the filter allows the call
+only when the instruction pointer the kernel reports is the gateway's,
+trapping it to the broker otherwise (review A-06). A worker that forges the
+sentinel from its own code still traps, and reaches only what the broker
+would allow it. Code that jumps to the gateway gets only what the filter lets
+through there, as it does for the exec trampoline. A relative path
 is claimed when the folder it lands in is (the directory's name from
 `/proc/self/fd`, joined to it). chmod and utimensat with a path follow
 the same split (droidtop's Android `FileUtils.setPermissions` on a claimed
@@ -277,9 +284,9 @@ kernel, as in the unbrokered mode.
 isolated process may not read a folder its app opened for it (`avc:
 denied { read } ... isolated_app`), so a folder the broker handed over
 could be opened and not listed. In passthrough getdents64 traps. The
-handler lists the folder itself first, its own call marked in the upper
-half of the count (which the kernel ignores, `unsigned int count`) so the
-filter lets it through; only when the kernel refuses it (`EACCES`) does it
+handler lists the folder itself first, its own call made through the syscall
+gateway, which the filter recognises by its address (review A-06), not by a
+forgeable marker; only when the kernel refuses it (`EACCES`) does it
 send the descriptor to the broker (`SBX_LIST`), which lists it when the
 folder it names may be read, from that same open file description: the
 position moves for both, and `lseek`/`rewinddir` work as before. One reply

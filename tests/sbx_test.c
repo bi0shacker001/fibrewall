@@ -2641,6 +2641,19 @@ static int passthrough_check(void) {
         snprintf(path, sizeof(path), "%s/key", secret);
         errno = 0;
         EXPECT(refused(open(path, O_RDONLY)), "passthrough: a claimed path the broker has no rule for is refused");
+        /*
+         * Review A-06: the filter binds the handler's own passthrough path ops to its gateway
+         * address, not to the PASS_DIRFD sentinel in the directory argument, which a worker could
+         * forge. A worker that issues openat with that sentinel from its own code (not the gateway)
+         * on this claimed-but-unruled absolute path must still trap to the broker and be refused --
+         * not reach the kernel, where the file (it exists on disk) would open. PASS_DIRFD is private
+         * to lockdown.c; -0x5b1 is its value.
+         */
+        errno = 0;
+        long forged = syscall(__NR_openat, -0x5b1, path, O_RDONLY, 0);
+        EXPECT(forged < 0 && errno == EACCES,
+               "passthrough: a worker's forged PASS_DIRFD openat is still brokered, not kernel-direct (A-06)");
+        if (forged >= 0) close((int) forged);
 
         fd = open("/sandbox-test/data/p.txt", O_CREAT | O_WRONLY | O_TRUNC, 0600);
         EXPECT(fd >= 0, "passthrough: a claimed alias goes to the broker and creates a file");
