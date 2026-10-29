@@ -330,6 +330,15 @@ For each request the broker:
 
 A refusal is always `EACCES`. It never says whether the path exists.
 
+The broker opens every granted path **non-blocking** (`O_NONBLOCK`), so a
+path a rule allows that happens to be a FIFO or a slow device cannot hold
+the broker's one serve thread, and through it the whole tree. For a regular
+file this changes nothing. It is visible in one case: a confined
+`open(fifo, O_WRONLY)` on a FIFO with no reader returns `ENXIO`, where
+unconfined it would block until a reader appears. The broker restores the
+caller's blocking mode on the descriptor it hands back, so reads and writes
+on it behave as the caller asked; only the open itself does not wait.
+
 The rules decide on the **resolved** path. A caller may name a place
 through an alias, either the system's own (`/sdcard`, `/data/user/0`) or
 one of the policy's, but what gets acted on is always what the path

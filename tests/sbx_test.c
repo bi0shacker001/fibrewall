@@ -1081,6 +1081,9 @@ static int fifo_check(void) {
             int fd = open(fifo, O_RDONLY);
             EXPECT(fd >= 0, "fifo: a FIFO in a rule opens without stalling the broker");
             if (fd >= 0) close(fd);
+            /* Non-blocking at the broker: O_WRONLY with no reader is ENXIO, where unconfined it would wait. */
+            errno = 0;
+            EXPECT(open(fifo, O_WRONLY) < 0 && errno == ENXIO, "fifo: O_WRONLY with no reader answers ENXIO, not a stall");
         }
         int rf = open(regular, O_RDONLY);
         EXPECT(rf >= 0, "fifo: an ordinary file still opens");
