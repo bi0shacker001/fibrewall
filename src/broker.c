@@ -826,7 +826,14 @@ static void reply(int to, int64_t result, const void *data, uint32_t data_len, i
         cm->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(cm), &fd, sizeof(int));
     }
-    sendmsg(to, &message, MSG_NOSIGNAL);
+    /*
+     * Non-blocking: the client makes a fresh reply socketpair per request and
+     * is already waiting on it, so a well-formed reply always fits. A client
+     * that instead hands a socket whose buffer is full (its own, or the
+     * broker's) would otherwise block this serve thread, and with it the whole
+     * tree. The reply is dropped instead; that client only starves itself.
+     */
+    sendmsg(to, &message, MSG_NOSIGNAL | MSG_DONTWAIT);
 }
 
 /* Opens c->real (decided) the safe way: from its checked parent, never following a final link. */

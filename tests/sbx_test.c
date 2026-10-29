@@ -1059,16 +1059,9 @@ static int learn_check(void) {
  * descriptor is the socket the broker answers on; any others follow it.
  * Returns the reply's result, or -EIO if no reply arrived.
  */
-static int64_t broker_request(int to, const struct sbx_request *request, const void *body, size_t body_len,
-                              const int *extra, int extra_count) {
-    int answer[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, answer) != 0) return -EIO;
-    struct timeval timeout = {10, 0};
-    setsockopt(answer[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    int fds[4];
-    int n = 0;
-    fds[n++] = answer[1];
-    for (int i = 0; i < extra_count && n < 4; i++) fds[n++] = extra[i];
+/* Sends one request message with the given descriptors (fds[0] is the answer socket). Returns the sendmsg result. */
+static ssize_t broker_send(int to, const struct sbx_request *request, const void *body, size_t body_len,
+                           const int *fds, int nfds, int flags) {
     struct iovec parts[2] = {{(void *) request, sizeof(*request)}, {(void *) body, body_len}};
     union {
         char buffer[CMSG_SPACE(sizeof(int) * 4)];
@@ -1080,14 +1073,27 @@ static int64_t broker_request(int to, const struct sbx_request *request, const v
     message.msg_iov = parts;
     message.msg_iovlen = body_len ? 2 : 1;
     message.msg_control = control.buffer;
-    message.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+    message.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
     struct cmsghdr *cm = CMSG_FIRSTHDR(&message);
     cm->cmsg_level = SOL_SOCKET;
     cm->cmsg_type = SCM_RIGHTS;
-    cm->cmsg_len = CMSG_LEN(sizeof(int) * n);
-    memcpy(CMSG_DATA(cm), fds, sizeof(int) * n);
+    cm->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+    memcpy(CMSG_DATA(cm), fds, sizeof(int) * nfds);
+    return sendmsg(to, &message, flags);
+}
+
+static int64_t broker_request(int to, const struct sbx_request *request, const void *body, size_t body_len,
+                              const int *extra, int extra_count) {
+    int answer[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, answer) != 0) return -EIO;
+    struct timeval timeout = {10, 0};
+    setsockopt(answer[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    int fds[4];
+    int n = 0;
+    fds[n++] = answer[1];
+    for (int i = 0; i < extra_count && n < 4; i++) fds[n++] = extra[i];
     int64_t result = -EIO;
-    if (sendmsg(to, &message, MSG_NOSIGNAL) >= 0) {
+    if (broker_send(to, request, body, body_len, fds, n, MSG_NOSIGNAL) >= 0) {
         struct sbx_reply header;
         char data[512];
         struct iovec rparts[2] = {{&header, sizeof(header)}, {data, sizeof(data)}};
@@ -1101,6 +1107,48 @@ static int64_t broker_request(int to, const struct sbx_request *request, const v
     close(answer[0]);
     close(answer[1]);
     return result;
+}
+
+/*
+ * A client that hands the broker an answer socket whose buffer is already
+ * full must not wedge the broker's one serve thread. The broker replies
+ * non-blocking, drops that reply, and keeps serving. The wedge here is a
+ * socketpair whose receive side we fill before handing its other end over;
+ * the broker's reply to it cannot be delivered. A fresh request afterwards
+ * must still be answered -- if it is not (a blocking reply), broker_request's
+ * receive timeout turns the wedge into a failed check rather than a hang.
+ */
+static int reply_wedge_check(void) {
+    int before = failures;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char path[400];
+    int plen = snprintf(path, sizeof(path), "%s/data.txt", game);
+    struct sbx_request stat_req = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT, .path_len = (uint32_t) plen};
+
+    int wedge[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, wedge) != 0) return 1;
+    int small = 1024;
+    setsockopt(wedge[0], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    setsockopt(wedge[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    /* Fill the receive side, so the broker's reply to wedge[1] can never be delivered. */
+    char junk[256];
+    memset(junk, 0, sizeof(junk));
+    while (send(wedge[1], junk, sizeof(junk), MSG_DONTWAIT) > 0) { /* until EAGAIN */ }
+    EXPECT(broker_send(pair[1], &stat_req, path, (size_t) plen, &wedge[1], 1, MSG_NOSIGNAL) >= 0,
+           "reply wedge: the request with a full answer socket is sent");
+
+    /* The broker must have survived it: a fresh request is still answered. */
+    EXPECT(broker_request(pair[1], &stat_req, path, (size_t) plen, NULL, 0) == 0,
+           "reply wedge: the broker keeps serving when an answer socket is full");
+
+    close(wedge[0]);
+    close(wedge[1]);
+    close(pair[1]);
+    return failures != before;
 }
 
 /* The broker refuses malformed requests rather than misreading or dropping them. */
@@ -3040,7 +3088,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
