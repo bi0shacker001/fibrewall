@@ -1190,6 +1190,19 @@ static int harness_check(void) {
     struct sbx_request empty = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT, .path_len = 0};
     EXPECT(broker_request(client, &empty, "", 0, NULL, 0) == -EINVAL, "harness: a zero-length path is refused");
 
+    /*
+     * A learn record's "would" is an errno the broker negates; INT32_MIN would
+     * make that negation undefined (the fuzzer found it). An out-of-range value
+     * is refused, not negated.
+     */
+    struct sbx_learn_record bad_learn;
+    memset(&bad_learn, 0, sizeof(bad_learn));
+    bad_learn.nr = __NR_openat;
+    bad_learn.would = INT32_MIN;
+    struct sbx_request learn_req = {.version = SBX_PROTOCOL_VERSION, .op = SBX_LEARN};
+    EXPECT(broker_request(client, &learn_req, &bad_learn, sizeof(bad_learn), NULL, 0) == -EINVAL,
+           "harness: a learn record with an out-of-range errno is refused, not negated");
+
     close(client);
     return failures != before;
 }

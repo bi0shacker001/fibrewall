@@ -1703,6 +1703,12 @@ static void learn_one(const struct sbx_policy *policy, const char *body, size_t 
     struct sbx_learn_record record;
     if (body_len != sizeof(record)) { reply(answer, -EINVAL, NULL, 0, -1); return; }
     memcpy(&record, body, sizeof(record));
+    /*
+     * "would" is the errno a real lockdown answers, a small non-negative value
+     * the handler fills in. A hostile record could carry anything, including
+     * INT32_MIN, whose negation below is undefined; refuse one out of range.
+     */
+    if (record.would < 0 || record.would > 4095) { reply(answer, -EINVAL, NULL, 0, -1); return; }
     char asked[160];
     const char *name = sbx_syscall_name((long) record.nr);
     if (name) {
