@@ -157,6 +157,18 @@ static const int x86_args[6] = {REG_RDI, REG_RSI, REG_RDX, REG_R10, REG_R8, REG_
  */
 long sbx_learn_call(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 extern const char sbx_learn_call_after[];
+
+/*
+ * The trampoline the handler routes its own kernel calls through, and the
+ * address just after its syscall instruction, which the filter recognises
+ * (trampoline_after). Without SBX_LOCK_EXEC it is sbx_learn_call; with it,
+ * the fixed page, the same in every image of the tree, so the filter's check
+ * still holds after exec. Declared here so the handler's net and path
+ * forwarders, above the trampoline setup below, can reach it.
+ */
+typedef long (*trampoline_fn)(long, long, long, long, long, long, long);
+static trampoline_fn through = sbx_learn_call;
+static uintptr_t through_after;  /* 0 until a lockdown sets it */
 #if defined(__x86_64__)
 __asm__(".text\n"
         ".p2align 4\n"
@@ -777,16 +789,16 @@ static long utimens_path(int dirfd, const char *path, const struct timespec *tim
 
 /*
  * getdents64, which traps in passthrough. The handler lists the folder
- * itself first (its own call carries LIST_MARK in the upper half of the
- * count, which the kernel ignores and the filter lets through); a folder
- * the kernel refuses to list (an Android isolated process may not read a
- * folder its app opened for it) goes to the broker with its descriptor,
- * which lists it from the same open file description when it may read it.
+ * itself first (its own call goes through the gateway, which the filter
+ * recognises by its address); a folder the kernel refuses to list (an
+ * Android isolated process may not read a folder its app opened for it)
+ * goes to the broker with its descriptor, which lists it from the same open
+ * file description when it may read it.
  */
-#define LIST_MARK 0x5b2u
 static long list_directory(int fd, void *out, unsigned count) {
-    long n = syscall(__NR_getdents64, fd, out, (unsigned long) count | ((unsigned long) LIST_MARK << 32));
-    if (n >= 0 || errno != EACCES) return kernel(n);
+    /* Through the gateway: the filter allows it by its address, not a forgeable marker (review A-06). */
+    long n = through(__NR_getdents64, fd, (long) (uintptr_t) out, (long) count, 0, 0, 0);
+    if (n != -EACCES) return n;
     size_t asked = count < SBX_LIST_MAX ? count : SBX_LIST_MAX;
     return forward(SBX_LIST, fd, ".", 0, NULL, 0, (uint32_t) asked, out, asked);
 }
@@ -795,12 +807,10 @@ static long list_directory(int fd, void *out, unsigned count) {
  * Sockets, with SBX_LOCK_NET_BROKERED: an inet socket is created, connected,
  * bound, listened on and accepted from by the broker, under its own
  * identity (an Android isolated process may create none and may not listen
- * or accept on one it was given). The handler's own calls to the kernel
- * carry NET_MARK in the upper half of a 32-bit argument the kernel ignores
- * (connect's address length, accept4's flags), which the filter lets
- * through.
+ * or accept on one it was given). The handler's own connect and accept of a
+ * Unix socket go through the gateway (trampoline_after), which the filter
+ * recognises by its address, so a worker cannot forge them.
  */
-#define NET_MARK 0x5b3u
 
 static int socket_domain(int fd) {
     int domain = 0;
@@ -854,7 +864,8 @@ static long net_connect(int fd, const struct sockaddr *address, socklen_t length
             if (passed >= 0) close(passed);
             if (result != -ENOSYS) return result;
         }
-        return kernel(syscall(__NR_connect, fd, address, (unsigned long) length | ((unsigned long) NET_MARK << 32)));
+        /* Through the gateway, so the filter allows it by its address, not a forgeable marker (review A-06). */
+        return through(__NR_connect, fd, (long) (uintptr_t) address, (long) length, 0, 0, 0);
     }
     int passed;
     long result = net_forward(SBX_CONNECT, fd, address, length, 0, 0, NULL, 0, 0, &passed);
@@ -888,7 +899,8 @@ static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int 
     int domain = socket_domain(fd);
     if (domain < 0) return domain;
     if (domain != AF_INET && domain != AF_INET6) {
-        return kernel(syscall(__NR_accept4, fd, address, length, (unsigned long) (unsigned) flags | ((unsigned long) NET_MARK << 32)));
+        /* Through the gateway, so the filter allows it by its address, not a forgeable marker (review A-06). */
+        return through(__NR_accept4, fd, (long) (uintptr_t) address, (long) (uintptr_t) length, (long) flags, 0, 0);
     }
     struct sockaddr_storage peer;
     int passed;
@@ -1003,16 +1015,7 @@ static long sigmask_call(ucontext_t *uc, int how, const void *set, void *old, un
     return 0;
 }
 
-/*
- * The trampoline the handler makes its own calls through, and the address
- * just after its syscall instruction, which the filter recognises. Without
- * SBX_LOCK_EXEC it is sbx_learn_call. With it, it is the page at
- * SBXE_TRAMPOLINE_ADDRESS, the same in every image of the tree, so the
- * filter's check still holds after exec.
- */
-typedef long (*trampoline_fn)(long, long, long, long, long, long, long);
-static trampoline_fn through = sbx_learn_call;
-static uintptr_t through_after;  /* 0 until a lockdown sets it */
+/* through, through_after and the trampoline_fn typedef are declared above, by sbx_learn_call. */
 SBXE_TRAMPOLINE_ASM
 #ifdef __x86_64__
 /* rt_sigreturn, for a handler sbx_adopt installs without libc. */
@@ -1751,6 +1754,26 @@ static void passthrough_block(unsigned nr, int two_directories) {
 }
 
 /*
+ * Allows nr only when it is made from the handler's gateway -- the trampoline
+ * the handler routes its own calls through, at trampoline_after() -- and traps
+ * any other caller to the broker. The handler's own privileged calls (a
+ * brokered connect/accept of a Unix socket, a directory listing, a passthrough
+ * path op) are bound this way instead of by a magic argument value a worker
+ * could forge (review A-06); execveat and rt_sigaction are bound the same way.
+ * When the call is not nr the accumulator still holds nr for the rules below.
+ */
+static void allow_from_gateway(unsigned nr) {
+    uint64_t after = (uint64_t) trampoline_after();
+    jeq(nr, 0, 6);
+    load(offsetof(struct seccomp_data, instruction_pointer));
+    jeq((unsigned) after, 0, 3);
+    load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+    jeq((unsigned) (after >> 32), 0, 1);
+    ret(ALLOW);
+    ret(TRAP);
+}
+
+/*
  * socket() with SBX_LOCK_UNIX: Unix stream and seqpacket sockets, a Unix
  * datagram one with SBX_LOCK_LOG_SOCKET, inet stream and datagram ones with
  * SBX_LOCK_INET; nothing else. One block per family: if the family
@@ -1864,11 +1887,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         ret(ALLOW);
         ret(TRAP);
         /* getdents64 names no path, but an isolated process may be refused a brokered folder's listing (list_directory). */
-        jeq(__NR_getdents64, 0, 4);
-        load(ARG_HI(2));
-        jeq(LIST_MARK, 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
+        allow_from_gateway(__NR_getdents64);
         passthrough_block(__NR_renameat2, 1);
 #ifdef __NR_renameat
         passthrough_block(__NR_renameat, 1);
@@ -1908,7 +1927,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
     rule(__NR_clone3, NOSYS);
     if (flags & SBX_LOCK_NET_BROKERED) {
-        /* Inet sockets are the broker's; Unix ones the process's own. connect and accept4 pass when marked. */
+        /* Inet sockets are the broker's; Unix ones the process's own. connect and accept4 pass from the gateway only. */
         jeq(__NR_socket, 0, 7);
         load(ARG_LO(0));
         jeq(AF_INET, 3, 0);
@@ -1917,16 +1936,8 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         ret(ALLOW);
         ret(TRAP);
         ret(REFUSE);
-        jeq(__NR_connect, 0, 4);
-        load(ARG_HI(2));
-        jeq(NET_MARK, 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
-        jeq(__NR_accept4, 0, 4);
-        load(ARG_HI(3));
-        jeq(NET_MARK, 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
+        allow_from_gateway(__NR_connect);
+        allow_from_gateway(__NR_accept4);
         rule(__NR_bind, TRAP);
         rule(__NR_listen, TRAP);
 #ifdef __NR_accept
