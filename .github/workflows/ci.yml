@@ -55,9 +55,12 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: |
-          # The corpus holds the regression seeds (e.g. the INT32_MIN learn record the fuzzer found);
-          # libFuzzer replays them first, then explores, so a fixed crash can never silently return.
-          TMPDIR="$RUNNER_TEMP" ./build-fuzz/fuzz_broker -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1 tests/fuzz_corpus
+          # Replay the committed regression seeds (e.g. the INT32_MIN learn record the fuzzer found),
+          # then explore, so a fixed crash can never silently return. New inputs are written to the
+          # first directory -- an ephemeral one -- so the tracked seed corpus stays as committed.
+          mkdir -p "$RUNNER_TEMP/corpus"
+          TMPDIR="$RUNNER_TEMP" ./build-fuzz/fuzz_broker -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1 \
+            "$RUNNER_TEMP/corpus" tests/fuzz_corpus
 
   linux-arm64:
     # Arm runners are free for public repositories only.
