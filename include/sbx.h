@@ -35,7 +35,7 @@
 #define SBX_VERSION "0.1.7"
 #define SBX_VERSION_MAJOR 0
 #define SBX_VERSION_MINOR 1
-#define SBX_VERSION_PATCH 2
+#define SBX_VERSION_PATCH 7
 
 #include <stdint.h>
 #include <sys/types.h>
