@@ -38,6 +38,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!policy || size < sizeof(struct sbx_request)) return 0;
     struct sbx_request request;
     memcpy(&request, data, sizeof(request));
+    /*
+     * SBX_SIGNAL is the one op that makes a real, arbitrary-target syscall
+     * (kill). signal_one correctly lets a process signal itself, and the
+     * sender here is this fuzzer process -- libFuzzer, which instruments the
+     * "target == sender" comparison, learns this pid and drives a self-kill,
+     * terminating the run. That is the broker behaving correctly, not a bug,
+     * so skip the op rather than let the harness signal itself or other
+     * processes on the machine. Every other op stays inside the throwaway
+     * directory or is refused (no network grant).
+     */
+    if (request.op == SBX_SIGNAL) return 0;
     const char *body = (const char *) data + sizeof(request);
     size_t body_len = size - sizeof(request);
 
