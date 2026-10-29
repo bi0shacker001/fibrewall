@@ -876,8 +876,18 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         /* The process's own /proc/<pid>/exe after sbx-exec: the target it was allowed to run, not the helper. */
         char exe[SBX_PATH_MAX];
         if (!writing && exe_lookup(c.real, pid, exe)) snprintf(c.real, sizeof(c.real), "%s", exe);
-        int fd = open_decided(&c, flags, (mode_t) request->mode, need);
+        /*
+         * Non-blocking, so opening a FIFO (or a device whose open waits) in a
+         * rule cannot hold the broker thread. The caller asked for its own
+         * blocking mode, so restore that on the descriptor before handing it
+         * back; on a regular file O_NONBLOCK meant nothing either way.
+         */
+        int fd = open_decided(&c, flags | O_NONBLOCK, (mode_t) request->mode, need);
         if (fd < 0) { error = fd; break; }
+        if (!(flags & O_NONBLOCK)) {
+            int current = fcntl(fd, F_GETFL);
+            if (current >= 0) fcntl(fd, F_SETFL, current & ~O_NONBLOCK);
+        }
         reply(answer, 0, NULL, 0, fd);
         close(fd);
         return;
@@ -1006,7 +1016,8 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
         /* A program is run as it is read: the rules' read decides, on what the path resolves to. */
         error = decide(&c, base, path, request->path_len, SBX_READ, 1, 0);
         if (error != 0) break;
-        int fd = open_decided(&c, O_RDONLY, 0, SBX_READ);
+        /* Non-blocking, so a FIFO in a rule cannot hold the broker; the regular-file check below then refuses it. */
+        int fd = open_decided(&c, O_RDONLY | O_NONBLOCK, 0, SBX_READ);
         if (fd < 0) { error = fd; break; }
         struct stat st;
         /*

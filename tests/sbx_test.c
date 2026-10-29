@@ -1048,6 +1048,54 @@ static int learn_check(void) {
 
 /* ---- SBX_LOCK_PATHOPS and SBX_LOCK_INOTIFY: link, symlink and truncate through the broker, marks allowed. ---- */
 
+/*
+ * A FIFO in a writable rule must not stall the broker. The broker opens it
+ * non-blocking, so a plain open of a FIFO with no writer returns a descriptor
+ * instead of holding the broker's one serve thread. An alarm turns a stall
+ * (a regression) into a failed child rather than a hung run.
+ */
+static int fifo_check(void) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, save, SBX_READ | SBX_WRITE);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char fifo[400], regular[400];
+    snprintf(fifo, sizeof(fifo), "%s/f-fifo", save);
+    snprintf(regular, sizeof(regular), "%s/f-regular", save);
+    unlink(fifo);
+    unlink(regular);
+    int made = mkfifo(fifo, 0600);
+    write_file(regular, "ok");
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        alarm(20);
+        struct sbx_lockdown_options options = {0};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "fifo: lockdown");
+        if (locked != 0) _exit(1);
+        if (made == 0) {
+            int fd = open(fifo, O_RDONLY);
+            EXPECT(fd >= 0, "fifo: a FIFO in a rule opens without stalling the broker");
+            if (fd >= 0) close(fd);
+        }
+        int rf = open(regular, O_RDONLY);
+        EXPECT(rf >= 0, "fifo: an ordinary file still opens");
+        if (rf >= 0) close(rf);
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    unlink(fifo);
+    unlink(regular);
+    if (made != 0) printf("skip fifo: the host refused mkfifo in the writable folder\n");
+    return !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+}
+
 static int pathops_check(void) {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
@@ -2891,7 +2939,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
