@@ -2244,6 +2244,66 @@ static int exec_check(const char *self) {
 #endif
 }
 
+/*
+ * A-04: sbx_spawn_confined installs the lockdown and execs the program
+ * through sbx-exec, so it is confined before its own loader runs. The spawned
+ * program never locks itself down, yet a file outside the rules is refused and
+ * one inside it opens -- proof the confinement was already in place. The
+ * control is spawn_check above, where a plain sbx_spawn leaves the program
+ * unconfined.
+ */
+static int spawn_confined_check(const char *self) {
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    (void) self;
+    return 0;
+#else
+    char helper[600], library[600];
+    if (exec_files(self, helper, library, sizeof(helper)) != 0) {
+        printf("FAIL spawn confined: sbx-exec or libsbx_child.so is not beside the test\n");
+        return 1;
+    }
+    int before = failures;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, "/", SBX_READ);     /* the loader, libc and the image itself are read to run it */
+    sbx_policy_add(policy, secret, SBX_DENY);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char granted[400], secret_path[400];
+    snprintf(granted, sizeof(granted), "%s/data.txt", game);
+    snprintf(secret_path, sizeof(secret_path), "%s/key", secret);
+    int report[2];
+    if (pipe(report) != 0) return 1;
+    char *argv[] = {(char *) self, "--spawned-confined", granted, secret_path, NULL};
+    int handed = report[1];
+    struct sbx_spawn_spec spec = {self, argv, exec_environment, &handed, 1, NULL, 0};
+    struct sbx_lockdown_options options = {.exec_helper = helper, .child_library = library};
+
+    /* Missing pieces are refused before anything is started. */
+    struct sbx_lockdown_options no_helper = {0};
+    EXPECT(sbx_spawn_confined(&spec, pair[1], &no_helper, NULL) == -EINVAL,
+           "spawn confined: without the exec helper and library it is refused");
+    EXPECT(sbx_spawn_confined(&spec, -1, &options, NULL) == -EINVAL, "spawn confined: without a broker it is refused");
+
+    pid_t pid = 0;
+    int started = sbx_spawn_confined(&spec, pair[1], &options, &pid);
+    close(report[1]);
+    errno = -started;
+    EXPECT(started == 0 && pid > 0, "spawn confined: the program starts");
+    char word[16] = {0};
+    ssize_t n = started == 0 ? read(report[0], word, sizeof(word) - 1) : 0;
+    close(report[0]);
+    int status = 0;
+    if (started == 0 && pid > 0) waitpid(pid, &status, 0);
+    if (n > 0) word[n] = 0;
+    EXPECT(started == 0 && strcmp(word, "confined") == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "spawn confined: the program is confined before its own code runs (granted opens, secret refused)");
+    if (started == 0 && strcmp(word, "confined") != 0) printf("info spawn confined: reported '%s'\n", word[0] ? word : "(nothing)");
+    close(pair[1]);
+    return failures != before;
+#endif
+}
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define SBX_TEST_CLANG_ASAN 1
@@ -3236,6 +3296,28 @@ static int spawned_main(void) {
     return bad ? 1 : 0;
 }
 
+/*
+ * Runs in a program started by sbx_spawn_confined (argv[1] == "--spawned-confined").
+ * It never locks itself down: sbx_spawn_confined did that before this code
+ * ran. So if the granted file opens and the secret is refused, the program
+ * was already confined from its first instruction. Reports on descriptor 3.
+ */
+static int spawned_confined_main(int argc, char **argv) {
+    if (argc < 4) return 2;
+    int ok = 1;
+    int granted = open(argv[2], O_RDONLY);
+    ok &= granted >= 0;
+    if (granted >= 0) close(granted);
+    errno = 0;
+    int secret_fd = open(argv[3], O_RDONLY);
+    ok &= secret_fd < 0 && errno == EACCES;
+    if (secret_fd >= 0) close(secret_fd);
+    const char *word = ok ? "confined" : "leak";
+    ssize_t ignored = write(3, word, strlen(word));
+    (void) ignored;
+    return ok ? 0 : 1;
+}
+
 static int spawn_check(const char *self) {
     int pipe_fds[2];
     if (pipe(pipe_fds) != 0) return 1;
@@ -3288,6 +3370,7 @@ static void audit(void *context, const struct sbx_access *access, int result) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "--spawned") == 0) return spawned_main();
+    if (argc > 3 && strcmp(argv[1], "--spawned-confined") == 0) return spawned_confined_main(argc, argv);
     if (argc > 3 && strcmp(argv[1], "--attached") == 0) return attached_main(argv[2], argv[3]);
     if (argc > 1 && strcmp(argv[1], "--exec-child") == 0) return exec_child_main(argc, argv);
     char self[512];
@@ -3330,7 +3413,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

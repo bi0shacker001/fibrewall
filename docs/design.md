@@ -1050,6 +1050,18 @@ broker. The helper is built for arm64-v8a and x86_64, and tested on Linux
 and both emulators by running a dynamic program from a confined one, and
 by an `exec` chain three images deep.
 
+**Starting a program already confined (`sbx_spawn_confined`, 2026-10-29).**
+`sbx_spawn` leaves the program to call `sbx_lockdown` itself, so its loader,
+preinit array and constructors run first, and a static program that never
+calls it is not confined at all (review finding A-04). `sbx_spawn_confined`
+closes that: in the forked child it lays out the descriptors as `sbx_spawn`
+does (keeping the broker), installs the lockdown with `SBX_LOCK_EXEC`, then
+`execve`s the program — which the filter turns into a run through `sbx-exec`,
+so the program is confined from its first instruction, loader included. It is
+the same mechanism the `exec` chain uses, with the launcher playing the part
+of the first confined process. Use it for an untrusted or a static first
+image; `sbx_spawn` stays for a program trusted to confine itself.
+
 `SBX_LOCK_PATHOPS` (section 1) is the fourth. A process started with all
 four is "a program tree": it can run its own helpers and talk to the
 sockets the host named, and nothing else.

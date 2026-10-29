@@ -507,6 +507,22 @@ struct sbx_spawn_spec {
  */
 int sbx_spawn(const struct sbx_spawn_spec *spec, pid_t *pid_out);
 
+/*
+ * Like sbx_spawn, but confines the program before its first instruction. The
+ * child installs the lockdown (with the broker and SBX_LOCK_EXEC, which is
+ * forced on) and then execs spec->path through sbx-exec, so the program's own
+ * loader, preinit array and constructors already run under the filter. Use it
+ * for a program that will not lock itself down -- an untrusted first image or
+ * a static binary -- where plain sbx_spawn would let that code run first.
+ * broker_fd is the broker's connected socket (kept and carried to the
+ * program); options must name exec_helper and child_library and must not ask
+ * for SBX_LOCK_PASSTHROUGH (sbx_lockdown refuses it with SBX_LOCK_EXEC).
+ * Returns 0 and the pid once the program is executing confined, or a negative
+ * errno (the child's, if it got as far as failing).
+ */
+int sbx_spawn_confined(const struct sbx_spawn_spec *spec, int broker_fd,
+                       const struct sbx_lockdown_options *options, pid_t *pid_out);
+
 /* Called by the spawned program first: makes it non-dumpable again (exec reset that). */
 int sbx_spawned_init(void);
 
