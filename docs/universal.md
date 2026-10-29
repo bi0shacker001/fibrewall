@@ -272,19 +272,23 @@ implement out as we go" decision.
   filter, an advisory proxy) is a best-effort layer, and the enforced
   guarantee is the one the kernel or a more-trusted process holds.
 
-## 10. Open questions for the owner
+## 10. Decisions (coordinator, 2026-10-29)
 
-- **Rules-engine host language.** C callbacks are the floor (and what the
-  ABI promises). Do we also want a small, safe, *declarative* rule format
-  the library evaluates itself (so a consumer ships rules as data, not
-  code), or is that a consumer's job on top of the C callbacks?
-- **Proxy scope.** Ship a built-in L7 proxy mechanism, or expose the
-  intercept + redirect hooks and let the consumer bring its own proxy? The
-  first is more "batteries included"; the second keeps the library smaller.
-- **cgroups/privilege.** The desktop-Linux container backend wants cgroup
-  v2 delegation and, for some setups, a one-time privileged helper. How
-  much privilege may the library assume, and where must it degrade to
-  unprivileged-only (the firejail-via-user-namespaces path)?
-- **Report format.** A stable binary struct (C-friendly, versioned) or a
-  serialisation (JSON/CBOR) for the behavioural report — which serves
-  consumers better?
+- **Rules-engine host language.** C callbacks are the floor and what the ABI
+  promises. A small, safe, *declarative* rule format the library evaluates
+  itself (a consumer ships rules as data, not code) is wanted too, but
+  later: Phase U0 defines only the C event/verdict API, and the declarative
+  layer is built on top of it afterwards.
+- **Proxy scope.** Ship a built-in L7 filtering proxy mechanism, kept
+  optional. Genuine network filtering means the library must be able to see
+  the traffic (HTTP, TLS SNI), so an intercept-hooks-only design that leaves
+  the proxy to the consumer is not enough; the consumer may still bring its
+  own where it prefers.
+- **cgroups / privilege.** Unprivileged-first: the desktop-Linux container
+  and firejail backends work through user namespaces with no privilege.
+  cgroup-v2 delegation and a one-time privileged helper are an *optional*
+  enhancement, never required, and the guarantees contract reports which of
+  the two a given launch got.
+- **Report format.** Both: a stable, versioned C struct is the ABI truth,
+  with a serialisation helper alongside it. The serialisation is **JSON**
+  (not CBOR) unless a consumer needs CBOR later.
