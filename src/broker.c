@@ -1885,6 +1885,14 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
         if (pid > 0 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) && (size_t) n >= sizeof(struct sbx_request)) {
             serve_one(policy, &incoming.request, incoming.body, (size_t) n - sizeof(struct sbx_request), fds,
                       fd_count, pid);
+        } else if (fd_count >= 1) {
+            /*
+             * A message too short to be a request, one whose descriptors or
+             * body the kernel truncated, or one with no credentials: it is
+             * not served, but an answer socket did arrive, so tell the client
+             * instead of dropping it silently and leaving it to hang.
+             */
+            reply(fds[0], -EINVAL, NULL, 0, -1);
         }
         for (int i = 0; i < fd_count; i++) close(fds[i]);
     }

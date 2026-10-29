@@ -1195,6 +1195,34 @@ static int harness_check(void) {
 }
 
 /*
+ * A malformed request that still carried an answer socket is answered with
+ * EINVAL, not dropped silently (which would leave the client hanging). The
+ * malformation here is more descriptors than the broker's control buffer
+ * holds, so the kernel truncates them (MSG_CTRUNC) and the broker does not
+ * serve the request. broker_request's receive timeout turns a silent drop (a
+ * regression) into a failed check rather than a hang.
+ */
+static int einval_drop_check(void) {
+    int before = failures;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    char path[400];
+    int plen = snprintf(path, sizeof(path), "%s/data.txt", game);
+    struct sbx_request req = {.version = SBX_PROTOCOL_VERSION, .op = SBX_STAT, .path_len = (uint32_t) plen};
+    int spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (spare < 0) { close(pair[1]); return 0; }
+    int extra[3] = {spare, spare, spare};
+    EXPECT(broker_request(pair[1], &req, path, (size_t) plen, extra, 3) == -EINVAL,
+           "einval: a request whose descriptors the kernel truncated is answered, not dropped");
+    close(spare);
+    close(pair[1]);
+    return failures != before;
+}
+
+/*
  * A FIFO in a writable rule must not stall the broker. The broker opens it
  * non-blocking, so a plain open of a FIFO with no writer returns a descriptor
  * instead of holding the broker's one serve thread. An alarm turns a stall
@@ -3088,7 +3116,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
