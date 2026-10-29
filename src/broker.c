@@ -159,18 +159,18 @@ static unsigned long long process_start(pid_t pid, pid_t *parent) {
  * costs a scan and no /proc read. A pid the kernel later reuses keeps its
  * first start time, so the new process counts only as itself (a sender).
  */
-static void tree_note(struct tree *tree, pid_t pid) {
-    if (!tree || pid <= 0) return;
+static int tree_note(struct tree *tree, pid_t pid) {
+    if (!tree || pid <= 0) return 0;
     pthread_mutex_lock(&tree->lock);
     for (unsigned i = 0; i < tree->count; i++) {
         if (tree->members[i].pid == pid) {
             pthread_mutex_unlock(&tree->lock);
-            return;
+            return 0;
         }
     }
     pthread_mutex_unlock(&tree->lock);
     unsigned long long start = process_start(pid, NULL);
-    if (start == 0) return;
+    if (start == 0) return 0;
     pthread_mutex_lock(&tree->lock);
     unsigned slot = tree->count < TREE_MAX ? tree->count++ : TREE_MAX;
     /* Full: the first member that has exited makes room. */
@@ -182,6 +182,12 @@ static void tree_note(struct tree *tree, pid_t pid) {
         tree->members[slot].start = start;
     }
     pthread_mutex_unlock(&tree->lock);
+    /*
+     * Full of live members: the pid is untracked, so the tree can no longer
+     * tell it apart from a stranger. Refuse the request rather than drop it
+     * silently and judge a tree member as an outsider (review A-19).
+     */
+    return slot < TREE_MAX ? 0 : -EAGAIN;
 }
 
 static int tree_has(struct tree *tree, pid_t pid, unsigned long long start) {
@@ -1199,8 +1205,66 @@ static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *
 }
 
 /* A blocking connect or accept, on a thread of its own: it holds up no other call, and touches no policy. */
+/*
+ * A blocking connect or accept runs on a detached thread of its own
+ * (net_wait_thread). Without a cap one worker could pipeline thousands,
+ * exhausting the broker's threads and descriptors and starving every other
+ * worker it serves (review A-19). Two caps bound them: a per-connection
+ * budget (conn_budget, one per serve_loop) so a single worker cannot
+ * monopolise the broker, and a global ceiling so the broker as a whole stays
+ * bounded whatever the number of connections. Past either, the blocking call
+ * is answered EAGAIN, as a non-blocking socket past its resources would be.
+ */
+#define NET_WAIT_MAX_PER_CONN 32
+#define NET_WAIT_MAX_TOTAL 256
+static pthread_mutex_t net_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static int net_wait_total;
+
+struct conn_budget {
+    int live;  /* net_wait threads this connection has running */
+    int refs;  /* the connection, plus one per live net_wait thread */
+};
+
+static struct conn_budget *conn_budget_new(void) {
+    struct conn_budget *b = calloc(1, sizeof(*b));
+    if (b) b->refs = 1;
+    return b;
+}
+
+/* Drops one reference and frees at the last. Safe on NULL. */
+static void conn_budget_release(struct conn_budget *b) {
+    if (!b) return;
+    pthread_mutex_lock(&net_wait_lock);
+    int remaining = --b->refs;
+    pthread_mutex_unlock(&net_wait_lock);
+    if (remaining == 0) free(b);
+}
+
+/* Reserves a net_wait slot against both caps, taking a reference for the thread; 0, or -EAGAIN when full. */
+static int net_wait_reserve(struct conn_budget *b) {
+    pthread_mutex_lock(&net_wait_lock);
+    int ok = net_wait_total < NET_WAIT_MAX_TOTAL && (!b || b->live < NET_WAIT_MAX_PER_CONN);
+    if (ok) {
+        net_wait_total++;
+        if (b) { b->live++; b->refs++; }
+    }
+    pthread_mutex_unlock(&net_wait_lock);
+    return ok ? 0 : -EAGAIN;
+}
+
+/* Returns a reserved slot (the thread finished, or never started) and drops its reference. */
+static void net_wait_unreserve(struct conn_budget *b) {
+    pthread_mutex_lock(&net_wait_lock);
+    net_wait_total--;
+    int remaining = -1;
+    if (b) { b->live--; remaining = --b->refs; }
+    pthread_mutex_unlock(&net_wait_lock);
+    if (b && remaining == 0) free(b);
+}
+
 struct net_wait {
     uint16_t op;
+    struct conn_budget *budget;
     int socket;   /* the process's socket (a duplicate) */
     int answer;   /* the request's answer socket (a duplicate) */
     struct sockaddr_storage address;
@@ -1224,13 +1288,17 @@ static void *net_wait_thread(void *argument) {
             close(connection);
         }
     }
+    struct conn_budget *budget = w->budget;
     close(w->socket);
     close(w->answer);
     free(w);
+    net_wait_unreserve(budget);
     return NULL;
 }
 
-static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *address, socklen_t length, int flags) {
+static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *address, socklen_t length, int flags,
+                           struct conn_budget *budget) {
+    if (net_wait_reserve(budget) != 0) { reply(answer, -EAGAIN, NULL, 0, -1); return; }
     struct net_wait *w = calloc(1, sizeof(*w));
     int s = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
     int a = fcntl(answer, F_DUPFD_CLOEXEC, 0);
@@ -1239,9 +1307,11 @@ static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *a
         if (s >= 0) close(s);
         if (a >= 0) close(a);
         free(w);
+        net_wait_unreserve(budget);
         return;
     }
     w->op = op;
+    w->budget = budget;
     w->socket = s;
     w->answer = a;
     if (address && length > 0) memcpy(&w->address, address, (size_t) length);
@@ -1258,6 +1328,7 @@ static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *a
         close(s);
         close(a);
         free(w);
+        net_wait_unreserve(budget);
     }
 }
 
@@ -1474,7 +1545,7 @@ static int read_int(const char *body, size_t body_len, int *out) {
 }
 
 static void net_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
-                    size_t body_len, int *fds, int fd_count, pid_t pid) {
+                    size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
     int answer = fds[0];
     if (request->path2_len != 0 || request->path_len != body_len || body_len == 0 ||
         body_len > sizeof(struct sockaddr_storage) || fd_count != 1 + request->dirfd_sent ||
@@ -1559,7 +1630,7 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
             reply(answer, listen(subject, value) == 0 ? 0 : -errno, NULL, 0, -1);
             return;
         }
-        net_wait_start(SBX_ACCEPT, subject, answer, NULL, 0, value);
+        net_wait_start(SBX_ACCEPT, subject, answer, NULL, 0, value, budget);
         return;
     }
     /* connect or bind: an inet address of the socket's own family. */
@@ -1583,7 +1654,7 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
     }
     verdict = net_decide(policy, request->op, words, pid, (policy->net & SBX_NET_CONNECT) ? 0 : -EACCES);
     if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
-    net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0);
+    net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0, budget);
 }
 
 const char *sbx_syscall_name(long nr) {
@@ -1771,12 +1842,12 @@ static void signal_one(const struct sbx_policy *policy, const char *body, size_t
 }
 
 static void serve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
-                      size_t body_len, int *fds, int fd_count, pid_t pid) {
+                      size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
     if (fd_count < 1) return;
     int answer = fds[0];
     /* dirfd_sent and dirfd2_sent are counts of 0 or 1; a larger value is a malformed request, never ours. */
     if (request->dirfd_sent > 1 || request->dirfd2_sent > 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
-    tree_note(policy->tree, pid);
+    if (tree_note(policy->tree, pid) != 0) { reply(answer, -EAGAIN, NULL, 0, -1); return; }
     if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_SIGNAL) {
         if (fd_count != 1) { reply(answer, -EINVAL, NULL, 0, -1); return; }
         signal_one(policy, body, body_len, pid, answer);
@@ -1796,7 +1867,7 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         return;
     }
     if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {
-        net_one(policy, request, body, body_len, fds, fd_count, pid);
+        net_one(policy, request, body, body_len, fds, fd_count, pid, budget);
         return;
     }
     /* The second part: a name (rename, link), a target (symlink), bytes (utimens, truncate) or nothing. */
@@ -1850,6 +1921,7 @@ int sbx_broker_prepare(int fd) {
 
 /* Answers fd's requests until the other end closes it. Leaves fd open and the policy to the caller. */
 static void serve_loop(const struct sbx_policy *policy, int fd) {
+    struct conn_budget *budget = conn_budget_new();
     struct {
         struct sbx_request request;
         char body[SBX_PATH_MAX * 2];
@@ -1890,7 +1962,7 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
         }
         if (pid > 0 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) && (size_t) n >= sizeof(struct sbx_request)) {
             serve_one(policy, &incoming.request, incoming.body, (size_t) n - sizeof(struct sbx_request), fds,
-                      fd_count, pid);
+                      fd_count, pid, budget);
         } else if (fd_count >= 1) {
             /*
              * A message too short to be a request, one whose descriptors or
@@ -1902,6 +1974,8 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
         }
         for (int i = 0; i < fd_count; i++) close(fds[i]);
     }
+    /* The connection is done; its net_wait threads (if any still run) hold their own references. */
+    conn_budget_release(budget);
 }
 
 void sbx_broker_serve(struct sbx_policy *policy, int fd) {

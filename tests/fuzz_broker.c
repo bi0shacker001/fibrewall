@@ -73,7 +73,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (dir2 >= 0) fds[fd_count++] = dir2;
     }
 
-    serve_one(policy, &request, body, body_len, fds, fd_count, getpid());
+    serve_one(policy, &request, body, body_len, fds, fd_count, getpid(), NULL);
 
     close(answer[0]);
     close(answer[1]);

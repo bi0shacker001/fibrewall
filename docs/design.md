@@ -82,7 +82,11 @@ So, within one app, a confined process can be given:
    (`SBX_CONNECT`, `SBX_BIND`, `SBX_LISTEN`, `SBX_ACCEPT`) after the grants
    (`sbx_policy_set_net`: `SBX_NET_CONNECT`, `SBX_NET_LISTEN`,
    `SBX_NET_RESOLVE`) and the decider, which sees the address in words. A
-   blocking connect or accept waits on a broker thread of its own. Reads
+   blocking connect or accept waits on a broker thread of its own; the number
+   one connection may hold at once is capped, and a global ceiling bounds the
+   broker as a whole, so a worker cannot exhaust the broker's threads with
+   blocking calls (a call past either cap is answered `EAGAIN`, review A-19).
+   Reads
    and writes are the process's own. Unix sockets stay the process's, but
    may not be bound or listened on; a connect to a system socket the host
    named (`sbx_policy_add_system_socket`: Android's `dnsproxyd` for name
@@ -915,7 +919,11 @@ time so a reused pid does not count, together with their descendants
 (found through `/proc/<pid>/stat`). Anything else is refused with `EPERM`,
 unless the decider allows the `"signal"` access. Process groups stay
 refused. The receiver sees the broker's pid in `si_pid`. Recording costs a
-scan per request, and a `/proc` read only for a pid not seen before. What the outright flags give up is
+scan per request, and a `/proc` read only for a pid not seen before. The
+tree holds up to 1024 live members; when it is full of live processes a new
+pid cannot be recorded, so its request is refused with `EAGAIN` rather than
+served while untracked, which would let the broker judge a tree member as an
+outsider (review A-19). What the outright flags give up is
 stated where they are declared (`include/sbx.h`): with `SBX_LOCK_SOCKETS`
 the process can reach any socket of its UID, the host's own included, and
 create socket files wherever the UID may write.

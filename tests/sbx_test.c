@@ -2901,6 +2901,19 @@ static void *net_accept_thread(void *argument) {
     return (void *) accepted;
 }
 
+/* Review A-19: counts the brokered blocking accepts the broker refuses once its per-connection cap is reached. */
+static int net_flood_eagain;
+static void *net_flood_thread(void *argument) {
+    int server = *(int *) argument;
+    struct sockaddr_in peer;
+    socklen_t length = sizeof(peer);
+    errno = 0;
+    long r = syscall(__NR_accept4, server, (struct sockaddr *) &peer, &length, SOCK_CLOEXEC);
+    if (r < 0 && errno == EAGAIN) __atomic_add_fetch(&net_flood_eagain, 1, __ATOMIC_ACQ_REL);
+    else if (r >= 0) close((int) r);
+    return NULL;  /* the under-cap accepts block forever (nothing connects); the worker _exit()s past them. */
+}
+
 static void net_granted(const char *resolver) {
     errno = 0;
     EXPECT(a_netlink() == EACCES, "net: socket(AF_NETLINK) refused");
@@ -2995,6 +3008,41 @@ static void net_granted(const char *resolver) {
     EXPECT(elsewhere >= 0 && connect(elsewhere, (struct sockaddr *) &target, sizeof(target)) < 0 && errno == ENOENT,
            "net: any other Unix connect is the kernel's");
     if (elsewhere >= 0) close(elsewhere);
+
+    /*
+     * Review A-19: one worker cannot exhaust the broker with blocking accepts.
+     * Many threads each start a brokered blocking accept on a server nothing
+     * connects to. The broker runs each on a thread of its own but caps how
+     * many one connection may hold; past the cap it answers EAGAIN instead of
+     * spawning an unbounded number of threads. Without the cap every one of
+     * these blocks a broker thread and none answers EAGAIN (the control is a
+     * build with the cap removed). The under-cap accepts stay blocked; the
+     * worker _exit()s past them and the alarm guards a hang.
+     */
+    int quiet = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in quiet_addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    EXPECT(quiet >= 0 && bind(quiet, (struct sockaddr *) &quiet_addr, sizeof(quiet_addr)) == 0 && listen(quiet, 64) == 0,
+           "net: a server for the accept-flood test (A-19)");
+    if (quiet >= 0) {
+        enum { FLOOD = 80 };
+        static int quiet_fd;
+        quiet_fd = quiet;
+        pthread_attr_t small;
+        pthread_attr_init(&small);
+        pthread_attr_setstacksize(&small, 256 * 1024);
+        pthread_attr_setdetachstate(&small, PTHREAD_CREATE_DETACHED);
+        int started = 0;
+        for (int i = 0; i < FLOOD; i++) {
+            pthread_t t;
+            if (pthread_create(&t, &small, net_flood_thread, &quiet_fd) == 0) started++;
+        }
+        pthread_attr_destroy(&small);
+        usleep(600 * 1000);  /* the broker works through all requests: over-cap ones answer EAGAIN. */
+        int refused = __atomic_load_n(&net_flood_eagain, __ATOMIC_ACQUIRE);
+        EXPECT(started == FLOOD && refused >= FLOOD - 40,
+               "net: blocking accepts past the per-connection cap answer EAGAIN, not unbounded broker threads (A-19)");
+    }
+
     close(pair[0]);
     close(pair[1]);
 }
