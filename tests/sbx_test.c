@@ -1151,6 +1151,53 @@ static int reply_wedge_check(void) {
     return failures != before;
 }
 
+/*
+ * Runs in a forked child: locks down with the broker's peer already closed, so
+ * the first brokered call finds the broker gone. With SBX_LOCK_FAIL_CLOSED the
+ * process must not reach the return (the call ends it); without it the call
+ * answers EIO and the child returns 0. Other exit codes report where it went
+ * wrong. An alarm keeps a hang from wedging the run.
+ */
+static int fail_closed_child(int broker_fd, unsigned flags) {
+    alarm(20);
+    struct sbx_lockdown_options options = {.flags = flags};
+    if (sbx_lockdown(broker_fd, &options) != 0) return 55;
+    errno = 0;
+    int fd = open("/sandbox-fail-closed-probe", O_RDONLY);  /* any brokered path op; the broker is gone */
+    if (fd >= 0) { close(fd); return 60; }
+    return errno == EIO ? 0 : 61;
+}
+
+/* A-21: a brokered call whose broker has gone ends the process under SBX_LOCK_FAIL_CLOSED, and answers EIO without it. */
+static int fail_closed_check(void) {
+    int before = failures;
+    for (int strict = 0; strict < 2; strict++) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            close(pair[0]);  /* nothing serves the broker; with the parent's copy closed too, its peer is gone */
+            _exit(fail_closed_child(pair[1], strict ? SBX_LOCK_FAIL_CLOSED : 0));
+        }
+        close(pair[0]);
+        close(pair[1]);
+        int status = 0;
+        waitpid(child, &status, 0);
+        if (strict) {
+            EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 120,
+                   "fail closed: a brokered call after the broker is gone ends the process");
+        } else {
+            EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                   "fail closed control: without the flag the call answers EIO and the process continues");
+        }
+        if (!WIFEXITED(status)) printf("info fail closed (strict=%d): child did not exit normally\n", strict);
+        else if ((strict && WEXITSTATUS(status) != 120) || (!strict && WEXITSTATUS(status) != 0))
+            printf("info fail closed (strict=%d): child exited %d\n", strict, WEXITSTATUS(status));
+    }
+    return failures != before;
+}
+
 /* The broker refuses malformed requests rather than misreading or dropping them. */
 static int harness_check(void) {
     int before = failures;
@@ -3129,7 +3176,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];

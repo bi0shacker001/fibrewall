@@ -339,6 +339,18 @@ unconfined it would block until a reader appears. The broker restores the
 caller's blocking mode on the descriptor it hands back, so reads and writes
 on it behave as the caller asked; only the open itself does not wait.
 
+**Fail closed when the broker is gone (`SBX_LOCK_FAIL_CLOSED`, review A-21).**
+A brokered call whose broker has died, or that comes back with a reply too
+short or claiming more data than the buffer holds, cannot be served. By
+default it answers `EIO` and the process runs on, every later brokered call
+failing the same way -- a process still alive but no longer doing anything
+useful, the opposite of a sandbox. With `SBX_LOCK_FAIL_CLOSED` such a call
+instead ends the whole process (`exit_group`), so no descendant outlives the
+authority that confined it. A caller's own bad descriptor (`EBADF`) is not a
+broker failure and never ends the process. Strict profiles set the flag; the
+compatibility default does not. (Windows carries the same intent separately:
+the broker thread closes the job when its pipe breaks.)
+
 The rules decide on the **resolved** path. A caller may name a place
 through an alias, either the system's own (`/sdcard`, `/data/user/0`) or
 one of the policy's, but what gets acted on is always what the path

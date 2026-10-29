@@ -200,6 +200,7 @@ __asm__(".text\n"
 #endif
 
 static int broker = -1;
+static unsigned lock_flags;  /* the lockdown's flags; exchange() reads SBX_LOCK_FAIL_CLOSED, the filter build the rest */
 static int locked;
 /* The confined process's current directory: it cannot chdir for real, since it may not open what it enters. */
 static int cwd = -1;
@@ -424,6 +425,20 @@ static int current_directory(void) { return __atomic_load_n(&cwd, __ATOMIC_ACQUI
  * unless keep_open. Returns the reply's result, or -EIO when the broker is
  * gone (-EBADF for a bad descriptor of the caller's).
  */
+/*
+ * A broker that has gone, or answered with a short or malformed reply, is a
+ * failure the caller cannot recover from. With SBX_LOCK_FAIL_CLOSED the whole
+ * process ends, so no descendant outlives the authority confining it (review
+ * A-21); otherwise the call answers EIO as before and the process runs on. A
+ * caller's own bad descriptor is not a broker failure, so it never comes
+ * here. Async-signal-safe: it runs in the SIGSYS handler.
+ */
+#define SBX_FAIL_CLOSED_STATUS 120
+static long broker_failure(void) {
+    if (lock_flags & SBX_LOCK_FAIL_CLOSED) syscall(__NR_exit_group, SBX_FAIL_CLOSED_STATUS);
+    return -EIO;
+}
+
 static long exchange(struct sbx_request *request, const int *extra, int extra_count, const void *body, size_t body_len,
                      const void *body2, size_t body2_len, void *out, size_t out_len, int keep_open, int *passed) {
     *passed = -1;
@@ -464,7 +479,7 @@ static long exchange(struct sbx_request *request, const int *extra, int extra_co
     if (sent < 0) {
         close(answer[0]);
         /* EBADF: a bad directory descriptor of the caller's; anything else, the broker is gone. */
-        return send_error == EBADF ? -EBADF : -EIO;
+        return send_error == EBADF ? -EBADF : broker_failure();
     }
 
     struct sbx_reply reply;
@@ -490,10 +505,11 @@ static long exchange(struct sbx_request *request, const int *extra, int extra_co
             memcpy(passed, CMSG_DATA(c), sizeof(int));
         }
     }
-    if (received < (ssize_t) sizeof(reply)) {
+    if (received < (ssize_t) sizeof(reply) || reply.data_len > out_len) {
+        /* Too short to be a reply, or claiming more data than the buffer: a broker not speaking the protocol. */
         if (*passed >= 0) close(*passed);
         *passed = -1;
-        return -EIO;
+        return broker_failure();
     }
     return (long) reply.result;
 }
@@ -1039,8 +1055,7 @@ static int map_trampoline(void) {
     return 0;
 }
 
-/* SBX_LOCK_EXEC's state: the lockdown's flags, the helper, and the child library's path. */
-static unsigned lock_flags;
+/* SBX_LOCK_EXEC's state: the helper and the child library's path (the flags are lock_flags, above). */
 static int helper_fd = -1;
 static char child_library[SBX_PATH_MAX];
 

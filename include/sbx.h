@@ -253,6 +253,17 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
 #define SBX_LOCK_CONTAIN (SBX_LOCK_PATHOPS | SBX_LOCK_INOTIFY | SBX_LOCK_SOCKETS | SBX_LOCK_SIGNALS | SBX_LOCK_EXEC)
 
 /*
+ * Fail closed when the broker is gone (Droidtop/tracker review A-21). Without
+ * it a brokered call whose broker has died or sent a short or malformed reply
+ * answers EIO and the process runs on, half working -- the opposite of a
+ * sandbox. With it, such a call ends the whole process (exit_group) instead,
+ * so no descendant outlives the authority that was confining it. For strict
+ * profiles. A caller's own bad descriptor (EBADF) is not a broker failure and
+ * never ends the process. Meaningless, and harmless, without a broker.
+ */
+#define SBX_LOCK_FAIL_CLOSED 0x8000u
+
+/*
  * The kernel logs every call the filter traps or refuses
  * (SECCOMP_FILTER_FLAG_LOG): an audit record, type 1326, with the call's
  * number, the instruction pointer and the action, which on Android reaches
