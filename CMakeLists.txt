@@ -90,6 +90,17 @@ if(SBX_TESTS)
   target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror -fno-omit-frame-pointer)
 endif()
 
+# The broker fuzz target (tests/fuzz_broker.c): clang's libFuzzer + ASan/UBSan on the request path.
+# It includes broker.c to reach the static serve_one, so it does not link libsbx (that would double-define).
+option(SBX_FUZZ "Build the broker libFuzzer target (clang only)" OFF)
+if(SBX_FUZZ)
+  add_executable(fuzz_broker tests/fuzz_broker.c)
+  target_include_directories(fuzz_broker PRIVATE src include)
+  target_compile_options(fuzz_broker PRIVATE -g -O1 -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
+  target_link_options(fuzz_broker PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(fuzz_broker PRIVATE Threads::Threads)
+endif()
+
 # The native-kind feasibility probe: GPU drawing from a locked-down process with no ART (Android only).
 if(SBX_TESTS AND ANDROID)
   add_executable(gpu_probe tests/android/gpu_probe.c)

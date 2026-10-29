@@ -36,6 +36,27 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
 
+  fuzz:
+    # The broker request path under clang's libFuzzer + ASan/UBSan (review finding A-09).
+    name: broker fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the clang runtime (libFuzzer + ASan)
+        run: |
+          ver=$(clang --version | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)
+          sudo apt-get update
+          sudo apt-get install -y "libclang-rt-${ver}-dev" || sudo apt-get install -y libclang-rt-dev
+      - name: Build the fuzz target
+        run: |
+          cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang -DSBX_FUZZ=ON -DSBX_TESTS=OFF
+          cmake --build build-fuzz --target fuzz_broker -j
+      - name: Fuzz the request path briefly
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          TMPDIR="$RUNNER_TEMP" ./build-fuzz/fuzz_broker -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1
+
   linux-arm64:
     # Arm runners are free for public repositories only.
     if: ${{ !github.event.repository.private }}
