@@ -151,7 +151,15 @@ The filter:
   statfs, chdir, fchdir, getcwd, chmod/fchmodat (the broker keeps the
   permission bits, `0777`, under a write rule) and utimensat with a path
   (its two times travel in the request; `futimens`, on a descriptor, is
-  untouched).
+  untouched). One readlink is answered in the process instead: its own
+  descriptor link, exactly `/proc/self/fd/<n>` or `/proc/thread-self/fd/<n>`,
+  which names a file it already holds. The handler makes that call through
+  its gateway. The broker would have to read `/proc/<pid>/fd` of the sender,
+  and the kernel refuses that to a broker without `CAP_SYS_PTRACE` whenever
+  the process is not dumpable, which is every Android release app. bionic's
+  `realpath()` depends on this readlink, and the linker drops a library path
+  it cannot resolve: a WebView shipped in `/product` failed to load in a
+  locked-down process (Droidtop/tracker#550).
 - **Refuses with ENOSYS, so callers fall back.** statx, openat2, clone3,
   fchmodat2.
 - **Refuses with EACCES.** Any other path call: truncate, link, symlink,

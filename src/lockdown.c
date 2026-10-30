@@ -682,8 +682,31 @@ static long access_path(int dirfd, const char *path, int mode, int flags, char *
     return forward(SBX_ACCESS, dirfd, path, 0, NULL, 0, (uint32_t) mode, NULL, 0);
 }
 
+/*
+ * Whether path is the process's own descriptor link, /proc/self/fd/<n> or
+ * /proc/thread-self/fd/<n>, and nothing past it. Its readlink names a file
+ * the process already holds, so the kernel answers it here. The broker
+ * would read the sender's /proc/<pid>/fd instead, which the kernel refuses
+ * it when the process is not dumpable (every Android release app): bionic's
+ * realpath() then fails, and the linker drops a library path it could not
+ * resolve (a WebView in /product, Droidtop/tracker#550).
+ */
+static int own_fd_link(const char *path) {
+    static const char self[] = "/proc/self/fd/";
+    static const char thread[] = "/proc/thread-self/fd/";
+    const char *digits;
+    if (strncmp(path, self, sizeof(self) - 1) == 0) digits = path + sizeof(self) - 1;
+    else if (strncmp(path, thread, sizeof(thread) - 1) == 0) digits = path + sizeof(thread) - 1;
+    else return 0;
+    if (*digits < '0' || *digits > '9') return 0;
+    while (*digits >= '0' && *digits <= '9') digits++;
+    return *digits == '\0';
+}
+
 static long readlink_path(int dirfd, const char *path, char *out, long size, char *buffer) {
     if (size <= 0) return -EINVAL;
+    if (path == NULL) return -EFAULT;
+    if (own_fd_link(path)) return through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) path, (long) (uintptr_t) out, size, 0, 0);
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
@@ -1852,9 +1875,11 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     }
     int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (flags & SBX_LOCK_PASSTHROUGH) != 0;
+    /* readlink of the process's own descriptor link is answered by the handler whenever it brokers paths (own_fd_link). */
+    if (!unbrokered) allow_from_gateway(__NR_readlinkat);
     if (pass) {
         static const unsigned one[] = {
-            __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat, __NR_unlinkat,
+            __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_mkdirat, __NR_unlinkat,
             __NR_fchmodat,
         };
         for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) allow_from_gateway(one[i]);

@@ -610,6 +610,53 @@ static int sealed_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/*
+ * ---- readlink of the process's own descriptor link, answered in the process. ----
+ * The broker would read /proc/<pid>/fd of a process that is not dumpable, which
+ * the kernel refuses a broker without CAP_SYS_PTRACE; bionic's realpath()
+ * depends on this readlink. Run unprivileged, as CI does, this fails without
+ * the process answering it.
+ */
+static int own_fd_link_check(void) {
+    char data[400], real[PATH_MAX];
+    snprintf(data, sizeof(data), "%s/data.txt", game);
+    if (!realpath(data, real)) return 1;
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, game, SBX_READ);
+    if (sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(pair[0]);
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+        int locked = sbx_lockdown(pair[1], NULL);
+        errno = -locked;
+        EXPECT(locked == 0, "own fd link: lockdown");
+        if (locked != 0) _exit(1);
+        int fd = open(data, O_PATH | O_CLOEXEC);
+        EXPECT(fd >= 0, "own fd link: open of a granted file");
+        char link[64], target[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n >= 0) target[n] = '\0';
+        EXPECT(n >= 0 && strcmp(target, real) == 0, "own fd link: readlink of /proc/self/fd/<n> names the file");
+        snprintf(link, sizeof(link), "/proc/thread-self/fd/%d", fd);
+        n = readlinkat(AT_FDCWD, link, target, sizeof(target) - 1);
+        if (n >= 0) target[n] = '\0';
+        EXPECT(n >= 0 && strcmp(target, real) == 0, "own fd link: readlinkat of /proc/thread-self/fd/<n> names the file");
+        /* A name past the number is not a descriptor link: it stays the broker's, which finds no link there. */
+        snprintf(link, sizeof(link), "/proc/self/fd/%dx", fd);
+        EXPECT(readlink(link, target, sizeof(target)) < 0, "own fd link: a name past the number is not answered as one");
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- SIGSYS stays open: a blocked SIGSYS used to kill the process on its next trap. ---- */
 
 /* A handler that makes trapped calls; installed with every signal masked. */
@@ -3270,7 +3317,7 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "%s/link", save);
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
-    int sealed_failures = sealed_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
+    int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
                           net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0);
 
     int pair[2];
