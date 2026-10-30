@@ -646,6 +646,19 @@ static int own_fd_link_check(void) {
         n = readlinkat(AT_FDCWD, link, target, sizeof(target) - 1);
         if (n >= 0) target[n] = '\0';
         EXPECT(n >= 0 && strcmp(target, real) == 0, "own fd link: readlinkat of /proc/thread-self/fd/<n> names the file");
+        /*
+         * The O_PATH open came back readable: a received descriptor with neither read nor
+         * write is checked as ioctl by SELinux, which an Android app may not do on a system
+         * file, so the broker answers a readable regular file with a read-only descriptor.
+         */
+        int got = fcntl(fd, F_GETFL);
+        EXPECT(got >= 0 && !(got & O_PATH) && (got & O_ACCMODE) == O_RDONLY, "O_PATH open of a readable file: a read-only descriptor");
+        char byte;
+        EXPECT(pread(fd, &byte, 1, 0) == 1, "O_PATH open of a readable file: it reads");
+        int folder = open(game, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        got = folder >= 0 ? fcntl(folder, F_GETFL) : -1;
+        EXPECT(got >= 0 && (got & O_PATH), "O_PATH open of a folder stays an O_PATH handle");
+        if (folder >= 0) close(folder);
         /* A name past the number is not a descriptor link: it stays the broker's, which finds no link there. */
         snprintf(link, sizeof(link), "/proc/self/fd/%dx", fd);
         EXPECT(readlink(link, target, sizeof(target)) < 0, "own fd link: a name past the number is not answered as one");

@@ -349,6 +349,17 @@ For each request the broker:
 
 A refusal is always `EACCES`. It never says whether the path exists.
 
+An `O_PATH` open of a regular file the rules let the process read is
+answered with a read-only descriptor of the same file. The broker reopens
+its own handle and checks the inode. An `O_PATH` descriptor has neither
+read nor write, and SELinux checks such a received file as `ioctl`, which
+an Android app may not do on a system file. The kernel then drops it from
+the reply, and the call fails with `EIO`. bionic's `realpath()` opens with
+`O_PATH`, so the linker could not resolve a WebView in `/product` and left
+it out of its namespace (Droidtop/tracker#550). Read-only is what an
+ordinary open of the same path is given. A directory, a device, and a file
+the rules only let the process look up keep their `O_PATH` handle.
+
 The broker opens every granted path **non-blocking** (`O_NONBLOCK`), so a
 path a rule allows that happens to be a FIFO or a slow device cannot hold
 the broker's one serve thread, and through it the whole tree. For a regular

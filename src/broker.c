@@ -868,6 +868,33 @@ static int open_decided(struct check *c, int flags, mode_t mode, unsigned need) 
     return fd;
 }
 
+/*
+ * An O_PATH descriptor of a regular file the rules let the process read,
+ * exchanged for a read-only one of the same file. A received descriptor
+ * with neither read nor write is checked by SELinux as ioctl, which an
+ * Android app may not do on system files: the kernel drops it from the
+ * reply, the call fails with EIO, and bionic's realpath(), which opens with
+ * O_PATH, fails with it (the linker then dropped a WebView in /product from
+ * its namespace, Droidtop/tracker#550). Read-only is what an ordinary open
+ * of the same path would have been given. Anything else (a directory, a
+ * device, a file the rules only let it look up) keeps its O_PATH handle.
+ */
+static int readable_path_handle(const struct check *c, int fd) {
+    if (!permits(allowed(c->policy, c->real, c->pid), SBX_READ)) return fd;
+    struct stat handle, opened;
+    if (fstat(fd, &handle) != 0 || !S_ISREG(handle.st_mode)) return fd;
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    int readable = open(link, O_RDONLY | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
+    if (readable < 0) return fd;
+    if (fstat(readable, &opened) != 0 || opened.st_dev != handle.st_dev || opened.st_ino != handle.st_ino) {
+        close(readable);
+        return fd;
+    }
+    close(fd);
+    return readable;
+}
+
 static void handle(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
                    const char *path2, const char *base, const char *base2, pid_t pid, int answer) {
     struct check c;
@@ -897,6 +924,7 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
          */
         int fd = open_decided(&c, flags | O_NONBLOCK, (mode_t) request->mode, need);
         if (fd < 0) { error = fd; break; }
+        if (flags & O_PATH) fd = readable_path_handle(&c, fd);
         if (!(flags & O_NONBLOCK)) {
             int current = fcntl(fd, F_GETFL);
             if (current >= 0) fcntl(fd, F_SETFL, current & ~O_NONBLOCK);
