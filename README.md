@@ -1,4 +1,4 @@
-<h1 align="center">sandbox</h1>
+<h1 align="center">Fibrewall</h1>
 
 <p align="center">
   <b>A process sandbox for Linux and Android, in C.</b><br>
@@ -6,10 +6,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bi0shacker001/sandbox/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bi0shacker001/sandbox/ci.yml?branch=main&label=ci&style=flat-square"></a>
+  <a href="https://github.com/bi0shacker001/fibrewall/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bi0shacker001/fibrewall/ci.yml?branch=main&label=ci&style=flat-square"></a>
   <img alt="Linux and Android" src="https://img.shields.io/badge/Linux%20%C2%B7%20Android-26%2B-3ddc84?style=flat-square">
   <img alt="Language: C" src="https://img.shields.io/badge/language-C-555555?style=flat-square">
-  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/github/license/bi0shacker001/sandbox?style=flat-square"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/github/license/bi0shacker001/fibrewall?style=flat-square"></a>
   <img alt="Status: early" src="https://img.shields.io/badge/status-early-d69e2e?style=flat-square">
 </p>
 
@@ -22,7 +22,7 @@
   <a href="#licence">Licence</a>
 </p>
 
-sandbox confines a process that runs untrusted code, such as a game engine plugin, so that it can only touch the files you allow. A trusted process answers each file request from a policy you write. It is used by [droidtop](https://github.com/Droidtop/droidtop) and [Enginehost](https://github.com/Droidtop/enginehost), each of which vendors it.
+Fibrewall confines a process that runs untrusted code, such as a game engine plugin, so that it can only touch the files you allow. A trusted process answers each file request from a policy you write. It is used by [droidtop](https://github.com/Droidtop/droidtop) and [Enginehost](https://github.com/Droidtop/enginehost), each of which vendors it.
 
 ## How it works
 

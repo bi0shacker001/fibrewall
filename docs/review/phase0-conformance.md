@@ -17,7 +17,7 @@ Read-only research for the Fibrewall review (Droidtop/tracker `coordination/desi
 |---|---|---|
 | droidtop main (`vendor/sandbox` gitlink at 28d2bb5) | **`a40cc14`** (2026-10-16, "design: the isolated UID is a mode a host chooses") | **Untagged, before v0.1.0, 7 tags behind v0.1.7.** It has `SBX_LOCK_INET` (bbedd55), `SBX_LOCK_NET_BROKERED` (abbeeae), `sbx_local_add_mode`, PASSTHROUGH/claims and list/chmod/utimens. It lacks everything from 2026-10-22 on: SIGSYS kept open (03857cd), `SBX_LOCK_LEARN`, `UNIX`/`SOCKETS`/`SIGNALS`/`SIGNAL_TREE`/`CONTAIN`, `EXEC`, `sbx_broker_listen`/`sbx_attach`/`libsbx_child.so`, `WATCH`, `sbx_trace`, the 64-bit-only build, the `process_vm_readv`-self fix (0.1.6) and the per-open spare descriptors for own-opened devices (0.1.7). |
 | droidtop local clone (`/home/user/droidtop`, 2026-10-15) | `683c3c7` (2026-10-14) | An older snapshot, for reference only. |
-| droidtop SPEC.md:20703-20704 | says "bi0shacker001/sandbox 467c429, vendored" | **Wrong** about the pin, which is a40cc14. |
+| droidtop SPEC.md:20703-20704 | says "bi0shacker001/fibrewall 467c429, vendored" | **Wrong** about the pin, which is a40cc14. |
 | Enginehost (`vendor/sandbox` gitlink, `.gitmodules`) | **`2dfda43` = v0.1.7** | Current. |
 
 ## Consumer usage today

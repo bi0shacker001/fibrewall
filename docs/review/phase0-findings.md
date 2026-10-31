@@ -1,6 +1,6 @@
 # Fibrewall Phase 0 — Deliverable A: verified findings register
 
-Reviewed `bi0shacker001/sandbox` at `2dfda43` (v0.1.7), read-only. Line numbers are that revision. Every A-NN below is Confirmed unless its line says otherwise; the verdict and nuance are per finding.
+Reviewed `bi0shacker001/fibrewall` at `2dfda43` (v0.1.7), read-only. Line numbers are that revision. Every A-NN below is Confirmed unless its line says otherwise; the verdict and nuance are per finding.
 
 ## A-01 .. A-14
 

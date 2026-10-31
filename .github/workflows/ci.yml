@@ -187,7 +187,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(sed -n 's/^project(sandbox VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
+          version=$(sed -n 's/^project(fibrewall VERSION \([0-9.]*\) .*/\1/p' CMakeLists.txt)
           test -n "$version" || { echo "no version in CMakeLists.txt"; exit 1; }
           grep -q "^#define SBX_VERSION \"$version\"" include/sbx.h || { echo "sbx.h's SBX_VERSION is not $version"; exit 1; }
           if gh release view "v$version" >/dev/null 2>&1; then
@@ -202,7 +202,7 @@ jobs:
           printf '\nBuilt and tested by CI run %s.\n' "$GITHUB_RUN_ID" >> notes.md
           # A tag made by hand (the coordinator tags on request) is released as it stands, never moved.
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
-            gh release create "v$version" --verify-tag --title "sandbox $version" --notes-file notes.md
+            gh release create "v$version" --verify-tag --title "Fibrewall $version" --notes-file notes.md
           else
-            gh release create "v$version" --target "$GITHUB_SHA" --title "sandbox $version" --notes-file notes.md
+            gh release create "v$version" --target "$GITHUB_SHA" --title "Fibrewall $version" --notes-file notes.md
           fi
