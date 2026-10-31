@@ -3,8 +3,8 @@
 Status: design, the end goal (owner, 2026-10-29). We implement toward it
 incrementally; nothing here is built until its own change lands with the
 owner's approval. The working name stays `sbx` until the owner says to
-rename. This sits above `docs/design.md` (what is built), `docs/contract.md`
-(the guarantees contract), and `docs/zones.md` (#651, bounded zones).
+rename. This sits above `docs/design.md` (what is built, including its "The confinement contract" section,
+the guarantees contract), and `docs/zones.md` (#651, bounded zones).
 
 ## 0. What the owner asked for
 
@@ -36,7 +36,7 @@ Three invariants already in the library carry the whole vision:
 - **The broker is the trust boundary, not the in-process filter.** Policy
   is declarative data; each OS backend enforces as much of it as that OS
   allows. A weak backend is still safe — it just enforces less.
-- **The guarantees contract (`docs/contract.md`, A-26).** A consumer states
+- **The guarantees contract (`docs/design.md` ("The confinement contract"), A-26).** A consumer states
   the guarantees it *requires*, *prefers* and *forbids*; `sbx_negotiate`
   reports what a given policy and backend would actually enforce, what they
   rule out, and what authority would remain. This is how one library spans
