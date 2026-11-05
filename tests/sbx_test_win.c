@@ -815,12 +815,28 @@ static int pe_facts(const wchar_t *path, const char *name8, int mode) {
                 memcpy(&guard, image + config_off + guard_at, sizeof(guard));
             }
             tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+            /* The resource directory's root: whether a side-by-side manifest (RT_MANIFEST, 24) is there. */
+            IMAGE_DATA_DIRECTORY resources = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+            DWORD res_off = resources.VirtualAddress ? rva_to_offset(nt, resources.VirtualAddress) : 0;
+            IMAGE_RESOURCE_DIRECTORY_ENTRY *manifest = NULL;
+            if (res_off && res_off + sizeof(IMAGE_RESOURCE_DIRECTORY) <= size) {
+                IMAGE_RESOURCE_DIRECTORY *root_dir = (IMAGE_RESOURCE_DIRECTORY *) (image + res_off);
+                IMAGE_RESOURCE_DIRECTORY_ENTRY *e = (IMAGE_RESOURCE_DIRECTORY_ENTRY *) (root_dir + 1);
+                unsigned entries = root_dir->NumberOfNamedEntries + root_dir->NumberOfIdEntries;
+                for (unsigned k = 0; k < entries && (BYTE *) (e + k + 1) <= image + size; k++) {
+                    if (!(e[k].Name & 0x80000000u) && e[k].Name == 24) manifest = &e[k];
+                }
+            }
+            if (mode == 0) printf("info dll pe: %s manifest %s\n", name8, manifest ? "yes" : "no");
             if (mode == 0) {
                 printf("info dll pe: %s characteristics 0x%04x ex 0x%08lx guard 0x%08lx tls %lu\n", name8,
                        (unsigned) nt->OptionalHeader.DllCharacteristics, ex, guard, tls);
                 done = 1;
             } else if (mode == 1 && ex_at && (ex & 1)) {
                 *ex_at = ex & ~(DWORD) 1;
+                done = 1;
+            } else if (mode == 3 && manifest) {
+                manifest->Name = 0x7ff0;  /* a type nothing reads: the loader no longer finds a manifest */
                 done = 1;
             } else if (mode == 2 && (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF)) {
                 nt->OptionalHeader.DllCharacteristics &= (WORD) ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
@@ -895,6 +911,10 @@ static void dll_probe(int less) {
                 /* Then the unsigned copy without CET shadow-stack compatibility, and a fresh one without CFG's flag. */
                 if (pe_facts(copy, name8, 1)) {
                     printf("info dll probe: %s unsigned, CET compatibility cleared:\n", name8);
+                    probe_one(copy8, less);
+                }
+                if (copy_bytes(dll, copy) && strip_signature(copy) && pe_facts(copy, name8, 3)) {
+                    printf("info dll probe: %s unsigned, manifest hidden:\n", name8);
                     probe_one(copy8, less);
                 }
                 if (copy_bytes(dll, copy) && strip_signature(copy) && pe_facts(copy, name8, 2)) {
