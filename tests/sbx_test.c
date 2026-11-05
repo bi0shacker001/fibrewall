@@ -4291,6 +4291,12 @@ static int gpu_connect(void) {
 }
 
 static int gpu_proxy_check(const char *self) {
+#if defined(__SANITIZE_ADDRESS__) || SBX_TEST_CLANG_ASAN
+    /* The renderer and Mesa's tools are not sanitized, and the child library of a sanitized build cannot load into them. */
+    (void) self;
+    printf("skip gpu proxy: a sanitized libsbx_child.so cannot load into the system's renderer and tools\n");
+    return 0;
+#endif
     const char *server = "/usr/bin/virgl_test_server";
     if (access(server, X_OK) != 0) {
         printf("skip gpu proxy: no %s here (the virgl-server package)\n", server);

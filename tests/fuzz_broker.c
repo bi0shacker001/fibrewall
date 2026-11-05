@@ -17,6 +17,20 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/*
+ * The fuzz target links broker.c without the rest of the library. The GPU
+ * proxy's renderer start is the one call it would need; a fuzzed request
+ * must never start a program anyway, so it is refused here.
+ */
+int sbx_spawn_confined(const struct sbx_spawn_spec *spec, int broker_fd, const struct sbx_lockdown_options *options,
+                       pid_t *pid_out) {
+    (void) spec;
+    (void) broker_fd;
+    (void) options;
+    (void) pid_out;
+    return -ENOSYS;
+}
+
 static struct sbx_policy *policy;
 static int root_fd = -1;
 
