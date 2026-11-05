@@ -469,7 +469,11 @@ static long exchange_parts(struct sbx_request *request, const int *extra, int ex
     fds[count++] = answer[1];
     for (int i = 0; i < extra_count; i++) fds[count++] = extra[i];
 
-    struct iovec parts[EXCHANGE_PARTS];
+    /*
+     * Sized to the request: the handler runs on the thread's signal stack (16 KiB on bionic), and a trapped
+     * call can nest inside another handler's, so every frame here stays small (API 28's nested-handler test).
+     */
+    struct iovec parts[body_count + 1];
     parts[0].iov_base = request;
     parts[0].iov_len = sizeof(*request);
     int part_count = 1;
@@ -980,7 +984,8 @@ static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int 
  * The rest goes to the broker (SBX_SEND), which decides the address and
  * sends on the same socket.
  */
-static long send_broker(int fd, const struct msghdr *m, int flags, int stream) {
+/* Kept out of dispatch's frame: its buffers are only for the sends that need them. */
+__attribute__((noinline)) static long send_broker(int fd, const struct msghdr *m, int flags, int stream) {
     struct sbx_send_head head;
     memset(&head, 0, sizeof(head));
     if (m->msg_name && m->msg_namelen) {
@@ -1054,7 +1059,7 @@ static long send_broker(int fd, const struct msghdr *m, int flags, int stream) {
     return result;
 }
 
-static long send_message(int fd, const struct msghdr *m, int flags) {
+__attribute__((noinline)) static long send_message(int fd, const struct msghdr *m, int flags) {
     if (m == NULL) return -EFAULT;
     int type = 0;
     socklen_t type_length = sizeof(type);
@@ -1093,7 +1098,7 @@ static long send_message(int fd, const struct msghdr *m, int flags) {
     return result;
 }
 
-static long send_to(int fd, const void *bytes, size_t length, int flags, const struct sockaddr *address, socklen_t address_length) {
+__attribute__((noinline)) static long send_to(int fd, const void *bytes, size_t length, int flags, const struct sockaddr *address, socklen_t address_length) {
     struct iovec part = {(void *) bytes, length};
     struct msghdr m;
     memset(&m, 0, sizeof(m));
@@ -1104,7 +1109,7 @@ static long send_to(int fd, const void *bytes, size_t length, int flags, const s
     return send_message(fd, &m, flags);
 }
 
-static long send_many(int fd, struct mmsghdr *messages, unsigned count, int flags) {
+__attribute__((noinline)) static long send_many(int fd, struct mmsghdr *messages, unsigned count, int flags) {
     if (messages == NULL) return -EFAULT;
     if (count > 1024) count = 1024;
     for (unsigned i = 0; i < count; i++) {
