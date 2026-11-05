@@ -679,6 +679,43 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
     return count;
 }
 
+/*
+ * When the interpreter dies before it reports (STATUS_ACCESS_DENIED at load),
+ * which of its DLLs the container may not load: this program, confined the
+ * same way, loads each DLL in Python's folder and its exit code is the
+ * Windows error (0: loaded).
+ */
+static void dll_probe(int less) {
+    wchar_t pattern[MAX_PATH];
+    swprintf(pattern, MAX_PATH, L"%ls\\*.dll", python_dir);
+    WIN32_FIND_DATAW found;
+    HANDLE search = FindFirstFileW(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        char dll8[MAX_PATH * 3], name8[MAX_PATH * 3];
+        wchar_t dll[MAX_PATH];
+        swprintf(dll, MAX_PATH, L"%ls\\%ls", python_dir, found.cFileName);
+        to_utf8(dll8, sizeof(dll8), dll);
+        to_utf8(name8, sizeof(name8), found.cFileName);
+        char *argv[] = {exe8, "--load", dll8, NULL};
+        struct sbx_policy *policy = sbx_policy_new();
+        sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);
+        sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);
+        struct sbx_spawn_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.path = exe8;
+        spec.argv = argv;
+        spec.container = CONTAINER;
+        spec.less_privileged = less;
+        spec.policy = policy;
+        struct sbx_process process;
+        int code = -1;
+        if (sbx_spawn(&spec, &process) == 0) sbx_process_wait(&process, &code);
+        printf("info dll probe (%s): %s -> %d\n", less ? "less-privileged" : "appcontainer", name8, code);
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+}
+
 static void python_checks(void) {
     wchar_t python[MAX_PATH];
     if (!GetEnvironmentVariableW(L"SBX_TEST_PYTHON", python, MAX_PATH)) {
@@ -710,9 +747,20 @@ static void python_checks(void) {
     to_utf8(profile_file8, sizeof(profile_file8), profile_file);
     to_utf8(granted8, sizeof(granted8), path);
 
-    static const char *const must_refuse[] = {"subprocess", "startfile", "ctypes-createprocess", "socket-loopback",
+    /*
+     * os.startfile is judged by its effect alone (the marker, above): in a
+     * less-privileged container ShellExecute can report success and start
+     * nothing (seen on ARM64, CI 41970274514), which is a refusal all the same.
+     */
+    static const char *const must_refuse[] = {"subprocess", "ctypes-createprocess", "socket-loopback",
                                               "socket-public", "ctypes-registry", "ctypes-openprocess",
                                               "open-profile-file", "list-profile"};
+    /*
+     * In a less-privileged container Python's _socket cannot start Winsock,
+     * so socket, and ssl which imports it, fail at import (CI 41970274514,
+     * ARM64): the network is refused before any call. So ssl must import in
+     * the plain container only.
+     */
     static const char *const must_work[] = {"import-json", "import-ssl", "import-ctypes", "sbx-open"};
     /* Where a program the script launched would leave its mark: the parent's temporary folder. */
     wchar_t marker[MAX_PATH], temp_dir[MAX_PATH];
@@ -750,6 +798,12 @@ static void python_checks(void) {
         }
         int all_worked = confined_count >= 13;
         for (size_t i = 0; i < sizeof(must_work) / sizeof(must_work[0]); i++) {
+            if (less && strcmp(must_work[i], "import-ssl") == 0) {
+                const char *ssl = py_value(confined, confined_count, "works", must_work[i]);
+                printf("info %s: import-ssl %s (Winsock cannot start in a less-privileged container)\n", label,
+                       ssl && strcmp(ssl, "1") == 0 ? "works" : "fails");
+                continue;
+            }
             const char *value = py_value(confined, confined_count, "works", must_work[i]);
             snprintf(what, sizeof(what), "%s: %s works", label, must_work[i]);
             EXPECT(value && strcmp(value, "1") == 0, what);
@@ -765,6 +819,7 @@ static void python_checks(void) {
             if (errors) fclose(errors);
             said[said_length] = 0;
             printf("info %s: its stderr:\n%s\n", label, said_length ? said : "(nothing)");
+            if (confined_count < 13) dll_probe(less);
         }
     }
     DeleteFileW(profile_file);
@@ -856,6 +911,12 @@ static void left_on_windows_checks(void) {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--idle") == 0) return 0;
+    if (argc >= 3 && strcmp(argv[1], "--load") == 0) {
+        wchar_t dll[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, dll, MAX_PATH);
+        HMODULE module = LoadLibraryExW(dll, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        return module ? 0 : (int) GetLastError();
+    }
     if (argc >= 8 && strcmp(argv[1], "--child") == 0) {
         MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, root, MAX_PATH);
         MultiByteToWideChar(CP_UTF8, 0, argv[4], -1, profile, MAX_PATH);

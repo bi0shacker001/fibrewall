@@ -75,7 +75,8 @@ works("sbx-open", through_broker)
 def run_subprocess():
     import subprocess
 
-    subprocess.run(["cmd.exe", "/c", "echo started> \"%s\"" % marker], check=True, timeout=20)
+    # The interpreter itself, writing the marker: no shell quoting between the test and the effect.
+    subprocess.run([sys.executable, "-I", "-c", "open(%r, 'w').write('started')" % marker], check=True, timeout=20)
 
 
 def create_process():
