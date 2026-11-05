@@ -110,11 +110,13 @@ static int c_kept(void *arg) {
     if (fcntl(fds[1], F_GETFD) >= 0 || errno != EBADF) return 1;
     return write(fds[0], "k", 1) == 1 ? 0 : 2;
 }
+#if !(defined(__SANITIZE_ADDRESS__) || SBX_TEST_CLANG_ASAN)
 static int c_memory(void *arg) {
     (void) arg;
     void *big = malloc((size_t) 1 << 30);
     return big == NULL ? 0 : 1;
 }
+#endif
 static int c_spin(void *arg) {
     (void) arg;
     for (volatile unsigned long i = 0;; i++) {}
@@ -203,7 +205,10 @@ static int compute_check(void) {
 #else
     struct sbx_limit memory[] = {{RLIMIT_AS, 256ul << 20}};
     struct compute_case capped = {0, NULL, 0, memory, 1};
-    EXPECT(compute_run(&capped, c_memory, NULL) == 0, "compute: the memory limit: a 1 GiB allocation fails under a 256 MiB cap");
+    /* glibc's malloc answers NULL; bionic's allocator aborts the process: either way the cap holds. */
+    int capped_result = compute_run(&capped, c_memory, NULL);
+    EXPECT(capped_result == 0 || capped_result == COMPUTE_KILLED - SIGABRT,
+           "compute: the memory limit: a 1 GiB allocation fails (or the allocator aborts) under a 256 MiB cap");
 #endif
     struct sbx_limit cpu[] = {{RLIMIT_CPU, 1}};
     struct compute_case timed = {0, NULL, 0, cpu, 1};
