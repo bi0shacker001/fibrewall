@@ -20,6 +20,7 @@
 #include <winternl.h>
 #include <aclapi.h>
 #include <userenv.h>
+#include <sddl.h>
 
 #include "sbx.h"
 
@@ -681,39 +682,98 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
 
 /*
  * When the interpreter dies before it reports (STATUS_ACCESS_DENIED at load),
- * which of its DLLs the container may not load: this program, confined the
- * same way, loads each DLL in Python's folder and its exit code is the
- * Windows error (0: loaded).
+ * which DLL the container may not load, and why: this program, confined the
+ * same way, opens and loads each DLL in Python's folder and each DLL those
+ * import by name. Its exit code packs two Windows errors (0: fine): opening
+ * the file for read and execute, and loading it. Each DLL in Python's folder
+ * also prints its security descriptor (owner, DACL, label) as SDDL.
  */
+static int probe_one(const char *what, int less) {
+    char *argv[] = {exe8, "--load", (char *) what, NULL};
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);
+    sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);
+    struct sbx_spawn_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.path = exe8;
+    spec.argv = argv;
+    spec.container = CONTAINER;
+    spec.less_privileged = less;
+    spec.policy = policy;
+    struct sbx_process process;
+    int code = -1;
+    if (sbx_spawn(&spec, &process) == 0) sbx_process_wait(&process, &code);
+    if (code < 0) printf("info dll probe (%s): %s -> spawn or exit %d\n", less ? "less-privileged" : "appcontainer", what, code);
+    else printf("info dll probe (%s): %s -> open %d, load %d\n", less ? "less-privileged" : "appcontainer", what,
+                (code >> 16) & 0xffff, code & 0xffff);
+    return code;
+}
+
+static void print_sddl(const wchar_t *path, const char *name8) {
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    SECURITY_INFORMATION what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    DWORD error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, what, NULL, NULL, NULL, NULL, &descriptor);
+    wchar_t *sddl = NULL;
+    if (error == ERROR_SUCCESS && ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1, what, &sddl, NULL)) {
+        static char sddl8[8192];
+        to_utf8(sddl8, sizeof(sddl8), sddl);
+        printf("info dll sddl: %s %s\n", name8, sddl8);
+        LocalFree(sddl);
+    } else {
+        printf("info dll sddl: %s unreadable (%lu)\n", name8, error ? error : GetLastError());
+    }
+    if (descriptor) LocalFree(descriptor);
+}
+
+/* The DLL names path imports at load (not delay-loaded), added to names[] once each. */
+static int import_names(const wchar_t *path, char names[][64], int count, int max) {
+    HMODULE module = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!module) return count;
+    const BYTE *base = (const BYTE *) module;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *) (base + ((const IMAGE_DOS_HEADER *) base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (directory.VirtualAddress) {
+        for (const IMAGE_IMPORT_DESCRIPTOR *d = (const void *) (base + directory.VirtualAddress); d->Name; d++) {
+            const char *name = (const char *) (base + d->Name);
+            int seen = 0;
+            for (int i = 0; i < count; i++) seen |= _stricmp(names[i], name) == 0;
+            if (!seen && count < max) snprintf(names[count++], 64, "%s", name);
+        }
+    }
+    FreeLibrary(module);
+    return count;
+}
+
 static void dll_probe(int less) {
     wchar_t pattern[MAX_PATH];
     swprintf(pattern, MAX_PATH, L"%ls\\*.dll", python_dir);
     WIN32_FIND_DATAW found;
     HANDLE search = FindFirstFileW(pattern, &found);
     if (search == INVALID_HANDLE_VALUE) return;
+    static char imports[96][64];
+    int import_count = 0;
     do {
         char dll8[MAX_PATH * 3], name8[MAX_PATH * 3];
         wchar_t dll[MAX_PATH];
         swprintf(dll, MAX_PATH, L"%ls\\%ls", python_dir, found.cFileName);
         to_utf8(dll8, sizeof(dll8), dll);
         to_utf8(name8, sizeof(name8), found.cFileName);
-        char *argv[] = {exe8, "--load", dll8, NULL};
-        struct sbx_policy *policy = sbx_policy_new();
-        sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);
-        sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);
-        struct sbx_spawn_spec spec;
-        memset(&spec, 0, sizeof(spec));
-        spec.path = exe8;
-        spec.argv = argv;
-        spec.container = CONTAINER;
-        spec.less_privileged = less;
-        spec.policy = policy;
-        struct sbx_process process;
-        int code = -1;
-        if (sbx_spawn(&spec, &process) == 0) sbx_process_wait(&process, &code);
-        printf("info dll probe (%s): %s -> %d\n", less ? "less-privileged" : "appcontainer", name8, code);
+        print_sddl(dll, name8);
+        probe_one(dll8, less);
+        import_count = import_names(dll, imports, import_count, 96);
     } while (FindNextFileW(search, &found));
     FindClose(search);
+    char folder8[MAX_PATH * 3];
+    snprintf(folder8, sizeof(folder8), "%s", python_dir8);
+    print_sddl(python_dir, folder8);
+    /* Imports found beside Python are probed above; the rest come from the system's search path. */
+    for (int i = 0; i < import_count; i++) {
+        wchar_t beside[MAX_PATH], name[64];
+        MultiByteToWideChar(CP_UTF8, 0, imports[i], -1, name, 64);
+        swprintf(beside, MAX_PATH, L"%ls\\%ls", python_dir, name);
+        if (GetFileAttributesW(beside) != INVALID_FILE_ATTRIBUTES) continue;
+        probe_one(imports[i], less);
+    }
 }
 
 static void python_checks(void) {
@@ -930,8 +990,17 @@ int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--load") == 0) {
         wchar_t dll[MAX_PATH];
         MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, dll, MAX_PATH);
-        HMODULE module = LoadLibraryExW(dll, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-        return module ? 0 : (int) GetLastError();
+        /* A bare name is found the way the loader would find an import; a path is opened first. */
+        DWORD open_error = 0;
+        if (wcschr(dll, L'\\')) {
+            HANDLE file = CreateFileW(dll, GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                                      OPEN_EXISTING, 0, NULL);
+            if (file == INVALID_HANDLE_VALUE) open_error = GetLastError();
+            else CloseHandle(file);
+        }
+        HMODULE module = LoadLibraryExW(dll, NULL, wcschr(dll, L'\\') ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
+        DWORD load_error = module ? 0 : GetLastError();
+        return (int) ((open_error > 0x7fff ? 0x7fff : open_error) << 16 | (load_error > 0xffff ? 0xffff : load_error));
     }
     if (argc >= 8 && strcmp(argv[1], "--child") == 0) {
         MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, root, MAX_PATH);
