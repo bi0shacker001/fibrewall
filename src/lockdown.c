@@ -455,30 +455,36 @@ static long broker_failure(void) {
     return -EIO;
 }
 
-static long exchange(struct sbx_request *request, const int *extra, int extra_count, const void *body, size_t body_len,
-                     const void *body2, size_t body2_len, void *out, size_t out_len, int keep_open, int *passed) {
+/* The most iovecs one request is gathered from: the request, a header, and a send's own (SBX_SEND). */
+#define EXCHANGE_PARTS 72
+
+static long exchange_parts(struct sbx_request *request, const int *extra, int extra_count, const struct iovec *body,
+                           int body_count, void *out, size_t out_len, int keep_open, int *passed) {
     *passed = -1;
+    if (body_count < 0 || body_count > EXCHANGE_PARTS - 1 || extra_count < 0 || extra_count > SBX_FDS_MAX - 1) return -EINVAL;
     int answer[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, answer) != 0) return -errno;
-    int fds[3];
+    int fds[SBX_FDS_MAX];
     int count = 0;
     fds[count++] = answer[1];
-    for (int i = 0; i < extra_count && count < 3; i++) fds[count++] = extra[i];
+    for (int i = 0; i < extra_count; i++) fds[count++] = extra[i];
 
-    struct iovec parts[3] = {
-        {request, sizeof(*request)},
-        {(void *) body, body_len},
-        {(void *) body2, body2_len},
-    };
+    struct iovec parts[EXCHANGE_PARTS];
+    parts[0].iov_base = request;
+    parts[0].iov_len = sizeof(*request);
+    int part_count = 1;
+    for (int i = 0; i < body_count; i++) {
+        if (body[i].iov_len) parts[part_count++] = body[i];
+    }
     union {
-        char buffer[CMSG_SPACE(sizeof(int) * 3)];
+        char buffer[CMSG_SPACE(sizeof(int) * SBX_FDS_MAX)];
         struct cmsghdr align;
     } control;
     memset(&control, 0, sizeof(control));
     struct msghdr message;
     memset(&message, 0, sizeof(message));
     message.msg_iov = parts;
-    message.msg_iovlen = body2_len ? 3 : 2;
+    message.msg_iovlen = (size_t) part_count;
     message.msg_control = control.buffer;
     message.msg_controllen = CMSG_SPACE(sizeof(int) * count);
     struct cmsghdr *header = CMSG_FIRSTHDR(&message);
@@ -528,6 +534,12 @@ static long exchange(struct sbx_request *request, const int *extra, int extra_co
         return broker_failure();
     }
     return (long) reply.result;
+}
+
+static long exchange(struct sbx_request *request, const int *extra, int extra_count, const void *body, size_t body_len,
+                     const void *body2, size_t body2_len, void *out, size_t out_len, int keep_open, int *passed) {
+    struct iovec parts[2] = {{(void *) body, body_len}, {(void *) body2, body2_len}};
+    return exchange_parts(request, extra, extra_count, parts, 2, out, out_len, keep_open, passed);
 }
 
 static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const char *path2,
@@ -846,6 +858,9 @@ static int socket_domain(int fd) {
     return getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) == 0 ? domain : -errno;
 }
 
+static int net_filter;  /* SBX_LOCK_NET_FILTER */
+static long unix_call(uint32_t op, int fd, const struct sockaddr *address, socklen_t length);
+
 static long net_forward(uint32_t op, int subject, const void *body, size_t body_len, int flags, uint32_t mode,
                         void *out, size_t out_len, int keep_open, int *passed) {
     struct sbx_request request;
@@ -892,11 +907,20 @@ static long net_connect(int fd, const struct sockaddr *address, socklen_t length
             if (passed >= 0) close(passed);
             if (result != -ENOSYS) return result;
         }
+        /* SBX_LOCK_NET_FILTER: no connect from the gateway at all; the broker decides the path, as SBX_LOCK_UNIX's. */
+        if (net_filter) return unix_call(SBX_UNIX_CONNECT, fd, address, length);
         /* Through the gateway, so the filter allows it by its address, not a forgeable marker (review A-06). */
         return through(__NR_connect, fd, (long) (uintptr_t) address, (long) length, 0, 0, 0);
     }
     int passed;
-    long result = net_forward(SBX_CONNECT, fd, address, length, 0, 0, NULL, 0, 0, &passed);
+    long result = net_forward(SBX_CONNECT, fd, address, length, 0, 0, NULL, 0, 1, &passed);
+    if (result == 0 && passed >= 0) {
+        /* A name server the broker answers itself (DNS through the broker): the caller's socket becomes that one. */
+        int close_on_exec = (fcntl(fd, F_GETFD) & FD_CLOEXEC) ? O_CLOEXEC : 0;
+        long placed = dup3(passed, fd, close_on_exec) < 0 ? -errno : 0;
+        close(passed);
+        return placed;
+    }
     if (passed >= 0) close(passed);
     return result;
 }
@@ -926,7 +950,7 @@ static long net_listen(int fd, int backlog) {
 static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int flags) {
     int domain = socket_domain(fd);
     if (domain < 0) return domain;
-    if (domain != AF_INET && domain != AF_INET6) {
+    if (domain != AF_INET && domain != AF_INET6 && !net_filter) {
         /* Through the gateway, so the filter allows it by its address, not a forgeable marker (review A-06). */
         return through(__NR_accept4, fd, (long) (uintptr_t) address, (long) (uintptr_t) length, (long) flags, 0, 0);
     }
@@ -945,6 +969,150 @@ static long net_accept(int fd, struct sockaddr *address, socklen_t *length, int 
         *length = have;
     }
     return passed;
+}
+
+/*
+ * Sends, with SBX_LOCK_NET_FILTER (docs/design.md, "How it is enforced"):
+ * a sendto that names an address, every sendmsg but on the broker's socket,
+ * and every sendmmsg trap here. What cannot name a place is made here, as
+ * sendto without an address (which the filter lets through): a stream
+ * socket's bytes, a datagram of one piece with no name and no control.
+ * The rest goes to the broker (SBX_SEND), which decides the address and
+ * sends on the same socket.
+ */
+static long send_broker(int fd, const struct msghdr *m, int flags, int stream) {
+    struct sbx_send_head head;
+    memset(&head, 0, sizeof(head));
+    if (m->msg_name && m->msg_namelen) {
+        if (m->msg_namelen > sizeof(struct sockaddr_storage)) return -EINVAL;
+        head.addr_len = m->msg_namelen;
+    }
+    int rights[SBX_SEND_RIGHTS_MAX + 1];
+    rights[0] = fd;
+    int right_count = 0;
+    _Alignas(struct cmsghdr) char control[SBX_SEND_CONTROL_MAX];
+    size_t control_len = 0;
+    if (m->msg_control && m->msg_controllen) {
+        for (struct cmsghdr *c = CMSG_FIRSTHDR((struct msghdr *) m); c; c = CMSG_NXTHDR((struct msghdr *) m, c)) {
+            if (c->cmsg_len < sizeof(*c)) return -EINVAL;
+            if (c->cmsg_level == SOL_SOCKET) {
+                if (c->cmsg_type == SCM_CREDENTIALS) return -EPERM;  /* the broker would send its own */
+                if (c->cmsg_type != SCM_RIGHTS) return -EOPNOTSUPP;
+                size_t n = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                if (right_count + n > SBX_SEND_RIGHTS_MAX) return -ETOOMANYREFS;
+                memcpy(rights + 1 + right_count, CMSG_DATA(c), n * sizeof(int));
+                right_count += (int) n;
+                continue;
+            }
+            size_t space = CMSG_ALIGN(c->cmsg_len);
+            if (control_len + space > sizeof(control)) return -ENOBUFS;
+            memset(control + control_len, 0, space);
+            memcpy(control + control_len, c, c->cmsg_len);
+            control_len += space;
+        }
+    }
+    head.control_len = (uint32_t) control_len;
+    head.rights = (uint32_t) right_count;
+    struct iovec parts[EXCHANGE_PARTS - 1];
+    parts[0].iov_base = &head;
+    parts[0].iov_len = sizeof(head);
+    parts[1].iov_base = m->msg_name;
+    parts[1].iov_len = head.addr_len;
+    parts[2].iov_base = control;
+    parts[2].iov_len = control_len;
+    int count = 3;
+    size_t total = 0;
+    for (size_t i = 0; i < m->msg_iovlen; i++) {
+        size_t piece = m->msg_iov[i].iov_len;
+        if (piece == 0) continue;
+        int full = count == EXCHANGE_PARTS - 1 || total + piece > SBX_SEND_MAX;
+        if (full) {
+            /* A stream takes part of a send, as the kernel may; a datagram is one message or none. */
+            if (!stream) return -EMSGSIZE;
+            if (count < EXCHANGE_PARTS - 1 && total < SBX_SEND_MAX) {
+                parts[count].iov_base = m->msg_iov[i].iov_base;
+                parts[count++].iov_len = SBX_SEND_MAX - total;
+                total = SBX_SEND_MAX;
+            }
+            break;
+        }
+        parts[count++] = m->msg_iov[i];
+        total += piece;
+    }
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = SBX_SEND;
+    request.flags = flags;
+    request.path_len = (uint32_t) (sizeof(head) + head.addr_len + control_len);
+    request.path2_len = (uint32_t) total;
+    request.tid = (int32_t) syscall(__NR_gettid);
+    request.dirfd_sent = 1;
+    int passed;
+    long result = exchange_parts(&request, rights, 1 + right_count, parts, count, NULL, 0, 0, &passed);
+    if (passed >= 0) close(passed);
+    return result;
+}
+
+static long send_message(int fd, const struct msghdr *m, int flags) {
+    if (m == NULL) return -EFAULT;
+    int type = 0;
+    socklen_t type_length = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) != 0) return -errno;
+    int named = m->msg_name != NULL && m->msg_namelen != 0;
+    int control = m->msg_control != NULL && m->msg_controllen != 0;
+    long result;
+    if (type == SOCK_STREAM && !control) {
+        /* A stream ignores an address: its pieces go out here, in order, as the kernel would send them. */
+        long total = 0;
+        result = 0;
+        for (size_t i = 0; i < m->msg_iovlen; i++) {
+            if (m->msg_iov[i].iov_len == 0) continue;
+            ssize_t sent = sendto(fd, m->msg_iov[i].iov_base, m->msg_iov[i].iov_len, flags, NULL, 0);
+            if (sent < 0) {
+                result = total ? total : -errno;
+                break;
+            }
+            total += sent;
+            result = total;
+            if ((size_t) sent < m->msg_iov[i].iov_len) break;
+        }
+        return result;
+    }
+    if (!named && !control && m->msg_iovlen <= 1) {
+        const void *bytes = m->msg_iovlen ? m->msg_iov[0].iov_base : "";
+        size_t length = m->msg_iovlen ? m->msg_iov[0].iov_len : 0;
+        ssize_t sent = sendto(fd, bytes, length, flags, NULL, 0);
+        return sent < 0 ? -errno : sent;
+    }
+    result = send_broker(fd, m, flags, type == SOCK_STREAM);
+    if (result == -EPIPE && !(flags & MSG_NOSIGNAL)) {
+        /* The broker sent without SIGPIPE; the caller asked for it, as the kernel would have raised it. */
+        syscall(__NR_tgkill, getpid(), syscall(__NR_gettid), SIGPIPE);
+    }
+    return result;
+}
+
+static long send_to(int fd, const void *bytes, size_t length, int flags, const struct sockaddr *address, socklen_t address_length) {
+    struct iovec part = {(void *) bytes, length};
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    m.msg_name = (void *) address;
+    m.msg_namelen = address ? address_length : 0;
+    m.msg_iov = &part;
+    m.msg_iovlen = 1;
+    return send_message(fd, &m, flags);
+}
+
+static long send_many(int fd, struct mmsghdr *messages, unsigned count, int flags) {
+    if (messages == NULL) return -EFAULT;
+    if (count > 1024) count = 1024;
+    for (unsigned i = 0; i < count; i++) {
+        long sent = send_message(fd, &messages[i].msg_hdr, flags);
+        if (sent < 0) return i ? (long) i : sent;
+        messages[i].msg_len = (unsigned) sent;
+    }
+    return count;
 }
 
 /*
@@ -1403,6 +1571,13 @@ static long dispatch(long nr, ucontext_t *uc) {
         return net_listen((int) a0, (int) a1);
     case __NR_accept4:
         return net_accept((int) a0, (struct sockaddr *) a1, (socklen_t *) a2, (int) a3);
+    case __NR_sendto:
+        return send_to((int) a0, (const void *) a1, (size_t) a2, (int) a3, (const struct sockaddr *) a4,
+                       (socklen_t) ARG(uc, 5));
+    case __NR_sendmsg:
+        return send_message((int) a0, (const struct msghdr *) a1, (int) a2);
+    case __NR_sendmmsg:
+        return send_many((int) a0, (struct mmsghdr *) a1, (unsigned) a2, (int) a3);
 #ifdef __NR_accept
     case __NR_accept:
         return net_accept((int) a0, (struct sockaddr *) a1, (socklen_t *) a2, 0);
@@ -1823,6 +1998,70 @@ static void socket_rule(unsigned flags) {
     ret(REFUSE);
 }
 
+#ifndef __NR_close_range
+#define __NR_close_range 436
+#endif
+#ifndef MSG_FASTOPEN
+#define MSG_FASTOPEN 0x20000000
+#endif
+
+static int filter_broker = -1;  /* the broker's descriptor, for SBX_LOCK_NET_FILTER's rules */
+
+static void jset(unsigned value, unsigned char jt, unsigned char jf) {
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, value, jt, jf));
+}
+
+/* nr is refused (EPERM) when its argument arg is the broker's descriptor; otherwise the rules below decide. */
+static void broker_kept(unsigned nr, unsigned arg) {
+    jeq(nr, 0, 4);
+    load(ARG_LO(arg));
+    jeq((unsigned) filter_broker, 0, 1);
+    ret(DENY);
+    load(offsetof(struct seccomp_data, nr));
+}
+
+/*
+ * SBX_LOCK_NET_FILTER (docs/design.md, "How it is enforced"): no connect or
+ * accept from anywhere, the handler's gateway included; a send that could
+ * name an address traps; MSG_FASTOPEN is refused; the broker's descriptor
+ * cannot be closed or replaced, so sendmsg on it alone can go to the kernel.
+ */
+static void net_filter_rules(void) {
+    rule(__NR_connect, TRAP);
+    rule(__NR_accept4, TRAP);
+    /* sendto: MSG_FASTOPEN refused; with a destination (its fifth argument), trapped; without, the kernel's. */
+    jeq(__NR_sendto, 0, 9);
+    load(ARG_LO(3));
+    jset(MSG_FASTOPEN, 0, 1);
+    ret(REFUSE);
+    load(ARG_LO(4));
+    jeq(0, 0, 3);
+    load(ARG_HI(4));
+    jeq(0, 0, 1);
+    ret(ALLOW);
+    ret(TRAP);
+    /* sendmsg: its address is in memory the filter cannot read, so only the broker's own (connected) socket passes. */
+    jeq(__NR_sendmsg, 0, 7);
+    load(ARG_LO(2));
+    jset(MSG_FASTOPEN, 0, 1);
+    ret(REFUSE);
+    load(ARG_LO(0));
+    jeq((unsigned) filter_broker, 0, 1);
+    ret(ALLOW);
+    ret(TRAP);
+    jeq(__NR_sendmmsg, 0, 4);
+    load(ARG_LO(3));
+    jset(MSG_FASTOPEN, 0, 1);
+    ret(REFUSE);
+    ret(TRAP);
+    broker_kept(__NR_close, 0);
+    broker_kept(__NR_dup3, 1);
+#ifdef __NR_dup2
+    broker_kept(__NR_dup2, 1);
+#endif
+    rule(__NR_close_range, NOSYS);
+}
+
 static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
     int learn = (flags & SBX_LOCK_LEARN) != 0;
@@ -1950,8 +2189,12 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         ret(ALLOW);
         ret(TRAP);
         ret(REFUSE);
-        allow_from_gateway(__NR_connect);
-        allow_from_gateway(__NR_accept4);
+        if (flags & SBX_LOCK_NET_FILTER) {
+            net_filter_rules();
+        } else {
+            allow_from_gateway(__NR_connect);
+            allow_from_gateway(__NR_accept4);
+        }
         rule(__NR_bind, TRAP);
         rule(__NR_listen, TRAP);
 #ifdef __NR_accept
@@ -2227,6 +2470,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if ((options->flags & SBX_LOCK_WATCH) && (options->flags & SBX_LOCK_INOTIFY || unbrokered || pass)) return -EINVAL;
     /* The process's own sockets, or the broker's: one or the other. */
     if ((options->flags & SBX_LOCK_SOCKETS) && (options->flags & SBX_LOCK_NET_BROKERED)) return -EINVAL;
+    /* Filtering is the brokered network's, made strict. */
+    if ((options->flags & SBX_LOCK_NET_FILTER) && !(options->flags & SBX_LOCK_NET_BROKERED)) return -EINVAL;
     /* The broker's network needs the broker, and replaces the process's own. */
     if ((options->flags & SBX_LOCK_NET_BROKERED) && (options->flags & (SBX_LOCK_INET | SBX_LOCK_UNBROKERED))) return -EINVAL;
     /* Exec through the broker and the helper: needs both, and the broker's decisions (not passthrough's). */
@@ -2275,6 +2520,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
             return mapped;
         }
     }
+    filter_broker = broker_fd;
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) {
         if (helper >= 0) close(helper);
@@ -2336,6 +2582,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     passthrough = pass;
     unix_mode = (options->flags & SBX_LOCK_UNIX) != 0;
     lock_flags = options->flags;
+    net_filter = (options->flags & SBX_LOCK_NET_FILTER) != 0;
     if (exec) {
         helper_fd = helper;
         snprintf(child_library, sizeof(child_library), "%s", options->child_library);
@@ -2404,6 +2651,7 @@ int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, con
     snprintf(child_library, sizeof(child_library), "%s", library);
     passthrough = 0;
     unix_mode = (flags & SBX_LOCK_UNIX) != 0;
+    net_filter = (flags & SBX_LOCK_NET_FILTER) != 0;
     lock_flags = flags;
     /*
      * The full handler replaces sbx-exec's minimal one, through the
@@ -2429,4 +2677,25 @@ int sbx_adopt(unsigned flags, int broker_fd, int cwd_fd, int exec_helper_fd, con
     }
     locked = 1;
     return 0;
+}
+
+int sbx_resolve(const char *name, int family, struct sockaddr_storage *out, int max) {
+    if (!locked || broker < 0) return -EPERM;
+    if (name == NULL || (out == NULL && max > 0)) return -EFAULT;
+    size_t length = strnlen(name, 254);
+    if (length == 0 || length > 253) return -EINVAL;
+    if (max <= 0) return -EINVAL;
+    if (max > SBX_RESOLVE_MAX) max = SBX_RESOLVE_MAX;
+    struct sbx_request request;
+    memset(&request, 0, sizeof(request));
+    request.version = SBX_PROTOCOL_VERSION;
+    request.op = SBX_RESOLVE;
+    request.flags = max;
+    request.mode = (uint32_t) family;
+    request.path_len = (uint32_t) length;
+    request.tid = (int32_t) syscall(__NR_gettid);
+    int passed;
+    long result = exchange(&request, NULL, 0, name, length, NULL, 0, out, (size_t) max * sizeof(*out), 0, &passed);
+    if (passed >= 0) close(passed);
+    return (int) result;
 }

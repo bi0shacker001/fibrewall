@@ -58,6 +58,10 @@ extern "C" {
 #define SBX_G_NOT_LEARNING          (1ull << 21) /* enforcing: learning mode is off */
 #define SBX_G_NO_TRACE_CONTENT      (1ull << 22) /* diagnostics record no paths or arguments */
 #define SBX_G_MITIGATIONS           (1ull << 23) /* platform process mitigations applied */
+#define SBX_G_NET_FILTERED          (1ull << 24) /* no worker socket can reach an address the broker did not decide:
+                                                    connects, accepts and addressed sends all go to the broker
+                                                    (SBX_LOCK_NET_FILTER); the destinations are the policy's
+                                                    rules (sbx_policy_net_rule). Added in 0.2.0 */
 
 /*
  * Residual authority: what the worker still has that a guarantee above

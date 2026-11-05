@@ -158,6 +158,7 @@ static void name_bit(uint64_t bit, int residual, char *out, size_t cap) {
         case SBX_G_NOT_LEARNING: n = "enforcing, not learning (SBX_LOCK_LEARN is set)"; break;
         case SBX_G_NO_TRACE_CONTENT: n = "diagnostics without content (not guaranteed)"; break;
         case SBX_G_MITIGATIONS: n = "process mitigations (Windows only)"; break;
+        case SBX_G_NET_FILTERED: n = "network filtering (SBX_LOCK_NET_BROKERED with SBX_LOCK_NET_FILTER)"; break;
         }
         snprintf(out, cap, "required but not effective: %s", n);
     } else {
@@ -195,6 +196,9 @@ int sbx_negotiate(const struct sbx_policy *policy, const void *options, const st
     if (!(f & NET_FLAGS)) eff |= SBX_G_NET_NONE;
     else block |= SBX_G_NET_NONE;
     if (f & SBX_LOCK_NET_BROKERED) eff |= SBX_G_NET_MEDIATED;
+    /* Filtering: the strict brokered network, enforcing (learning lets refused calls through). */
+    if ((f & SBX_LOCK_NET_BROKERED) && (f & SBX_LOCK_NET_FILTER) && !(f & SBX_LOCK_LEARN)) eff |= SBX_G_NET_FILTERED;
+    else if (f & (SBX_LOCK_INET | SBX_LOCK_SOCKETS)) block |= SBX_G_NET_FILTERED;
     if (f & SBX_LOCK_INET) resid |= SBX_R_NETWORK_ANY;
     if (f & SBX_LOCK_SOCKETS) resid |= SBX_R_UID_SOCKETS;
 

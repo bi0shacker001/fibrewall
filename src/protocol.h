@@ -87,6 +87,31 @@ enum sbx_op {
      * watch descriptor.
      */
     SBX_WATCH = 27,
+    /*
+     * SBX_LOCK_NET_FILTER (docs/design.md, "Network filtering"). SBX_SEND: a send the handler could not make
+     * itself. flags = the send flags; path = struct sbx_send_head, then the address (addr_len bytes), then
+     * control messages other than SCM_RIGHTS (control_len bytes); path2 = the bytes to send. The socket is
+     * the first descriptor after the answer socket (dirfd_sent = 1); descriptors for SCM_RIGHTS follow
+     * (head.rights of them). result = the bytes sent.
+     */
+    SBX_SEND = 28,
+    /* sbx_resolve: path = the name, mode = the family; data = struct sockaddr_storage[result] */
+    SBX_RESOLVE = 29,
+};
+
+/* The most bytes one SBX_SEND carries: a datagram's largest, with room for its header. */
+#define SBX_SEND_MAX 65536
+/* The most descriptors one request carries: the answer socket, the subject, and SCM_RIGHTS ones. */
+#define SBX_FDS_MAX 8
+#define SBX_SEND_RIGHTS_MAX (SBX_FDS_MAX - 2)
+#define SBX_SEND_CONTROL_MAX 512
+#define SBX_RESOLVE_MAX 16
+
+struct sbx_send_head {
+    uint32_t addr_len;
+    uint32_t control_len;
+    uint32_t rights;
+    uint32_t reserved;
 };
 
 /* The calls SBX_SIGNAL carries. */
