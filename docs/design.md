@@ -1993,6 +1993,69 @@ and a refused name; UDP to port 53 refused; the broker's socket kept
 with "no rule". On the emulators bionic's own `getaddrinfo` runs through
 the relay as well.
 
+## The GPU: a proxy by default, direct with an ioctl allowlist (design 2026-11-05; allowlist built, Droidtop/tracker#815)
+
+The owner (2026-10-30): a GPU proxy as a sandbox feature, "optional, but
+by default", for every sandbox user that asks for the GPU (Linux
+containers, `gpu.render` plugins, Enginehost GPU cores, Wine); direct
+access stays a per-process option the host chooses, never the confined
+code. Asked whether direct access carries risks, the owner settled it:
+Enginehost cores default to the proxy too, direct is a per-game opt-in
+with a plain warning, and **direct mode and the proxy's renderer both get
+an ioctl allowlist on the GPU**, found by learning, then enforced.
+
+**Why.** A process that holds a GPU device descriptor reaches the kernel
+GPU driver with every ioctl (KGSL on Adreno), a known privilege-escalation
+surface, and Enginehost cores run untrusted game scripts.
+
+### The ioctl allowlist (built, 0.5.0)
+
+`sbx_lockdown_options.ioctl_allow` lists the ioctl requests a process may
+make; any other is refused (EPERM). It is keyed on the **request, on every
+descriptor**, not on the GPU descriptor's number: sealing by number was
+shown bypassable by receiving the descriptor back under a new number over
+`SCM_RIGHTS` (review A-24), and a request-keyed list is not. The request
+is matched in its low 32 bits, as the kernel reads it. TIOCSTI and
+TIOCLINUX stay refused even when listed; sealed descriptors stay sealed.
+
+How a host builds the list: run the process with `SBX_LOCK_LEARN` and the
+list it has so far; each request outside it is let through and recorded
+(`allowed_by` "ioctl_allow", the request in the record's second argument);
+add what the driver needs, then lock down without learning. The list is
+the host's, per driver (Turnip on KGSL, a Mali driver), as `own_opens` is:
+the library never decides what a driver needs. A process that is denied
+an ioctl its driver needs fails in its driver, so a list is checked on the
+device it is for. The contract reports it (`SBX_G_IOCTL_ALLOWLIST`, only
+when not learning). At most 200 requests (`SBX_IOCTL_ALLOW_MAX`).
+
+### The proxy (designed, not built)
+
+- **The client** (the confined process) loads Mesa's `virgl` (GL) and
+  `venus` (Vulkan) drivers, which speak the vtest protocol over a Unix
+  socket. It holds no GPU node: its own opens of the device are refused,
+  and the allowlist above, with no driver requests on it, refuses the rest.
+- **The renderer** is virglrenderer's vtest server, one per client so
+  clients never share GPU state, started confined by the library
+  (`sbx_spawn_confined`) with the GPU node as its only device (`own_opens`),
+  the driver's ioctl allowlist, no network, and only its shader cache
+  writable.
+- **The socket** is the broker's: the client's connect to the vtest path
+  is a system socket the broker connects for it (as `dnsproxyd` is), to
+  its own renderer's socket only.
+- **The pieces** (virglrenderer and Mesa's virgl/venus for arm64-v8a and
+  x86_64, from pinned upstream tags under `vendor/`, unmodified) are built
+  by CI and shipped beside `sbx-exec`.
+- **Escape suite**: a proxied client cannot open any GPU node; a renderer
+  accepts only its own client; the vtest decoder is fuzzed with malformed
+  streams.
+- **Measured first**, per kind of user, on the rig: llvmpipe, the proxy and
+  direct, one GL and one Vulkan benchmark and one heavy title each. If the
+  proxy costs a user too much, the owner decides whether that user's
+  default becomes direct; until then it stays the proxy.
+
+Next slice: the renderer launcher and the system-socket hand-off, tested in
+CI on Linux with a software renderer, then the Android build of the pieces.
+
 ## Performance: fewer and cheaper broker round trips (built 2026-11-05, Droidtop/tracker#791)
 
 The owner (2026-10-29) asked whether a Syncthing scan of a very large

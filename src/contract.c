@@ -125,6 +125,8 @@ static void digest(const struct sbx_policy *policy, const struct sbx_lockdown_op
     for (unsigned i = 0; i < o->own_open_count; i++)
         if (o->own_opens && o->own_opens[i]) sha256_update(&s, o->own_opens[i], strlen(o->own_opens[i]) + 1);
     sha256_update(&s, &o->sealed_count, sizeof(o->sealed_count));
+    sha256_update(&s, &o->ioctl_allow_count, sizeof(o->ioctl_allow_count));
+    if (o->ioctl_allow && o->ioctl_allow_count) sha256_update(&s, o->ioctl_allow, sizeof(uint32_t) * o->ioctl_allow_count);
     for (unsigned i = 0; i < o->claim_count; i++)
         if (o->claims && o->claims[i]) sha256_update(&s, o->claims[i], strlen(o->claims[i]) + 1);
     sha256_final(&s, out);
@@ -159,6 +161,7 @@ static void name_bit(uint64_t bit, int residual, char *out, size_t cap) {
         case SBX_G_NO_TRACE_CONTENT: n = "diagnostics without content (not guaranteed)"; break;
         case SBX_G_MITIGATIONS: n = "process mitigations (Windows only)"; break;
         case SBX_G_NET_FILTERED: n = "network filtering (SBX_LOCK_NET_BROKERED with SBX_LOCK_NET_FILTER)"; break;
+        case SBX_G_IOCTL_ALLOWLIST: n = "an ioctl allowlist (sbx_lockdown_options.ioctl_allow, not learning)"; break;
         }
         snprintf(out, cap, "required but not effective: %s", n);
     } else {
@@ -198,6 +201,8 @@ int sbx_negotiate(const struct sbx_policy *policy, const void *options, const st
     if (f & SBX_LOCK_NET_BROKERED) eff |= SBX_G_NET_MEDIATED;
     /* Filtering: the strict brokered network, enforcing (learning lets refused calls through). */
     if ((f & SBX_LOCK_NET_BROKERED) && (f & SBX_LOCK_NET_FILTER) && !(f & SBX_LOCK_LEARN)) eff |= SBX_G_NET_FILTERED;
+    /* The ioctl allowlist, enforcing (learning lets unlisted requests through). */
+    if (o->ioctl_allow_count > 0 && !(f & SBX_LOCK_LEARN)) eff |= SBX_G_IOCTL_ALLOWLIST;
     else if (f & (SBX_LOCK_INET | SBX_LOCK_SOCKETS)) block |= SBX_G_NET_FILTERED;
     if (f & SBX_LOCK_INET) resid |= SBX_R_NETWORK_ANY;
     if (f & SBX_LOCK_SOCKETS) resid |= SBX_R_UID_SOCKETS;

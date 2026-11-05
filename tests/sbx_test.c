@@ -4045,6 +4045,120 @@ static int perf_check(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+/* ---- The ioctl allowlist (sbx_lockdown_options.ioctl_allow; Droidtop/tracker#815). ---- */
+
+static int ioctl_learned;
+static void ioctl_audit(void *context, const struct sbx_access *access, int result) {
+    (void) context;
+    (void) result;
+    if (access->allowed_by && strcmp(access->allowed_by, "ioctl_allow") == 0) __atomic_add_fetch(&ioctl_learned, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Sends fd over a socketpair and back: the same open file under a new number (review A-24). */
+static int ioctl_reimport(int fd) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) return -1;
+    char byte = 'x';
+    struct iovec part = {&byte, 1};
+    union {
+        char buffer[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    m.msg_iov = &part;
+    m.msg_iovlen = 1;
+    m.msg_control = control.buffer;
+    m.msg_controllen = sizeof(control.buffer);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof(int));
+    int copy = -1;
+    if (sendmsg(pair[0], &m, 0) == 1) {
+        m.msg_controllen = sizeof(control.buffer);
+        if (recvmsg(pair[1], &m, MSG_CMSG_CLOEXEC) == 1) {
+            c = CMSG_FIRSTHDR(&m);
+            if (c && c->cmsg_type == SCM_RIGHTS) memcpy(&copy, CMSG_DATA(c), sizeof(int));
+        }
+    }
+    close(pair[0]);
+    close(pair[1]);
+    return copy;
+}
+
+static int ioctl_run(int learn) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_set_audit(policy, ioctl_audit, NULL);
+    sbx_broker_prepare(pair[0]);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(30);
+        close(pair[0]);
+        int sock[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sock) != 0) _exit(2);
+        int on = 1, queued = -1;
+        if (!learn) {
+            EXPECT(ioctl(sock[0], FIONREAD, &queued) == 0 && ioctl(sock[0], FIONBIO, &on) == 0,
+                   "ioctl allow control: FIONREAD and FIONBIO work unconfined");
+            uint32_t too_many[SBX_IOCTL_ALLOW_MAX + 1] = {0};
+            struct sbx_lockdown_options bad = {.flags = 0, .ioctl_allow = too_many, .ioctl_allow_count = SBX_IOCTL_ALLOW_MAX + 1};
+            EXPECT(sbx_lockdown(pair[1], &bad) == -EINVAL, "ioctl allow: more than SBX_IOCTL_ALLOW_MAX requests is refused");
+        }
+        static const uint32_t allow[] = {FIONREAD, TIOCSTI};
+        struct sbx_lockdown_options options = {.flags = learn ? SBX_LOCK_LEARN : 0, .ioctl_allow = allow, .ioctl_allow_count = 2};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, learn ? "ioctl allow, learning: lockdown" : "ioctl allow: lockdown");
+        if (locked == 0 && !learn) {
+            EXPECT(ioctl(sock[0], FIONREAD, &queued) == 0, "ioctl allow: a listed request works");
+            errno = 0;
+            EXPECT(ioctl(sock[0], FIONBIO, &on) < 0 && errno == EPERM, "ioctl allow: a request not listed is refused");
+            int copy = ioctl_reimport(sock[0]);
+            errno = 0;
+            EXPECT(copy >= 0 && ioctl(copy, FIONBIO, &on) < 0 && errno == EPERM,
+                   "ioctl allow: the same descriptor under a new number (SCM_RIGHTS) is refused too");
+            char c = 'x';
+            errno = 0;
+            EXPECT(ioctl(sock[0], TIOCSTI, &c) < 0 && errno == EPERM, "ioctl allow: TIOCSTI stays refused even when listed");
+        }
+        if (locked == 0 && learn) {
+            EXPECT(ioctl(sock[0], FIONBIO, &on) == 0, "ioctl allow, learning: a request not listed is let through");
+        }
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    sbx_broker_serve(policy, pair[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+static int ioctl_allow_check(void) {
+    struct sbx_report report;
+    memset(&report, 0, sizeof(report));
+    report.size = sizeof(report);
+    static const uint32_t one[] = {FIONREAD};
+    struct sbx_lockdown_options listed = {.flags = 0, .ioctl_allow = one, .ioctl_allow_count = 1};
+    struct sbx_requirements need = {.size = sizeof(need), .required = SBX_G_IOCTL_ALLOWLIST};
+    EXPECT(sbx_negotiate(NULL, &listed, &need, &report) == 0 && (report.effective & SBX_G_IOCTL_ALLOWLIST),
+           "ioctl allow: the contract reports the allowlist");
+    struct sbx_lockdown_options none = {.flags = 0};
+    memset(&report, 0, sizeof(report));
+    report.size = sizeof(report);
+    EXPECT(sbx_negotiate(NULL, &none, &need, &report) == -EPERM, "ioctl allow: without one, a requirement for it is refused");
+    int result = ioctl_run(0) | ioctl_run(1);
+    int learned = __atomic_load_n(&ioctl_learned, __ATOMIC_ACQUIRE);
+    printf("%s ioctl allow, learning: the request was recorded with allowed_by \"ioctl_allow\" (%d)\n",
+           learned >= 1 ? "ok  " : "FAIL", learned);
+    return result | (learned >= 1 ? 0 : 1);
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -4196,7 +4310,7 @@ int main(int argc, char **argv) {
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
     int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
-                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check();
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check() | ioctl_allow_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

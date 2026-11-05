@@ -1872,7 +1872,7 @@ static void handle_sigsys(int signal_number, siginfo_t *info, void *context) {
     errno = saved_errno;
 }
 
-#define FILTER_MAX 512
+#define FILTER_MAX 1024
 static struct sock_filter filter[FILTER_MAX];
 static unsigned short filter_length;
 
@@ -2011,6 +2011,8 @@ static void socket_rule(unsigned flags) {
 #endif
 
 static int filter_broker = -1;  /* the broker's descriptor, for SBX_LOCK_NET_FILTER's rules */
+static const uint32_t *ioctl_allow;  /* sbx_lockdown_options.ioctl_allow, for the filter's build */
+static unsigned ioctl_allow_count;
 
 static void jset(unsigned value, unsigned char jt, unsigned char jf) {
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, value, jt, jf));
@@ -2300,6 +2302,19 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
     jeq(TIOCLINUX, 0, 1);
     ret(DENY);
     load(offsetof(struct seccomp_data, nr));
+    /*
+     * The ioctl allowlist (sbx_lockdown_options.ioctl_allow): a request not
+     * listed is refused (recorded, when learning), on every descriptor. A
+     * listed one goes on to the rules below (sealing among them).
+     */
+    if (ioctl_allow_count > 0) {
+        unsigned n = ioctl_allow_count;
+        jeq(__NR_ioctl, 0, (unsigned char) (n + 3));
+        load(ARG_LO(1));
+        for (unsigned k = 0; k < n; k++) jeq(ioctl_allow[k], (unsigned char) (n - k), 0);
+        ret(DENY);
+        load(offsetof(struct seccomp_data, nr));
+    }
     /* Sealed descriptors: kept, but no longer used. */
     if (sealed_count > 0) {
         sealed_block(__NR_ioctl, 0, sealed, sealed_count);
@@ -2495,6 +2510,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (options->sealed_count > SBX_SEALED_MAX || (options->sealed_count && !options->sealed_fds)) return -EINVAL;
     if (options->own_open_count > SBX_OWN_OPENS_MAX || (options->own_open_count && !options->own_opens)) return -EINVAL;
     if (options->limit_count > SBX_LIMITS_MAX || (options->limit_count && !options->limits)) return -EINVAL;
+    if (options->ioctl_allow_count > SBX_IOCTL_ALLOW_MAX || (options->ioctl_allow_count && !options->ioctl_allow)) return -EINVAL;
     for (unsigned k = 0; k < options->sealed_count; k++) {
         if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
     }
@@ -2526,6 +2542,8 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
         }
     }
     filter_broker = broker_fd;
+    ioctl_allow = options->ioctl_allow;
+    ioctl_allow_count = options->ioctl_allow_count;
     int built = build_filter(options->flags, getpid(), options->sealed_fds, options->sealed_count);
     if (built != 0) {
         if (helper >= 0) close(helper);

@@ -32,9 +32,9 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.4.0"
+#define SBX_VERSION "0.5.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 4
+#define SBX_VERSION_MINOR 5
 #define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -296,6 +296,7 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
 #define SBX_CLAIMS_MAX 32
 #define SBX_LOCALS_MAX 512
 #define SBX_LIMITS_MAX 8
+#define SBX_IOCTL_ALLOW_MAX 200
 
 /* A resource limit (rlimit): both the soft and hard limit are set to value. Used by sbx_lockdown and sbx_spawn. */
 struct sbx_limit {
@@ -359,6 +360,20 @@ struct sbx_lockdown_options {
      */
     const struct sbx_limit *limits;
     unsigned limit_count;  /* at most SBX_LIMITS_MAX */
+    /*
+     * An ioctl allowlist (Droidtop/tracker#815): when ioctl_allow_count is
+     * not 0, an ioctl whose request (its low 32 bits, as the kernel reads
+     * it) is not listed is refused (EPERM), on every descriptor. It is keyed
+     * on the request, not the descriptor, so a device descriptor received
+     * back under a new number (review A-24) gains nothing. For a process
+     * that keeps a GPU device (own_opens): list the requests its driver
+     * uses, found with SBX_LOCK_LEARN (each refused request is recorded with
+     * allowed_by "ioctl_allow"), and every other driver ioctl is refused.
+     * TIOCSTI and TIOCLINUX stay refused even when listed; sealed
+     * descriptors stay sealed. Appended in 0.5.0.
+     */
+    const uint32_t *ioctl_allow;
+    unsigned ioctl_allow_count;  /* at most SBX_IOCTL_ALLOW_MAX */
 };
 
 /*

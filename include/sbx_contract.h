@@ -62,6 +62,8 @@ extern "C" {
                                                     connects, accepts and addressed sends all go to the broker
                                                     (SBX_LOCK_NET_FILTER); the destinations are the policy's
                                                     rules (sbx_policy_net_rule). Added in 0.2.0 */
+#define SBX_G_IOCTL_ALLOWLIST       (1ull << 25) /* every ioctl's request is on a declared allowlist, on every descriptor
+                                                    (sbx_lockdown_options.ioctl_allow). Added in 0.5.0 */
 
 /*
  * Residual authority: what the worker still has that a guarantee above

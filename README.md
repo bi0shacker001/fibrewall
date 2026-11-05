@@ -74,6 +74,10 @@ Not built yet:
 
 ### Releases
 
+- **v0.5.0** (2026-11-05): an ioctl allowlist, the first piece of the GPU proxy design ([Droidtop/tracker#815](https://github.com/Droidtop/tracker/issues/815); [docs/design.md](docs/design.md), "The GPU"):
+  - `sbx_lockdown_options.ioctl_allow`: any ioctl whose request is not listed is refused, on every descriptor. A GPU descriptor received back under a new number gains nothing. The list is the host's, found with `SBX_LOCK_LEARN`, which records each unlisted request (`allowed_by` "ioctl_allow").
+  - `SBX_G_IOCTL_ALLOWLIST` in the contract.
+
 - **v0.4.0** (2026-11-05): fewer and cheaper broker round trips ([Droidtop/tracker#791](https://github.com/Droidtop/tracker/issues/791); [docs/design.md](docs/design.md), "Performance"):
   - `sbx_list_stat`: a folder's entries with their metadata in one request. Under lockdown, a 100k-file metadata walk takes 0.16 s instead of 4.9 s.
   - The broker keeps the folders it resolved for two seconds, so a call in a folder it has just seen checks only the last name. A stale entry can only refuse.

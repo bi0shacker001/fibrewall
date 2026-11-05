@@ -2452,6 +2452,11 @@ const char *sbx_syscall_name(long nr) {
  */
 static const char *allowed_by(long nr, const int64_t *args) {
     switch (nr) {
+    case __NR_ioctl: {
+        /* The terminal-input ioctls are never allowed; any other refused one was the allowlist's. */
+        uint32_t request = (uint32_t) args[1];
+        return request == 0x5412 /* TIOCSTI */ || request == 0x541C /* TIOCLINUX */ ? NULL : "ioctl_allow";
+    }
     case __NR_socket: {
         unsigned type = (unsigned) args[1] & 0xf;
         switch ((int) args[0]) {
