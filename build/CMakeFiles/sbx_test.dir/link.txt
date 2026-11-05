@@ -1,0 +1,1 @@
+/usr/bin/cc CMakeFiles/sbx_test.dir/tests/sbx_test.c.o -o sbx_test  libsbx.a 

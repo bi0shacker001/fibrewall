@@ -1,0 +1,2 @@
+/usr/bin/ar qc libsbx.a CMakeFiles/sbx.dir/src/lockdown.c.o CMakeFiles/sbx.dir/src/broker.c.o CMakeFiles/sbx.dir/src/net.c.o CMakeFiles/sbx.dir/src/spawn.c.o CMakeFiles/sbx.dir/src/open.c.o CMakeFiles/sbx.dir/src/attach.c.o CMakeFiles/sbx.dir/src/contract.c.o
+/usr/bin/ranlib libsbx.a

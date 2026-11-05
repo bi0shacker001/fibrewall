@@ -173,6 +173,15 @@ asks for; the contract reports which are actually in force.
    a flow. The adaptivity is the host's rules plus the engine's threaded
    state, nothing hidden.
 
+**Built (0.2.0, 2026-11-05):** the L3/L4 floor on the broker path, for
+Linux and Android without root or a namespace: per-destination, port,
+protocol and name rules, DNS through the broker, and the strict filter
+(`SBX_LOCK_NET_FILTER`) that leaves the worker no socket it can point
+anywhere undecided (`docs/design.md`, "Network filtering"). The rules are
+the first declarative layer the §10 decision anticipated, a line of text
+per rule. The namespace and kernel-firewall floor, L7 and adaptive rules
+are still to build.
+
 Honest limits: the proxy can inspect only what it can see; end-to-end
 encryption without a trusted-proxy CA is opaque above L4 (SNI and cert
 still visible). We do not MITM silently; a consumer that wants content

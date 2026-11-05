@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -shared -Wl,-soname,libsbx_child.so -o libsbx_child.so CMakeFiles/sbx_child.dir/src/child.c.o  libsbx.a 

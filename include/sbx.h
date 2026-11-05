@@ -32,10 +32,10 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.1.7"
+#define SBX_VERSION "0.2.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 1
-#define SBX_VERSION_PATCH 7
+#define SBX_VERSION_MINOR 2
+#define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -131,6 +131,21 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  * a thread of its own, so it holds up no other call.
  */
 #define SBX_LOCK_NET_BROKERED 0x10u
+/*
+ * With SBX_LOCK_NET_BROKERED: network filtering (docs/design.md, "Network
+ * filtering"). No socket the process holds can be pointed at an address
+ * the broker did not decide: connect and accept always go to the broker
+ * (a Unix connect too: a system socket as above, any other path under the
+ * file rules and sbx_policy_add_unix_name, as with SBX_LOCK_UNIX); a
+ * sendto that names an address, every sendmsg but on the broker's own
+ * socket, and every sendmmsg trap, and a send with an address, control
+ * data or a gathered datagram is made by the broker after it decides the
+ * address; MSG_FASTOPEN is refused; and the broker's socket cannot be
+ * closed or replaced (close, dup2 and dup3 onto it answer EPERM;
+ * close_range answers ENOSYS). The destinations are the policy's
+ * (sbx_policy_net_rule). -EINVAL without SBX_LOCK_NET_BROKERED.
+ */
+#define SBX_LOCK_NET_FILTER 0x10000u
 
 /*
  * Learning mode, for training a policy (docs/design.md, "Learning mode"):
@@ -644,6 +659,9 @@ struct sbx_access {
     int rule_verdict;      /* what the rules alone answered: 0 or a negative errno */
     const char *allowed_by; /* for "syscall": the lockdown flag that would have allowed the call
                                ("SBX_LOCK_INET", ...), or NULL when none does; NULL for every other op */
+    const char *net_rule;  /* for a network call decided by sbx_policy_net_rule's rules: the rule's text, or
+                              "no rule" when none matched (then refused), or the reason ("DNS goes through
+                              the broker"); NULL otherwise. Appended in 0.2.0. */
 };
 
 /*
@@ -668,8 +686,11 @@ void sbx_policy_set_decider(struct sbx_policy *policy, sbx_decide_fn decide, voi
  * "[2001:db8::1]:80", "*:8384" for any address, a system socket's path), with
  * rule_verdict what the grants alone answered; it is asked about refusals,
  * and about every call when SBX_NET_DECIDE is granted. Sockets are TCP and
- * UDP only. A UDP sendto to an address names it in memory the broker never
- * sees: SBX_NET_CONNECT covers every destination of a datagram.
+ * UDP only. Without SBX_LOCK_NET_FILTER a UDP sendto to an address names it
+ * in memory the broker never sees: SBX_NET_CONNECT covers every destination
+ * of a datagram. For destinations by address, port, protocol and name, use
+ * sbx_policy_net_rule (below) with SBX_LOCK_NET_FILTER; in that rule mode
+ * these grants follow from the rules.
  */
 #define SBX_NET_CONNECT 0x1u  /* outbound: connect TCP and UDP sockets, to any address the decider allows */
 #define SBX_NET_LISTEN 0x2u   /* inbound: bind a port, listen, accept */
@@ -689,6 +710,30 @@ void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants);
  * negative errno.
  */
 #define SBX_SYSTEM_SOCKETS_MAX 8
+/*
+ * Network rules (docs/design.md, "Network filtering"): the destinations a
+ * process may reach, one rule per call, as a line of text:
+ *
+ *   <allow|deny|ask> <out|in> [tcp|udp] <destination> [port N[-M]]
+ *   <allow|deny|ask> dns <any|name|*.zone>
+ *
+ * out is a connect or a datagram sent to an address, its destination the
+ * peer; in is a bind of a named port, a listen and each accepted peer, the
+ * destination the peer and the port the local one. A destination is any,
+ * loopback, local (loopback, private, link-local, unique-local, broadcast,
+ * and link- or site-scope multicast), internet (any other address), an
+ * address or prefix ("192.0.2.7", "10.0.0.0/8", "2001:db8::/32"), or a
+ * name ("example.com"; "*.example.com" for its subdomains). The first rule
+ * that matches answers; none matching is a refusal; ask hands the call to
+ * the decider (refused without one). With at least one rule the policy is
+ * in rule mode: names are resolved by the broker alone (a name rule or a
+ * dns rule allows a lookup; "allow dns any" every lookup), the system
+ * resolver's socket (SBX_NET_RESOLVE) and any TCP connect to port 53 are
+ * answered by the broker itself, UDP to port 53 is refused, and the
+ * SBX_NET_* grants follow from the rules. At most 256 rules. Returns 0,
+ * -EINVAL for a line that does not parse, or -ENOSPC.
+ */
+int sbx_policy_net_rule(struct sbx_policy *policy, const char *rule);
 int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant);
 
 /*
@@ -762,6 +807,17 @@ int sbx_attach(const char *socket_path, const char *token, const struct sbx_lock
  * (SBX_ADOPT, set by sbx-exec).
  */
 int sbx_attach_from_environment(void);
+
+/*
+ * In a locked-down process: asks the broker for name's addresses (family
+ * AF_INET, AF_INET6 or AF_UNSPEC), decided as a lookup by the policy's
+ * rules (or, without rules, the SBX_NET_RESOLVE grant). Fills up to max
+ * (at most 16) addresses, port 0, and returns how many; -EACCES when the
+ * policy refuses the name, -ENOENT when it has no address, -EAGAIN when
+ * the broker's resolver failed, -EPERM before lockdown.
+ */
+struct sockaddr_storage;
+int sbx_resolve(const char *name, int family, struct sockaddr_storage *out, int max);
 #endif
 
 #ifdef __cplusplus

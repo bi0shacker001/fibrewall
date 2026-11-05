@@ -1,0 +1,1 @@
+/usr/bin/cc -nostdlib -static -Wl,-no-pie -Wl,-Ttext-segment=0x200010000000 -fno-sanitize=all "CMakeFiles/sbx-exec.dir/src/exec_helper.c.o" -o sbx-exec 

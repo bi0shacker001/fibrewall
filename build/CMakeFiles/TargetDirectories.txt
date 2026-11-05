@@ -1,0 +1,6 @@
+/home/user/fibrewall/build/CMakeFiles/sbx.dir
+/home/user/fibrewall/build/CMakeFiles/sbx_child.dir
+/home/user/fibrewall/build/CMakeFiles/sbx-exec.dir
+/home/user/fibrewall/build/CMakeFiles/sbx_test.dir
+/home/user/fibrewall/build/CMakeFiles/edit_cache.dir
+/home/user/fibrewall/build/CMakeFiles/rebuild_cache.dir
