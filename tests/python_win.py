@@ -8,13 +8,14 @@
 # refusal from the kernel".
 #
 # argv: channel handle, port, parent pid, a file in the profile, the profile,
-#       the sbx_open helper DLL, a file the broker grants.
+#       the sbx_open helper DLL, a file the broker grants, and a marker path a
+#       launched program would create (the parent checks whether one ran).
 #
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 import os
 import sys
 
-channel_handle, port, parent_pid, profile_file, profile_dir, helper_dll, granted = sys.argv[1:8]
+channel_handle, port, parent_pid, profile_file, profile_dir, helper_dll, granted, marker = sys.argv[1:9]
 port = int(port)
 parent_pid = int(parent_pid)
 
@@ -41,6 +42,9 @@ def works(name, action):
         ok = action()
         report("works %s %d" % (name, 1 if ok is not False else 0))
     except BaseException:
+        import traceback
+
+        traceback.print_exc()  # to stderr, which the test shows when a check fails
         report("works %s 0" % name)
 
 
@@ -71,7 +75,7 @@ works("sbx-open", through_broker)
 def run_subprocess():
     import subprocess
 
-    subprocess.run(["cmd.exe", "/c", "exit 0"], check=True, timeout=20)
+    subprocess.run(["cmd.exe", "/c", "echo started> \"%s\"" % marker], check=True, timeout=20)
 
 
 def create_process():
@@ -97,7 +101,8 @@ def create_process():
 
 
 def start_file():
-    os.startfile("cmd.exe", "open", "/c exit 0")
+    # Whether a program really started is the parent's to see: this one would leave the marker.
+    os.startfile("cmd.exe", "open", '/c echo started> "%s"' % marker)
 
 
 def connect(host, the_port):

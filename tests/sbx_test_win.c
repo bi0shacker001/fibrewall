@@ -602,7 +602,7 @@ static wchar_t python_dir[MAX_PATH];
 
 /* Runs the script; confined < 0: the control. Returns the items it reported. */
 static size_t py_run(int confined, const wchar_t *script, const char *profile_file8, const char *granted8,
-                     struct py_item *items) {
+                     const char *marker8, struct py_item *items) {
     SECURITY_ATTRIBUTES inherit = {sizeof(inherit), NULL, TRUE};
     HANDLE read_end, write_end;
     CreatePipe(&read_end, &write_end, &inherit, 0);
@@ -620,8 +620,8 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
         quote_into(line, 24000, L"-I");
         quote_into(line, 24000, L"-c");
         quote_into(line, 24000, script);
-        const char *rest[] = {handle8, port8, pid8, profile_file8, profile8, helper8, granted8};
-        for (size_t i = 0; i < 7; i++) {
+        const char *rest[] = {handle8, port8, pid8, profile_file8, profile8, helper8, granted8, marker8};
+        for (size_t i = 0; i < 8; i++) {
             MultiByteToWideChar(CP_UTF8, 0, rest[i], -1, argument, MAX_PATH * 2);
             quote_into(line, 24000, argument);
         }
@@ -642,7 +642,7 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
         static char script8[24000 * 3];
         WideCharToMultiByte(CP_UTF8, 0, script, -1, script8, sizeof(script8), NULL, NULL);
         char *argv[] = {python8, "-I", "-c", script8, handle8, port8, pid8, (char *) profile_file8, profile8, helper8,
-                        (char *) granted8, NULL};
+                        (char *) granted8, (char *) marker8, NULL};
         struct sbx_policy *policy = sbx_policy_new();
         sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);  /* the interpreter and its standard library */
         sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);     /* the sbx_open helper DLL */
@@ -657,13 +657,20 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
         spec.less_privileged = confined;
         spec.memory_limit = 1ull << 30;
         spec.policy = policy;
+        /* The interpreter's stderr, to a file the test shows when a check fails. */
+        wchar_t errors_path[MAX_PATH];
+        child_path(errors_path, L"python-stderr.txt");
+        HANDLE errors = CreateFileW(errors_path, GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS, 0, NULL);
+        spec.std_err = errors != INVALID_HANDLE_VALUE ? errors : NULL;
         struct sbx_process process;
         int started = sbx_spawn(&spec, &process);
         CloseHandle(write_end);
+        if (errors != INVALID_HANDLE_VALUE) CloseHandle(errors);
         if (started == 0) {
             count = py_collect(read_end, items);
             int code = -1;
             sbx_process_wait(&process, &code);
+            if (count < 13) printf("info python: the confined interpreter exited with %d\n", code);
         } else {
             printf("info python: sbx_spawn failed: %d (Windows error %lu)\n", started, sbx_spawn_error());
         }
@@ -707,14 +714,28 @@ static void python_checks(void) {
                                               "socket-public", "ctypes-registry", "ctypes-openprocess",
                                               "open-profile-file", "list-profile"};
     static const char *const must_work[] = {"import-json", "import-ssl", "import-ctypes", "sbx-open"};
+    /* Where a program the script launched would leave its mark: the parent's temporary folder. */
+    wchar_t marker[MAX_PATH], temp_dir[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp_dir);
+    swprintf(marker, MAX_PATH, L"%lssbx-test-launched-%lu.txt", temp_dir, GetCurrentProcessId());
+    char marker8[MAX_PATH * 3];
+    to_utf8(marker8, sizeof(marker8), marker);
     struct py_item control[PY_ITEMS];
-    size_t control_count = py_run(-1, script, profile_file8, granted8, control);
+    size_t control_count = py_run(-1, script, profile_file8, granted8, marker8, control);
+    Sleep(2000);
+    EXPECT(GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES, "python control: a launched program leaves its marker");
+    DeleteFileW(marker);
     EXPECT(control_count >= 13, "python control: the script ran unconfined and reported");
     for (int less = 0; less <= 1; less++) {
         const char *label = less ? "python, less-privileged" : "python, appcontainer";
         struct py_item confined[PY_ITEMS];
-        size_t confined_count = py_run(less, script, profile_file8, granted8, confined);
+        size_t confined_count = py_run(less, script, profile_file8, granted8, marker8, confined);
         char what[160];
+        /* A launch that reports success but hands the program to someone outside the job would leave the marker. */
+        Sleep(2000);
+        snprintf(what, sizeof(what), "%s: no program it asked for ran, inside the job or out (no marker)", label);
+        EXPECT(GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES, what);
+        DeleteFileW(marker);
         snprintf(what, sizeof(what), "%s: the confined interpreter ran the plugin and reported", label);
         EXPECT(confined_count >= 13, what);
         for (size_t i = 0; i < sizeof(must_refuse) / sizeof(must_refuse[0]); i++) {
@@ -727,13 +748,28 @@ static void python_checks(void) {
             snprintf(what, sizeof(what), "%s: %s refused (%s)", label, must_refuse[i], after ? after : "no report");
             EXPECT(after && strcmp(after, "0") != 0, what);
         }
+        int all_worked = confined_count >= 13;
         for (size_t i = 0; i < sizeof(must_work) / sizeof(must_work[0]); i++) {
             const char *value = py_value(confined, confined_count, "works", must_work[i]);
             snprintf(what, sizeof(what), "%s: %s works", label, must_work[i]);
             EXPECT(value && strcmp(value, "1") == 0, what);
+            if (!value || strcmp(value, "1") != 0) all_worked = 0;
+        }
+        if (!all_worked) {
+            /* What the interpreter said on stderr, for the failing run. */
+            wchar_t errors_path[MAX_PATH];
+            child_path(errors_path, L"python-stderr.txt");
+            FILE *errors = _wfopen(errors_path, L"rb");
+            static char said[3000];
+            size_t n = errors ? fread(said, 1, sizeof(said) - 1, errors) : 0;
+            if (errors) fclose(errors);
+            said[n] = 0;
+            printf("info %s: its stderr:\n%s\n", label, n ? said : "(nothing)");
         }
     }
     DeleteFileW(profile_file);
+    child_path(path, L"python-stderr.txt");
+    DeleteFileW(path);
     child_path(path, L"plugin-data\\granted.txt");
     DeleteFileW(path);
     child_path(path, L"plugin-data");
