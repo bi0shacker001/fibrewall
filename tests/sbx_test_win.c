@@ -946,7 +946,7 @@ static void dll_probe(int less) {
 /*
  * The interpreter as the agent bundles it (docs/design.md, "What is left on
  * Windows"): python.exe, its DLLs and its extension modules, with no
- * side-by-side manifest embedded in the DLLs or the .pyd files. A
+ * side-by-side manifest embedded in any of them. A
  * less-privileged container is refused the activation context the loader
  * builds from a DLL's manifest: python312.dll fails to load (error 5) with
  * its manifest and loads without it (CI 42063916251, x64). The standard
@@ -984,6 +984,9 @@ static void make_bundle(void) {
     swprintf(exe_from, MAX_PATH, L"%ls\\python.exe", python_dir);
     swprintf(exe_to, MAX_PATH, L"%ls\\python.exe", bundle);
     if (!copy_bytes(exe_from, exe_to)) return;
+    /* The executable's own manifest too: with every DLL clean, the bundled python.exe still died at load (CI 42082633096). */
+    strip_signature(exe_to);
+    pe_facts(exe_to, "python.exe", 3);
     copy_without_manifests(python_dir, bundle, L"*.dll");
     copy_without_manifests(from_dlls, dlls, L"*.pyd");
     copy_without_manifests(from_dlls, dlls, L"*.dll");

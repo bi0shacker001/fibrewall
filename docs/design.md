@@ -1659,9 +1659,11 @@ his, and record it as built to the recommendation, owner to confirm"):
   context from a DLL's manifest, and LPAC is refused it. ARM64's Python
   passed as it was.
 
-  So the Python the agent bundles ships its DLLs and `.pyd` files without
-  embedded manifests: built with `/MANIFEST:NO`, or stripped when the agent
-  packages it. The test runs such a copy in LPAC (`make_bundle`): the
+  So the Python the agent bundles ships `python.exe`, its DLLs and its
+  `.pyd` files without embedded manifests: built with `/MANIFEST:NO`, or
+  stripped when the agent packages it. The executable counts too: with every
+  DLL clean, a `python.exe` that kept its manifest still died at load (CI
+  42082633096). The test runs such a copy in LPAC (`make_bundle`): the
   interpreter's DLLs and extension modules with the manifest resource
   hidden, and the standard library named by a `python._pth` file, as
   Python's embeddable distribution does. The other choice would be giving
