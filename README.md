@@ -74,6 +74,11 @@ Not built yet:
 
 ### Releases
 
+- **v0.6.0** (2026-11-05): the GPU proxy on Linux, and the first review fixes ([Droidtop/tracker#815](https://github.com/Droidtop/tracker/issues/815), [#767](https://github.com/Droidtop/tracker/issues/767)):
+  - `sbx_policy_add_gpu_proxy`: a confined process's Mesa virgl (GL) or venus (Vulkan) driver reaches the GPU through a vtest renderer of its own, started confined for each connection and reachable by nothing else. The process holds no GPU node.
+  - The listener closes its descriptor only when the listener is freed, gives a connection 5 seconds to greet, and serves at most 64 connections at once.
+  - The filter is built by per-concern emitters with computed jumps, and rules that could never match are gone. A side-by-side run over 211 million inputs showed the same decisions as before.
+
 - **v0.5.0** (2026-11-05): an ioctl allowlist, the first piece of the GPU proxy design ([Droidtop/tracker#815](https://github.com/Droidtop/tracker/issues/815); [docs/design.md](docs/design.md), "The GPU"):
   - `sbx_lockdown_options.ioctl_allow`: any ioctl whose request is not listed is refused, on every descriptor. A GPU descriptor received back under a new number gains nothing. The list is the host's, found with `SBX_LOCK_LEARN`, which records each unlisted request (`allowed_by` "ioctl_allow").
   - `SBX_G_IOCTL_ALLOWLIST` in the contract.

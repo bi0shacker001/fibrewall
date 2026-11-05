@@ -1993,7 +1993,7 @@ and a refused name; UDP to port 53 refused; the broker's socket kept
 with "no rule". On the emulators bionic's own `getaddrinfo` runs through
 the relay as well.
 
-## The GPU: a proxy by default, direct with an ioctl allowlist (design 2026-11-05; allowlist built, Droidtop/tracker#815)
+## The GPU: a proxy by default, direct with an ioctl allowlist (allowlist and proxy built 2026-11-05, Droidtop/tracker#815)
 
 The owner (2026-10-30): a GPU proxy as a sandbox feature, "optional, but
 by default", for every sandbox user that asks for the GPU (Linux
@@ -2028,7 +2028,33 @@ an ioctl its driver needs fails in its driver, so a list is checked on the
 device it is for. The contract reports it (`SBX_G_IOCTL_ALLOWLIST`, only
 when not learning). At most 200 requests (`SBX_IOCTL_ALLOW_MAX`).
 
-### The proxy (designed, not built)
+### The proxy (built on Linux, 0.6.0; the Android pieces are next)
+
+`sbx_policy_add_gpu_proxy` names, in a client's policy, the vtest path
+its Mesa connects to (`VTEST_SOCKET_NAME`); nothing listens there. A
+connect to it is served on a broker thread of its own:
+
+1. a fresh renderer (virglrenderer's `virgl_test_server`) is started
+   confined from its first instruction (`sbx_spawn_confined`) with its own
+   broker, policy and options (`SBX_LOCK_UNIX` added for its socket), and
+   `--no-loop-or-fork --socket-path <a fresh path in the host's folder>`;
+2. the broker waits for its socket, connects, and removes the path at
+   once, so nothing else can ever reach that renderer;
+3. the connected socket takes the place of the client's (as a system
+   socket's does), and the thread waits for the renderer to exit.
+
+One renderer per connection, so clients never share GPU state, and a
+process has at most 32 at once (the broker's per-connection cap). Proven
+in CI on Linux with Ubuntu's `virgl-server` and Mesa, software rendering
+(llvmpipe and lavapipe): a confined `eglinfo` reports
+`virgl (LLVMPIPE ...)`, and a confined `vulkaninfo` reports the `venus`
+driver, each through a confined renderer of its own; a malformed command
+stream ends only that renderer's connection; the client cannot open a GPU
+node; no renderer's socket path is left. Venus has the renderer start
+`virgl_render_server` itself, which is an exec decided by the renderer's
+broker.
+
+The design as it was written:
 
 - **The client** (the confined process) loads Mesa's `virgl` (GL) and
   `venus` (Vulkan) drivers, which speak the vtest protocol over a Unix
@@ -2053,8 +2079,10 @@ when not learning). At most 200 requests (`SBX_IOCTL_ALLOW_MAX`).
   proxy costs a user too much, the owner decides whether that user's
   default becomes direct; until then it stays the proxy.
 
-Next slice: the renderer launcher and the system-socket hand-off, tested in
-CI on Linux with a software renderer, then the Android build of the pieces.
+Next: the Android build of the pieces (virglrenderer's server and Mesa's
+virgl and venus drivers for arm64-v8a and x86_64), fuzzing the vtest
+decoder beyond the malformed-stream test, and the measurements on the
+rig.
 
 ## Performance: fewer and cheaper broker round trips (built 2026-11-05, Droidtop/tracker#791)
 

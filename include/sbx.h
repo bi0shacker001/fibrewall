@@ -32,9 +32,9 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.5.0"
+#define SBX_VERSION "0.6.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 5
+#define SBX_VERSION_MINOR 6
 #define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -774,6 +774,39 @@ int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, un
  */
 #define SBX_UNIX_NAMES_MAX 16
 int sbx_policy_add_unix_name(struct sbx_policy *policy, const char *name, unsigned mode);
+
+/*
+ * A GPU through a proxy (docs/design.md, "The GPU"; Droidtop/tracker#815):
+ * the confined process's Mesa virgl (GL) or venus (Vulkan) driver connects
+ * to vtest_path (its VTEST_SOCKET_NAME); nothing listens there. The broker
+ * answers each such connect with a renderer of the process's own: it
+ * starts renderer (virglrenderer's vtest server) confined from its first
+ * instruction (sbx_spawn_confined) with "--no-loop-or-fork --socket-path
+ * <a fresh path in folder>" and renderer_args, under renderer_policy and
+ * renderer_options (SBX_LOCK_UNIX is added, for its socket), connects to
+ * it, removes the path so nothing else can, and hands the connected socket
+ * over. The renderer serves that one connection and exits; the broker reaps
+ * it. The confined process needs SBX_LOCK_UNIX or SBX_LOCK_NET_BROKERED, so
+ * its connect reaches the broker, and holds no GPU node of its own.
+ *
+ * folder: absolute, a folder only the host can enter; renderer_policy gains
+ * a read-write rule on it. renderer_policy and renderer_options (with
+ * exec_helper, child_library, own_opens for the GPU node and the driver's
+ * ioctl_allow) must outlive the policy; the strings are copied. Each live
+ * renderer counts against the broker's per-connection cap of blocking
+ * waits, so a process has at most 32 at once. One proxy per policy.
+ * Returns 0 or a negative errno. Added in 0.6.0.
+ */
+struct sbx_gpu_proxy {
+    const char *vtest_path;
+    const char *renderer;
+    char *const *renderer_args;     /* NULL-terminated, or NULL */
+    char *const *renderer_envp;     /* NULL: an empty environment */
+    const char *folder;
+    struct sbx_policy *renderer_policy;
+    const struct sbx_lockdown_options *renderer_options;
+};
+int sbx_policy_add_gpu_proxy(struct sbx_policy *policy, const struct sbx_gpu_proxy *proxy);
 #endif
 
 /* Receives every decision with its result (0 or a negative errno). Defaults to logging refusals on stderr. */

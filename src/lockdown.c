@@ -1151,7 +1151,14 @@ static long unix_call(uint32_t op, int fd, const struct sockaddr *address, sockl
     request.dirfd2_sent = (uint8_t) relative;
     int extra[2] = {fd, current_directory()};
     int passed;
-    long result = exchange(&request, extra, relative ? 2 : 1, address, length, NULL, 0, NULL, 0, 0, &passed);
+    long result = exchange(&request, extra, relative ? 2 : 1, address, length, NULL, 0, NULL, 0, 1, &passed);
+    if (result == 0 && passed >= 0 && op == SBX_UNIX_CONNECT) {
+        /* A socket the broker connected for the process (the GPU proxy's renderer): it takes the caller's place. */
+        int close_on_exec = (fcntl(fd, F_GETFD) & FD_CLOEXEC) ? O_CLOEXEC : 0;
+        long placed = dup3(passed, fd, close_on_exec) < 0 ? -errno : 0;
+        close(passed);
+        return placed;
+    }
     if (passed >= 0) close(passed);
     return result;
 }

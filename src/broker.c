@@ -55,6 +55,7 @@
 #include <sys/inotify.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
@@ -88,6 +89,8 @@ struct alias {
     size_t real_length;
 };
 
+struct gpu_proxy;
+
 struct sbx_policy {
     struct rule *rules;
     size_t count;
@@ -109,6 +112,7 @@ struct sbx_policy {
     unsigned unix_name_count;
     struct netp *netp;  /* the network rules (sbx_policy_net_rule) and the addresses the broker resolved */
     void *attached;     /* sbx_policy_attach: state the policy owns (a zone session), freed with it */
+    struct gpu_proxy *gpu;  /* sbx_policy_add_gpu_proxy */
     void (*attached_free)(void *);
     int refs;           /* the host's, plus one per broker thread that outlives a request (accept, relays) */
 };
@@ -301,10 +305,14 @@ static const struct sbx_policy *policy_hold(const struct sbx_policy *policy) {
 }
 static void policy_release(const struct sbx_policy *policy) { sbx_policy_free((struct sbx_policy *) policy); }
 
+struct gpu_proxy;
+static void gpu_proxy_free(struct gpu_proxy *g);
+
 void sbx_policy_free(struct sbx_policy *policy) {
     if (!policy) return;
     if (__atomic_sub_fetch(&policy->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (policy->attached_free) policy->attached_free(policy->attached);
+    gpu_proxy_free(policy->gpu);
     netp_free(policy->netp);
     for (size_t i = 0; i < policy->count; i++) free(policy->rules[i].path);
     for (size_t i = 0; i < policy->alias_count; i++) {
@@ -1618,8 +1626,151 @@ static void net_wait_unreserve(struct conn_budget *b) {
     if (b && remaining == 0) free(b);
 }
 
+/*
+ * ---- The GPU proxy (sbx_policy_add_gpu_proxy; docs/design.md, "The GPU") ----
+ *
+ * A connect to the proxy's vtest path is served on a thread of its own:
+ * a fresh renderer, confined from its first instruction, serving that one
+ * connection on a path in the host's folder, which is removed as soon as
+ * the broker is connected, so only this client ever reaches it.
+ */
+struct gpu_proxy {
+    char *vtest_path;
+    char *renderer;
+    char **args;
+    char *const *envp;
+    char *folder;
+    struct sbx_policy *renderer_policy;
+    const struct sbx_lockdown_options *renderer_options;
+    unsigned next;  /* the next renderer's number, for its socket's name */
+};
+
+static void gpu_proxy_free(struct gpu_proxy *g) {
+    if (!g) return;
+    for (char **a = g->args; a && *a; a++) free(*a);
+    free(g->args);
+    free(g->vtest_path);
+    free(g->renderer);
+    free(g->folder);
+    free(g);
+}
+
+int sbx_policy_add_gpu_proxy(struct sbx_policy *policy, const struct sbx_gpu_proxy *proxy) {
+    if (!policy || !proxy || !proxy->vtest_path || proxy->vtest_path[0] != '/' || !proxy->renderer ||
+        proxy->renderer[0] != '/' || !proxy->folder || proxy->folder[0] != '/' || !proxy->renderer_policy ||
+        !proxy->renderer_options || !proxy->renderer_options->exec_helper || !proxy->renderer_options->child_library) {
+        return -EINVAL;
+    }
+    if (policy->gpu) return -EEXIST;
+    /* The renderer's socket: the folder, a name, and room for its number, under sun_path's limit. */
+    if (strlen(proxy->folder) + 32 >= sizeof(((struct sockaddr_un *) 0)->sun_path) ||
+        strlen(proxy->vtest_path) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
+        return -ENAMETOOLONG;
+    }
+    struct gpu_proxy *g = calloc(1, sizeof(*g));
+    if (!g) return -ENOMEM;
+    size_t extra = 0;
+    while (proxy->renderer_args && proxy->renderer_args[extra]) extra++;
+    g->args = calloc(extra + 1, sizeof(char *));
+    g->vtest_path = strdup(proxy->vtest_path);
+    g->renderer = strdup(proxy->renderer);
+    g->folder = strdup(proxy->folder);
+    int ok = g->args && g->vtest_path && g->renderer && g->folder;
+    for (size_t i = 0; ok && i < extra; i++) ok = (g->args[i] = strdup(proxy->renderer_args[i])) != NULL;
+    if (!ok || sbx_policy_add(proxy->renderer_policy, proxy->folder, SBX_READ | SBX_WRITE) != 0) {
+        gpu_proxy_free(g);
+        return -ENOMEM;
+    }
+    g->envp = proxy->renderer_envp;
+    g->renderer_policy = proxy->renderer_policy;
+    g->renderer_options = proxy->renderer_options;
+    policy->gpu = g;
+    return 0;
+}
+
+static int gpu_proxy_matches(const struct sbx_policy *policy, const char *path) {
+    return policy->gpu && strcmp(path, policy->gpu->vtest_path) == 0;
+}
+
+/*
+ * Starts one renderer for the client whose connect answer is answer, and
+ * replies with a socket connected to it; then waits for the renderer to
+ * exit. Runs on a net_wait thread (budgeted: a process has at most
+ * NET_WAIT_MAX_PER_CONN renderers at once). nonblocking: the client
+ * socket's SOCK_NONBLOCK, kept on the one handed over.
+ */
+static void gpu_proxy_serve(const struct sbx_policy *policy, int answer, int nonblocking) {
+    struct gpu_proxy *g = policy->gpu;
+    char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+    unsigned number = __atomic_add_fetch(&g->next, 1, __ATOMIC_ACQ_REL);
+    snprintf(path, sizeof(path), "%s/vtest-%d-%u.sock", g->folder, (int) getpid(), number);
+    unlink(path);
+    size_t extra = 0;
+    while (g->args[extra]) extra++;
+    char **argv = calloc(extra + 5, sizeof(char *));
+    int pair[2] = {-1, -1};
+    if (!argv || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) != 0) {
+        free(argv);
+        reply(answer, -ENOMEM, NULL, 0, -1);
+        return;
+    }
+    argv[0] = g->renderer;
+    argv[1] = "--no-loop-or-fork";
+    argv[2] = "--socket-path";
+    argv[3] = path;
+    for (size_t i = 0; i < extra; i++) argv[4 + i] = g->args[i];
+    struct sbx_lockdown_options options = *g->renderer_options;
+    options.flags |= SBX_LOCK_UNIX;  /* its socket: bound in the folder, under the renderer policy's rule */
+    /* The renderer's own broker, on its own policy (held: that broker frees one reference when it ends). */
+    int error = sbx_broker_start((struct sbx_policy *) policy_hold(g->renderer_policy), pair[0]);
+    if (error != 0) {
+        policy_release(g->renderer_policy);
+        close(pair[0]);
+    }
+    pid_t renderer = -1;
+    struct sbx_spawn_spec spec = {.path = g->renderer, .argv = argv, .envp = g->envp};
+    if (error == 0) error = sbx_spawn_confined(&spec, pair[1], &options, &renderer);
+    close(pair[1]);
+    free(argv);
+    int client = -1;
+    for (int waited = 0; error == 0; waited++) {
+        /* Its socket appears once it listens; a renderer that ends first, or takes over 10 s, is a failure. */
+        struct stat st;
+        if (stat(path, &st) == 0) break;
+        int status;
+        if (waitpid(renderer, &status, WNOHANG) == renderer) { renderer = -1; error = -ECONNREFUSED; break; }
+        if (waited >= 1000) { error = -ETIMEDOUT; break; }
+        usleep(10 * 1000);
+    }
+    if (error == 0) {
+        client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un at = {.sun_family = AF_UNIX};
+        memcpy(at.sun_path, path, strlen(path) + 1);
+        if (client < 0 || connect(client, (struct sockaddr *) &at, sizeof(at)) != 0) error = -errno;
+        else if (nonblocking) fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK);
+    }
+    /* Connected (or failed): the path goes, so nothing else can ever reach this renderer. */
+    unlink(path);
+    if (error != 0) {
+        if (client >= 0) close(client);
+        if (renderer > 0) kill(renderer, SIGKILL);
+        reply(answer, error, NULL, 0, -1);
+    } else {
+        reply(answer, 0, NULL, 0, client);
+        close(client);
+    }
+    if (renderer > 0) {
+        int status;
+        while (waitpid(renderer, &status, 0) < 0 && errno == EINTR) {}
+    }
+}
+
+/* A connect to the proxy's vtest path: decided (always, the host named it), then served on a thread of its own. */
+static void gpu_proxy_connect(const struct sbx_policy *policy, uint16_t op, const char *path, int subject, int answer,
+                              pid_t pid, struct conn_budget *budget);
+
 /* What a broker thread of its own does (net_wait_thread). */
-enum { WAIT_CONNECT, WAIT_ACCEPT, WAIT_SEND, WAIT_RESOLVE, WAIT_DNSPROXY, WAIT_DNS_TCP };
+enum { WAIT_CONNECT, WAIT_ACCEPT, WAIT_SEND, WAIT_RESOLVE, WAIT_DNSPROXY, WAIT_DNS_TCP, WAIT_GPU };
 
 struct net_wait {
     int kind;
@@ -1696,6 +1847,8 @@ static void *net_wait_thread(void *argument) {
         for (int i = 0; i < w->right_count; i++) close(w->rights[i]);
         w->part.iov_base = w->message.msg_name = w->message.msg_control = NULL;
         w->right_count = 0;
+    } else if (w->kind == WAIT_GPU) {
+        gpu_proxy_serve(w->policy, w->answer, w->flags);
     } else if (w->kind == WAIT_RESOLVE) {
         struct sockaddr_storage found[SBX_RESOLVE_MAX];
         struct lookup_context l = {w->policy, w->pid};
@@ -1775,6 +1928,22 @@ static void net_wait_start(int kind, int socket_fd, int answer, const void *addr
     net_wait_launch(w, answer, budget);
 }
 
+static void gpu_proxy_connect(const struct sbx_policy *policy, uint16_t op, const char *path, int subject, int answer,
+                              pid_t pid, struct conn_budget *budget) {
+    int type = 0;
+    socklen_t length = sizeof(type);
+    if (getsockopt(subject, SOL_SOCKET, SO_TYPE, &type, &length) != 0 || type != SOCK_STREAM) {
+        reply(answer, -EPROTOTYPE, NULL, 0, -1);
+        return;
+    }
+    char words[160];
+    snprintf(words, sizeof(words), "%s (the GPU proxy: a renderer of its own)", path);
+    int verdict = net_decide(policy, op, words, pid, 0);
+    if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+    int nonblocking = (fcntl(subject, F_GETFL) & O_NONBLOCK) != 0;
+    net_wait_start(WAIT_GPU, -1, answer, NULL, 0, nonblocking, policy, pid, budget);
+}
+
 /*
  * A name server the broker answers itself, for the process: a stream
  * socketpair whose one end is handed over (in place of the system resolver's
@@ -1837,7 +2006,7 @@ int sbx_policy_add_unix_name(struct sbx_policy *policy, const char *name, unsign
  * reaches nothing.
  */
 static void unix_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
-                     size_t body_len, int *fds, int fd_count, pid_t pid) {
+                     size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
     int answer = fds[0];
     int binding = request->op == SBX_UNIX_BIND;
     size_t offset = offsetof(struct sockaddr_un, sun_path);
@@ -1860,6 +2029,15 @@ static void unix_one(const struct sbx_policy *policy, const struct sbx_request *
         result = binding ? (bind(subject, (struct sockaddr *) &address, (socklen_t) body_len) == 0 ? 0 : -errno) : -EINVAL;
         reply(answer, result, NULL, 0, -1);
         return;
+    }
+    if (!binding && address.sun_path[0] == '/') {
+        char named[sizeof(address.sun_path) + 1];
+        memcpy(named, address.sun_path, n);
+        named[n] = '\0';
+        if (gpu_proxy_matches(policy, named)) {
+            gpu_proxy_connect(policy, request->op, named, subject, answer, pid, budget);
+            return;
+        }
     }
     unsigned need = binding ? SBX_WRITE : SBX_READ;
     if (address.sun_path[0] == '\0') {
@@ -2076,6 +2254,10 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
         int found = -1;
         for (unsigned i = 0; path[0] == '/' && i < policy->system_count; i++) {
             if (strcmp(path, policy->system_paths[i]) == 0) found = (int) i;
+        }
+        if (found < 0 && gpu_proxy_matches(policy, path)) {
+            gpu_proxy_connect(policy, request->op, path, subject, answer, pid, budget);
+            return;
         }
         if (found < 0) { reply(answer, -ENOSYS, NULL, 0, -1); return; }
         unsigned grant = policy->system_grants[found];
@@ -2599,7 +2781,7 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         return;
     }
     if (request->version == SBX_PROTOCOL_VERSION && (request->op == SBX_UNIX_BIND || request->op == SBX_UNIX_CONNECT)) {
-        unix_one(policy, request, body, body_len, fds, fd_count, pid);
+        unix_one(policy, request, body, body_len, fds, fd_count, pid, budget);
         return;
     }
     if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_WATCH) {

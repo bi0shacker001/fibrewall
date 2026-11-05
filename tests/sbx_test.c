@@ -4199,6 +4199,216 @@ static int ioctl_allow_check(void) {
     return result | (learned >= 1 ? 0 : 1);
 }
 
+/* ---- The GPU proxy (sbx_policy_add_gpu_proxy; Droidtop/tracker#815): a vtest renderer of each client's own. ---- */
+
+#define GPU_VTEST_PATH "/run/sbx-test/vtest"
+
+static int gpu_renderer_requests;
+static void gpu_renderer_audit(void *context, const struct sbx_access *access, int result) {
+    (void) context;
+    (void) access;
+    (void) result;
+    __atomic_add_fetch(&gpu_renderer_requests, 1, __ATOMIC_ACQ_REL);
+}
+
+/*
+ * Mesa's own GL client, confined, through the proxy: eglinfo started with
+ * sbx_spawn_confined, its output read back; 1 when it reports virgl, 0 when
+ * not, -1 when eglinfo is not here.
+ */
+static int gpu_mesa_client(const char *helper, const char *library, struct sbx_policy *client_policy,
+                           const char *program, char *const *argv, char *const *env, const char *expect) {
+    if (access(program, X_OK) != 0) return -1;
+    int out[2], pair[2];
+    if (pipe(out) != 0 || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 0;
+    if (sbx_broker_start(client_policy, pair[0]) != 0) return 0;
+    fflush(stdout);
+    pid_t runner = fork();
+    if (runner == 0) {
+        dup2(out[1], 1);
+        dup2(out[1], 2);
+        close(out[0]);
+        struct sbx_spawn_spec spec = {program, argv, env, NULL, 0, NULL, 0};
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNIX, .exec_helper = helper, .child_library = library};
+        pid_t pid = 0;
+        if (sbx_spawn_confined(&spec, pair[1], &options, &pid) != 0) _exit(2);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 3);
+    }
+    close(out[1]);
+    close(pair[1]);
+    char text[16384];
+    size_t used = 0;
+    ssize_t r;
+    while (used + 1 < sizeof(text) && (r = read(out[0], text + used, sizeof(text) - 1 - used)) > 0) used += (size_t) r;
+    text[used] = '\0';
+    close(out[0]);
+    int status = 0;
+    waitpid(runner, &status, 0);
+    char *found = strstr(text, expect);
+    if (found) {
+        char *end = strchr(found, '\n');
+        printf("info gpu proxy: confined %s says %.*s\n", argv[0], end ? (int) (end - found) : 80, found);
+    } else {
+        printf("info gpu proxy: confined %s said: %.400s\n", argv[0], text);
+    }
+    return found != NULL;
+}
+
+/* vtest's opening: create a renderer, then ping; 1 when the renderer answers the ping, 0 when not. */
+static int gpu_vtest_ping(int fd) {
+    static const char name[] = "sbx-test";
+    uint32_t create[2] = {sizeof(name), 8 /* VCMD_CREATE_RENDERER */};
+    uint32_t ping[2] = {0, 10 /* VCMD_PING_PROTOCOL_VERSION */};
+    uint32_t answer[2] = {0, 0};
+    if (write(fd, create, sizeof(create)) != (ssize_t) sizeof(create) || write(fd, name, sizeof(name)) != (ssize_t) sizeof(name) ||
+        write(fd, ping, sizeof(ping)) != (ssize_t) sizeof(ping)) {
+        return 0;
+    }
+    struct timeval wait = {.tv_sec = 20};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+    size_t got = 0;
+    while (got < sizeof(answer)) {
+        ssize_t r = read(fd, (char *) answer + got, sizeof(answer) - got);
+        if (r <= 0) return 0;
+        got += (size_t) r;
+    }
+    return answer[0] == 0 && answer[1] == 10;
+}
+
+static int gpu_connect(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un at;
+    unix_at(&at, GPU_VTEST_PATH);
+    if (fd < 0 || connect(fd, (struct sockaddr *) &at, sizeof(at)) != 0) {
+        int error = errno;
+        if (fd >= 0) close(fd);
+        errno = error;
+        return -1;
+    }
+    return fd;
+}
+
+static int gpu_proxy_check(const char *self) {
+    const char *server = "/usr/bin/virgl_test_server";
+    if (access(server, X_OK) != 0) {
+        printf("skip gpu proxy: no %s here (the virgl-server package)\n", server);
+        return 0;
+    }
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    (void) self;
+    return 0;
+#else
+    char helper[600], library[600];
+    if (exec_files(self, helper, library, sizeof(helper)) != 0) {
+        printf("FAIL gpu proxy: sbx-exec or libsbx_child.so is not beside the test\n");
+        return 1;
+    }
+    char folder[400];
+    snprintf(folder, sizeof(folder), "%s/gpu", root);
+    mkdir(folder, 0700);
+    int before = failures;
+    struct sbx_policy *renderer_policy = sbx_policy_new();
+    sbx_policy_add(renderer_policy, "/", SBX_READ);  /* its libraries, the driver and the software renderer */
+    sbx_policy_set_audit(renderer_policy, gpu_renderer_audit, NULL);
+    static struct sbx_lockdown_options renderer_options;
+    renderer_options.exec_helper = helper;
+    renderer_options.child_library = library;
+    static char *renderer_args[] = {"--use-egl-surfaceless", NULL};
+    static char *renderer_env[] = {"MESA_SHADER_CACHE_DISABLE=true", "EGL_PLATFORM=surfaceless",
+                                   "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+    struct sbx_policy *policy = sbx_policy_new();
+    struct sbx_gpu_proxy proxy = {.vtest_path = GPU_VTEST_PATH, .renderer = server, .renderer_args = renderer_args,
+                                  .renderer_envp = renderer_env, .folder = folder, .renderer_policy = renderer_policy,
+                                  .renderer_options = &renderer_options};
+    EXPECT(sbx_policy_add_gpu_proxy(policy, &proxy) == 0, "gpu proxy: added to the client's policy");
+    EXPECT(sbx_policy_add_gpu_proxy(policy, &proxy) == -EEXIST, "gpu proxy: one per policy");
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0 || sbx_broker_prepare(pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(120);
+        close(pair[0]);
+        struct sbx_lockdown_options options = {.flags = SBX_LOCK_UNIX};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "gpu proxy: the client locks down");
+        if (locked == 0) {
+            int first = gpu_connect();
+            EXPECT(first >= 0, "gpu proxy: the client's connect to its vtest path is answered");
+            EXPECT(first >= 0 && gpu_vtest_ping(first), "gpu proxy: a confined renderer of its own speaks vtest to it");
+            int second = gpu_connect();
+            EXPECT(second >= 0 && gpu_vtest_ping(second), "gpu proxy: a second connection gets a second renderer");
+            if (second >= 0) close(second);
+            /* A malformed stream: the renderer refuses it and ends; nothing else is affected. */
+            int third = gpu_connect();
+            uint32_t junk[4] = {0x7fffffff, 0xdeadbeef, 0, 0};
+            char byte;
+            int refused_junk = third >= 0 && write(third, junk, sizeof(junk)) == (ssize_t) sizeof(junk) &&
+                               read(third, &byte, 1) <= 0;
+            EXPECT(refused_junk, "gpu proxy: a malformed command stream ends that renderer's connection");
+            if (third >= 0) close(third);
+            int fourth = gpu_connect();
+            EXPECT(fourth >= 0 && gpu_vtest_ping(fourth), "gpu proxy: and the next connection is served as before");
+            if (fourth >= 0) close(fourth);
+            errno = 0;
+            int node = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+            EXPECT(node < 0 && errno == EACCES, "gpu proxy: the client cannot open a GPU node");
+            if (node >= 0) close(node);
+            if (first >= 0) close(first);
+        }
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    sbx_broker_serve(policy, pair[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    /* The renderers' paths were removed once the broker had connected: nothing else can reach them. */
+    DIR *dir = opendir(folder);
+    int left = 0;
+    struct dirent *entry;
+    while (dir && (entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "vtest-", 6) == 0) left++;
+    }
+    if (dir) closedir(dir);
+    EXPECT(left == 0, "gpu proxy: no renderer's socket is left to connect to");
+    EXPECT(__atomic_load_n(&gpu_renderer_requests, __ATOMIC_ACQUIRE) > 0,
+           "gpu proxy: each renderer is confined, its file access decided by its own broker");
+    /* Mesa's GL driver itself, in a confined process, through the proxy. */
+    struct sbx_policy *client_policy = sbx_policy_new();
+    sbx_policy_add(client_policy, "/", SBX_READ);
+    sbx_policy_add_gpu_proxy(client_policy, &proxy);
+    static char *gl_argv[] = {"eglinfo", "-B", "-p", "surfaceless", NULL};
+    static char *gl_env[] = {"GALLIUM_DRIVER=virpipe", "VTEST_SOCKET_NAME=" GPU_VTEST_PATH, "EGL_PLATFORM=surfaceless",
+                             "MESA_SHADER_CACHE_DISABLE=true", "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+    int mesa = gpu_mesa_client(helper, library, client_policy, "/usr/bin/eglinfo", gl_argv, gl_env, "renderer: virgl");
+    if (mesa < 0) printf("skip gpu proxy: no eglinfo here (mesa-utils) for the Mesa client check\n");
+    else EXPECT(mesa == 1, "gpu proxy: Mesa's GL driver, confined, renders through a confined renderer (virgl)");
+    /* Vulkan: Mesa's venus driver, through a renderer started with --venus (it runs virgl_render_server itself). */
+    const char *icd = "/usr/share/vulkan/icd.d/virtio_icd.json";
+    if (access("/usr/bin/vulkaninfo", X_OK) == 0 && access(icd, R_OK) == 0 && access("/usr/libexec/virgl_render_server", X_OK) == 0) {
+        static char *venus_args[] = {"--venus", "--use-egl-surfaceless", NULL};
+        struct sbx_gpu_proxy venus = proxy;
+        venus.renderer_args = venus_args;
+        struct sbx_policy *vk_policy = sbx_policy_new();
+        sbx_policy_add(vk_policy, "/", SBX_READ);
+        sbx_policy_add_gpu_proxy(vk_policy, &venus);
+        static char *vk_argv[] = {"vulkaninfo", "--summary", NULL};
+        static char *vk_env[] = {"VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json", "VN_DEBUG=vtest",
+                                 "VTEST_SOCKET_NAME=" GPU_VTEST_PATH, "MESA_SHADER_CACHE_DISABLE=true",
+                                 "ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0", NULL};
+        int vk = gpu_mesa_client(helper, library, vk_policy, "/usr/bin/vulkaninfo", vk_argv, vk_env, "driverName");
+        EXPECT(vk == 1, "gpu proxy: Mesa's Vulkan driver (venus), confined, through a confined renderer");
+    } else {
+        printf("skip gpu proxy: no vulkaninfo, venus ICD or virgl_render_server here for the Vulkan check\n");
+    }
+    sbx_policy_free(renderer_policy);
+    return (failures != before) | (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+#endif
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -4350,7 +4560,7 @@ int main(int argc, char **argv) {
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
     int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
-                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check() | ioctl_allow_check();
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check() | ioctl_allow_check() | gpu_proxy_check(self);
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }
