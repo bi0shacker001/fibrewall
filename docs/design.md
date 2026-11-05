@@ -1618,9 +1618,49 @@ open relative to a folder handle the broker gave is refused by the token;
 and a decider that grants one open of a path no rule covers lets the first
 through and refuses the second with `-EACCES`.
 
-### What is left on Windows (design, 2026-10-28, Droidtop/tracker#606)
+### What is left on Windows (design 2026-10-28; items 1-6 built 2026-11-05, Droidtop/tracker#606)
 
-Design only, for the owner's review. What is built is the spawn, the
+**Built (0.7.0), to the recommendation, owner to confirm** (coordinator,
+2026-11-05, relaying the owner: "Take the console until 8am, try to
+implement everything"; "Build the recommended option where a decision is
+his, and record it as built to the recommendation, owner to confirm"):
+
+- **The questions below, answered with the recommendations:**
+  1. Order: 1-6 as written; 7 only when the agent asks (not built).
+  2. CPU cap: no default. `cpu_percent` is 0 (none) unless the host sets
+     it, as `memory_limit` is; the library never decides what a plugin
+     needs.
+  3. ARM64 Windows: now. It is build and test only: CI builds and runs the
+     suite natively on `windows-11-arm`.
+- **1. Real Python under it.** `tests/python_win.py` runs in the runner's
+  own `python.exe` (`SBX_TEST_PYTHON`), passed with `-c` so no file of its
+  own needs a grant. It runs unconfined as the control, then under
+  `sbx_spawn` in a plain AppContainer and in LPAC, with Python's folder as
+  an `SBX_STATIC` read grant. It must be refused: `subprocess.run`,
+  `os.startfile`, `ctypes` `CreateProcessW`, a socket to 127.0.0.1 and to
+  a public address, `ctypes` registry and `OpenProcess` of the parent,
+  reading a file in the profile, listing the profile. It must still work:
+  importing `json`, `ssl` and `ctypes`, writing to its channel handle,
+  and `sbx_open` through `sbx_py_helper.dll`, loaded with `ctypes`. That
+  DLL stands in for the agent's module; a ctypes-loaded DLL needs no Python
+  headers in CI and exercises the same client call.
+- **2. `sbx_container_remove(name, paths, count)`.** It removes the access
+  entries naming the container's SID from each path, then the profile. It
+  is safe to repeat, and on a path that no longer exists. The test checks
+  that no entry is left on the program's folder or Python's.
+- **3. `sbx_spawn_probe`.** It reports AppContainers, LPAC, nested jobs,
+  and whether a profile can be made, with a reason in words; it returns
+  `-ENOSYS` when the system cannot confine.
+- **4. `sbx_spawn_spec.cpu_percent`.** The job's hard cap
+  (`JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`), 1-100, where 0 means none. The
+  test reads it back from the job.
+- **5. ARM64.** The `windows` job runs on `windows-latest` (x64) and on
+  `windows-11-arm` (ARM64).
+- **6. A consumer's build.** `tests/consumer` adds the library with
+  `add_subdirectory`, uses the DLL C runtime (`/MD`), links, and runs
+  `sbx_spawn_probe`.
+
+What follows is the design as it was written, for the owner's review. What is built is the spawn, the
 broker, `sbx_open`, static grants, and the escape suite in a plain
 AppContainer and in LPAC. With the droidtop-agent / Pythia lane's answers
 in, what remains is what a real Python plugin host needs, in this order:

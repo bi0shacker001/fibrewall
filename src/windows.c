@@ -670,6 +670,18 @@ static int container_sid(const char *container, PSID *sid) {
     return 0;
 }
 
+/* Whether the system is at least Windows major.minor (RtlGetVersion: not subject to the manifest's lie). */
+static int windows_at_least(DWORD major, DWORD minor) {
+    typedef LONG(WINAPI * get_version_fn)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    get_version_fn get_version = ntdll ? (get_version_fn) (void (*)(void)) GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    RTL_OSVERSIONINFOW version;
+    memset(&version, 0, sizeof(version));
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (!get_version || get_version(&version) != 0) return 0;
+    return version.dwMajorVersion > major || (version.dwMajorVersion == major && version.dwMinorVersion >= minor);
+}
+
 #define STATIC_RIGHTS (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
 #define STATIC_INHERIT (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
 
@@ -712,6 +724,108 @@ static int grant_static(const wchar_t *path, PSID sid) {
     LocalFree(granted);
     LocalFree(descriptor);
     return error == ERROR_SUCCESS ? 0 : -errno_of(error);
+}
+
+/*
+ * Removes from path's own access list every entry naming sid (inherited
+ * ones go with their parent's). A path that no longer exists has nothing
+ * to remove.
+ */
+static int revoke_static(const wchar_t *path, PSID sid) {
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    DWORD error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL,
+                                        &descriptor);
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return 0;
+    if (error != ERROR_SUCCESS) return -errno_of(error);
+    if (!dacl) {
+        LocalFree(descriptor);
+        return 0;
+    }
+    ACL_SIZE_INFORMATION size;
+    if (!GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation)) {
+        LocalFree(descriptor);
+        return -errno_of(GetLastError());
+    }
+    DWORD bytes = size.AclBytesInUse;
+    PACL kept = (PACL) LocalAlloc(LPTR, bytes);
+    int removed = 0;
+    if (!kept || !InitializeAcl(kept, bytes, ACL_REVISION)) {
+        LocalFree(kept);
+        LocalFree(descriptor);
+        return -ENOMEM;
+    }
+    for (DWORD i = 0; i < dacl->AceCount; i++) {
+        ACE_HEADER *header = NULL;
+        if (!GetAce(dacl, i, (void **) &header)) continue;
+        int names_sid = header->AceType == ACCESS_ALLOWED_ACE_TYPE && !(header->AceFlags & INHERITED_ACE) &&
+                        EqualSid((PSID) &((ACCESS_ALLOWED_ACE *) header)->SidStart, sid);
+        if (names_sid) {
+            removed = 1;
+            continue;
+        }
+        AddAce(kept, ACL_REVISION, MAXDWORD, header, header->AceSize);
+    }
+    error = ERROR_SUCCESS;
+    if (removed) {
+        error = SetNamedSecurityInfoW((LPWSTR) path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, kept, NULL);
+    }
+    LocalFree(kept);
+    LocalFree(descriptor);
+    return error == ERROR_SUCCESS ? 0 : -errno_of(error);
+}
+
+int sbx_container_remove(const char *container, const char *const *paths, unsigned count) {
+    wchar_t *name = container ? wide(container) : NULL;
+    if (!name || !name[0] || wcslen(name) > 64 || (count && !paths)) {
+        free(name);
+        return -EINVAL;
+    }
+    PSID sid = NULL;
+    int first = 0;
+    if (SUCCEEDED(DeriveAppContainerSidFromAppContainerName(name, &sid))) {
+        for (unsigned i = 0; i < count; i++) {
+            wchar_t *path = paths[i] ? wide(paths[i]) : NULL;
+            int result = path ? revoke_static(path, sid) : -EINVAL;
+            if (result != 0 && first == 0) first = result;
+            free(path);
+        }
+        FreeSid(sid);
+    } else {
+        first = -EINVAL;
+    }
+    HRESULT deleted = DeleteAppContainerProfile(name);
+    if (FAILED(deleted) && deleted != HRESULT_FROM_WIN32(ERROR_NOT_FOUND) &&
+        deleted != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && first == 0) {
+        first = deleted == E_ACCESSDENIED ? -EACCES : -EIO;
+    }
+    free(name);
+    return first;
+}
+
+int sbx_spawn_probe(struct sbx_probe *out) {
+    if (!out) return -EINVAL;
+    memset(out, 0, sizeof(*out));
+    out->appcontainer = windows_at_least(6, 2);
+    out->nested_jobs = windows_at_least(6, 2);
+    out->less_privileged = out->appcontainer && has_less_privileged();
+    if (out->appcontainer) {
+        /* A profile made and removed under a name of its own: policy can forbid making one. */
+        wchar_t name[64];
+        swprintf(name, 64, L"sbx-probe-%lu", GetCurrentProcessId());
+        PSID sid = NULL;
+        HRESULT made = CreateAppContainerProfile(name, name, name, NULL, 0, &sid);
+        if (made == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) made = S_OK;
+        if (SUCCEEDED(made)) {
+            out->profile = 1;
+            if (sid) FreeSid(sid);
+            DeleteAppContainerProfile(name);
+        }
+    }
+    if (!out->appcontainer) snprintf(out->reason, sizeof(out->reason), "this Windows has no AppContainers (Windows 8 or later is needed)");
+    else if (!out->nested_jobs) snprintf(out->reason, sizeof(out->reason), "this Windows cannot nest job objects");
+    else if (!out->profile) snprintf(out->reason, sizeof(out->reason), "making an AppContainer profile is refused here (policy)");
+    return out->reason[0] ? -ENOSYS : 0;
 }
 
 /* Appends text to a growing wide buffer. */
@@ -841,7 +955,7 @@ static void list_add(HANDLE *list, unsigned *count, HANDLE handle) {
     list[(*count)++] = handle;
 }
 
-static HANDLE make_job(unsigned long long memory_limit) {
+static HANDLE make_job(unsigned long long memory_limit, unsigned cpu_percent) {
     HANDLE job = CreateJobObjectW(NULL, NULL);
     if (!job) return NULL;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
@@ -863,6 +977,17 @@ static HANDLE make_job(unsigned long long memory_limit) {
         CloseHandle(job);
         return NULL;
     }
+    if (cpu_percent) {
+        /* A hard cap in hundredths of a percent of every processor: a runaway program cannot take the computer. */
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION rate;
+        memset(&rate, 0, sizeof(rate));
+        rate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        rate.CpuRate = cpu_percent * 100;
+        if (!SetInformationJobObject(job, JobObjectCpuRateControlInformation, &rate, sizeof(rate))) {
+            CloseHandle(job);
+            return NULL;
+        }
+    }
     return job;
 }
 
@@ -882,7 +1007,7 @@ int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out) {
     if (out) memset(out, 0, sizeof(*out));
     last_error = 0;
     if (!spec || !out || !spec->path || !spec->argv || !spec->argv[0] || !spec->container ||
-        spec->handle_count > SBX_SPAWN_HANDLES_MAX || (spec->handle_count && !spec->handles)) {
+        spec->handle_count > SBX_SPAWN_HANDLES_MAX || (spec->handle_count && !spec->handles) || spec->cpu_percent > 100) {
         result = -EINVAL;
         goto fail;
     }
@@ -925,7 +1050,7 @@ int sbx_spawn(const struct sbx_spawn_spec *spec, struct sbx_process *out) {
     }
     result = environment(spec->envp, client, &block);
     if (result) goto fail;
-    job = make_job(spec->memory_limit);
+    job = make_job(spec->memory_limit, spec->cpu_percent);
     if (!job) {
         result = -errno_of(GetLastError());
         goto fail;

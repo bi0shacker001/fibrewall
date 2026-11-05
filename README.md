@@ -74,6 +74,13 @@ Not built yet:
 
 ### Releases
 
+- **v0.7.0** (2026-11-05): what a Python plugin host needs on Windows ([Droidtop/tracker#606](https://github.com/Droidtop/tracker/issues/606); [docs/design.md](docs/design.md), "What is left on Windows"):
+  - Real Python under the backend, in CI: subprocess, `os.startfile`, `ctypes` process creation, sockets, the registry, the parent's memory and the profile are all refused, in both container kinds. The standard library, the plugin's channel and `sbx_open` still work.
+  - `sbx_container_remove`: removes a container's profile and the access entries it left.
+  - `sbx_spawn_probe`: says before anything starts whether this system can confine, and why not.
+  - `sbx_spawn_spec.cpu_percent`: a hard CPU cap on the job.
+  - CI on Windows ARM64 (`windows-11-arm`), and a consumer's build with the DLL C runtime.
+
 - **v0.6.1** (2026-11-05): the rest of the code-quality review ([Droidtop/tracker#767](https://github.com/Droidtop/tracker/issues/767)):
   - `sbx_attach_from_environment` refuses an over-long broker path, token, helper or library (`-ENAMETOOLONG`) instead of cutting it to a different one.
   - One check of `sbx_open`'s flags, shared by Linux and both Windows sides.

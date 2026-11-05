@@ -1,7 +1,7 @@
 # sandbox: a process sandbox library (seccomp lockdown + syscall broker).
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.18)
-project(fibrewall VERSION 0.6.1 LANGUAGES C)
+project(fibrewall VERSION 0.7.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -34,6 +34,11 @@ if(WIN32)
   if(SBX_TESTS)
     add_executable(sbx_test_win tests/sbx_test_win.c)
     target_link_libraries(sbx_test_win PRIVATE sbx)
+    # The Python test reads tests/python_win.py from the source tree.
+    target_compile_definitions(sbx_test_win PRIVATE SBX_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    # sbx_open for the Python test's plugin, through ctypes (the agent's droidtop.host stands where it is).
+    add_library(sbx_py_helper SHARED tests/sbx_py_helper.c)
+    target_link_libraries(sbx_py_helper PRIVATE sbx)
     if(MSVC)
       target_compile_options(sbx_test_win PRIVATE /W4 /WX /wd4204 /wd4221 /wd4127 /D_CRT_SECURE_NO_WARNINGS)
     else()

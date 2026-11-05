@@ -18,6 +18,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
+#include <aclapi.h>
+#include <userenv.h>
 
 #include "sbx.h"
 
@@ -541,7 +543,283 @@ static void confined_run(int less, const struct result *control, size_t control_
 
 }
 
+/*
+ * ---- Real Python under the backend (docs/design.md, "What is left on Windows", item 1) ----
+ *
+ * tests/python_win.py, passed with -c, run by the runner's own python.exe
+ * (SBX_TEST_PYTHON) unconfined as the control, then under sbx_spawn in each
+ * container kind. Every attempt that got through unconfined must be refused
+ * confined, and everything a plugin needs must still work.
+ */
+#define PY_ITEMS 32
+struct py_item {
+    char kind[16];
+    char name[48];
+    char value[48];
+};
+
+/* Appends one argument quoted the way the C runtime reads a command line. */
+static void quote_into(wchar_t *line, size_t size, const wchar_t *argument) {
+    size_t used = wcslen(line);
+    if (used && used + 1 < size) line[used++] = L' ';
+    if (used + 1 < size) line[used++] = L'"';
+    unsigned backslashes = 0;
+    for (const wchar_t *c = argument; *c; c++) {
+        if (*c == L'\\') { backslashes++; continue; }
+        unsigned n = *c == L'"' ? backslashes * 2 + 1 : backslashes;
+        for (unsigned k = 0; k < n && used + 1 < size; k++) line[used++] = L'\\';
+        backslashes = 0;
+        if (used + 1 < size) line[used++] = *c;
+    }
+    for (unsigned k = 0; k < backslashes * 2 && used + 1 < size; k++) line[used++] = L'\\';
+    if (used + 1 < size) line[used++] = L'"';
+    line[used] = 0;
+}
+
+static size_t py_collect(HANDLE pipe, struct py_item *items) {
+    static char text[16384];
+    DWORD used = 0, got;
+    while (used + 1 < sizeof(text) && ReadFile(pipe, text + used, (DWORD) (sizeof(text) - 1 - used), &got, NULL) && got) {
+        used += got;
+    }
+    text[used] = 0;
+    size_t count = 0;
+    for (char *line = strtok(text, "\r\n"); line && count < PY_ITEMS; line = strtok(NULL, "\r\n")) {
+        if (sscanf(line, "%15s %47s %47s", items[count].kind, items[count].name, items[count].value) == 3) count++;
+    }
+    return count;
+}
+
+static const char *py_value(const struct py_item *items, size_t count, const char *kind, const char *name) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(items[i].kind, kind) == 0 && strcmp(items[i].name, name) == 0) return items[i].value;
+    }
+    return NULL;
+}
+
+static char python8[MAX_PATH * 3], python_dir8[MAX_PATH * 3];
+static wchar_t python_dir[MAX_PATH];
+
+/* Runs the script; confined < 0: the control. Returns the items it reported. */
+static size_t py_run(int confined, const wchar_t *script, const char *profile_file8, const char *granted8,
+                     struct py_item *items) {
+    SECURITY_ATTRIBUTES inherit = {sizeof(inherit), NULL, TRUE};
+    HANDLE read_end, write_end;
+    CreatePipe(&read_end, &write_end, &inherit, 0);
+    SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+    char handle8[32], helper8[MAX_PATH * 3];
+    snprintf(handle8, sizeof(handle8), "%llu", (unsigned long long) (uintptr_t) write_end);
+    snprintf(helper8, sizeof(helper8), "%s\\sbx_py_helper.dll", exe_dir8);
+    size_t count = 0;
+    if (confined < 0) {
+        static wchar_t line[24000];
+        wchar_t python[MAX_PATH], argument[MAX_PATH * 2];
+        MultiByteToWideChar(CP_UTF8, 0, python8, -1, python, MAX_PATH);
+        line[0] = 0;
+        quote_into(line, 24000, python);
+        quote_into(line, 24000, L"-I");
+        quote_into(line, 24000, L"-c");
+        quote_into(line, 24000, script);
+        const char *rest[] = {handle8, port8, pid8, profile_file8, profile8, helper8, granted8};
+        for (size_t i = 0; i < 7; i++) {
+            MultiByteToWideChar(CP_UTF8, 0, rest[i], -1, argument, MAX_PATH * 2);
+            quote_into(line, 24000, argument);
+        }
+        STARTUPINFOW startup;
+        memset(&startup, 0, sizeof(startup));
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION info;
+        if (CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &startup, &info)) {
+            CloseHandle(write_end);
+            count = py_collect(read_end, items);
+            WaitForSingleObject(info.hProcess, 60000);
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+        } else {
+            CloseHandle(write_end);
+        }
+    } else {
+        static char script8[24000 * 3];
+        WideCharToMultiByte(CP_UTF8, 0, script, -1, script8, sizeof(script8), NULL, NULL);
+        char *argv[] = {python8, "-I", "-c", script8, handle8, port8, pid8, (char *) profile_file8, profile8, helper8,
+                        (char *) granted8, NULL};
+        struct sbx_policy *policy = sbx_policy_new();
+        sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);  /* the interpreter and its standard library */
+        sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);     /* the sbx_open helper DLL */
+        sbx_policy_add(policy, granted8, SBX_READ);                  /* the one file the broker hands it */
+        struct sbx_spawn_spec spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.path = python8;
+        spec.argv = argv;
+        spec.handles = &write_end;
+        spec.handle_count = 1;
+        spec.container = CONTAINER;
+        spec.less_privileged = confined;
+        spec.memory_limit = 1ull << 30;
+        spec.policy = policy;
+        struct sbx_process process;
+        int started = sbx_spawn(&spec, &process);
+        CloseHandle(write_end);
+        if (started == 0) {
+            count = py_collect(read_end, items);
+            int code = -1;
+            sbx_process_wait(&process, &code);
+        } else {
+            printf("info python: sbx_spawn failed: %d (Windows error %lu)\n", started, sbx_spawn_error());
+        }
+    }
+    CloseHandle(read_end);
+    return count;
+}
+
+static void python_checks(void) {
+    wchar_t python[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"SBX_TEST_PYTHON", python, MAX_PATH)) {
+        printf("skip python: SBX_TEST_PYTHON names no python.exe here\n");
+        return;
+    }
+    to_utf8(python8, sizeof(python8), python);
+    wcscpy(python_dir, python);
+    *wcsrchr(python_dir, L'\\') = 0;
+    to_utf8(python_dir8, sizeof(python_dir8), python_dir);
+    /* The script, read from the source tree. */
+    static wchar_t script[24000];
+    FILE *f = fopen(SBX_TEST_SOURCE_DIR "/tests/python_win.py", "rb");
+    static char raw[24000];
+    size_t n = f ? fread(raw, 1, sizeof(raw) - 1, f) : 0;
+    if (f) fclose(f);
+    raw[n] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, raw, -1, script, 24000);
+    EXPECT(n > 0, "python: the plugin script");
+    /* A file in the profile, and the one file the broker grants. */
+    wchar_t profile_file[MAX_PATH], path[MAX_PATH];
+    swprintf(profile_file, MAX_PATH, L"%ls\\sbx-test-python-%lu.txt", profile, GetCurrentProcessId());
+    make_file(profile_file, "profile");
+    child_path(path, L"plugin-data");
+    CreateDirectoryW(path, NULL);
+    child_path(path, L"plugin-data\\granted.txt");
+    make_file(path, "granted");
+    char profile_file8[MAX_PATH * 3], granted8[MAX_PATH * 3];
+    to_utf8(profile_file8, sizeof(profile_file8), profile_file);
+    to_utf8(granted8, sizeof(granted8), path);
+
+    static const char *const must_refuse[] = {"subprocess", "startfile", "ctypes-createprocess", "socket-loopback",
+                                              "socket-public", "ctypes-registry", "ctypes-openprocess",
+                                              "open-profile-file", "list-profile"};
+    static const char *const must_work[] = {"import-json", "import-ssl", "import-ctypes", "sbx-open"};
+    struct py_item control[PY_ITEMS];
+    size_t control_count = py_run(-1, script, profile_file8, granted8, control);
+    EXPECT(control_count >= 13, "python control: the script ran unconfined and reported");
+    for (int less = 0; less <= 1; less++) {
+        const char *label = less ? "python, less-privileged" : "python, appcontainer";
+        struct py_item confined[PY_ITEMS];
+        size_t confined_count = py_run(less, script, profile_file8, granted8, confined);
+        char what[160];
+        snprintf(what, sizeof(what), "%s: the confined interpreter ran the plugin and reported", label);
+        EXPECT(confined_count >= 13, what);
+        for (size_t i = 0; i < sizeof(must_refuse) / sizeof(must_refuse[0]); i++) {
+            const char *before = py_value(control, control_count, "attempt", must_refuse[i]);
+            const char *after = py_value(confined, confined_count, "attempt", must_refuse[i]);
+            if (!before || strcmp(before, "0") != 0) {
+                printf("info %s: %s did not get through unconfined either (%s); confined: %s\n", label, must_refuse[i],
+                       before ? before : "no report", after ? after : "no report");
+            }
+            snprintf(what, sizeof(what), "%s: %s refused (%s)", label, must_refuse[i], after ? after : "no report");
+            EXPECT(after && strcmp(after, "0") != 0, what);
+        }
+        for (size_t i = 0; i < sizeof(must_work) / sizeof(must_work[0]); i++) {
+            const char *value = py_value(confined, confined_count, "works", must_work[i]);
+            snprintf(what, sizeof(what), "%s: %s works", label, must_work[i]);
+            EXPECT(value && strcmp(value, "1") == 0, what);
+        }
+    }
+    DeleteFileW(profile_file);
+    child_path(path, L"plugin-data\\granted.txt");
+    DeleteFileW(path);
+    child_path(path, L"plugin-data");
+    RemoveDirectoryW(path);
+    RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\sbx-test-python");
+}
+
+/* Whether path's own access list has an entry naming the container's SID (an SBX_STATIC grant left behind). */
+static int has_entry_for(const wchar_t *path, const char *container) {
+    wchar_t name[80];
+    MultiByteToWideChar(CP_UTF8, 0, container, -1, name, 80);
+    PSID sid = NULL;
+    if (FAILED(DeriveAppContainerSidFromAppContainerName(name, &sid))) return 0;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    int found = 0;
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &descriptor) ==
+            ERROR_SUCCESS && dacl) {
+        for (DWORD i = 0; i < dacl->AceCount; i++) {
+            ACCESS_ALLOWED_ACE *ace = NULL;
+            if (GetAce(dacl, i, (void **) &ace) && ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                !(ace->Header.AceFlags & INHERITED_ACE) && EqualSid((PSID) &ace->SidStart, sid)) {
+                found = 1;
+            }
+        }
+    }
+    if (descriptor) LocalFree(descriptor);
+    FreeSid(sid);
+    return found;
+}
+
+/*
+ * What is left on Windows (docs/design.md; Droidtop/tracker#606): asking first,
+ * a CPU cap, and removing a container with what it left.
+ */
+static void left_on_windows_checks(void) {
+    struct sbx_probe probe;
+    int can = sbx_spawn_probe(&probe);
+    printf("info probe: appcontainer %d, less-privileged %d, nested jobs %d, profile %d, reason '%s'\n",
+           probe.appcontainer, probe.less_privileged, probe.nested_jobs, probe.profile, probe.reason);
+    EXPECT(can == 0 && probe.appcontainer && probe.nested_jobs && probe.profile && !probe.reason[0],
+           "probe: this system can confine, and says so before anything starts");
+    EXPECT(sbx_spawn_probe(NULL) == -EINVAL, "probe: a missing report is refused");
+
+    /* A CPU cap: out of range refused; in range, the job carries it. */
+    char *argv_idle[] = {exe8, "--idle", NULL};
+    struct sbx_spawn_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.path = exe8;
+    spec.argv = argv_idle;
+    spec.container = CONTAINER;
+    spec.cpu_percent = 101;
+    struct sbx_process process;
+    struct sbx_policy *refused_policy = sbx_policy_new();
+    spec.policy = refused_policy;
+    EXPECT(sbx_spawn(&spec, &process) == -EINVAL, "cpu cap: over 100 percent is refused, nothing started");
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);
+    spec.policy = policy;
+    spec.cpu_percent = 10;
+    int started = sbx_spawn(&spec, &process);
+    EXPECT(started == 0, "cpu cap: a program starts under a 10 percent cap");
+    if (started == 0) {
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION rate;
+        memset(&rate, 0, sizeof(rate));
+        DWORD got = 0;
+        int queried = QueryInformationJobObject(process.job, JobObjectCpuRateControlInformation, &rate, sizeof(rate), &got);
+        EXPECT(queried && (rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) && rate.CpuRate == 1000,
+               "cpu cap: the job carries the hard cap (10 percent)");
+        int code = -1;
+        sbx_process_wait(&process, &code);
+    }
+
+    /* Removing the container: its static grant on the program's folder goes, and its profile with it. */
+    EXPECT(has_entry_for(exe_dir, CONTAINER), "remove: the container's static grant is on the program's folder");
+    const char *granted[] = {exe_dir8, "C:\\sbx-test-gone\\nowhere", python_dir8};
+    unsigned granted_count = python_dir8[0] ? 3 : 2;
+    EXPECT(sbx_container_remove(CONTAINER, granted, granted_count) == 0, "remove: the container and its grants are removed");
+    EXPECT(!has_entry_for(exe_dir, CONTAINER), "remove: no entry for its SID is left on the folder");
+    if (python_dir8[0]) EXPECT(!has_entry_for(python_dir, CONTAINER), "remove: nor on Python's folder");
+    EXPECT(sbx_container_remove(CONTAINER, granted, granted_count) == 0, "remove: removing again is harmless");
+    EXPECT(sbx_container_remove("", granted, 1) == -EINVAL, "remove: a container needs a name");
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--idle") == 0) return 0;
     if (argc >= 8 && strcmp(argv[1], "--child") == 0) {
         MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, root, MAX_PATH);
         MultiByteToWideChar(CP_UTF8, 0, argv[4], -1, profile, MAX_PATH);
@@ -665,6 +943,9 @@ int main(int argc, char **argv) {
     /* Confined: an AppContainer, then a less-privileged one where the system has it. */
     confined_run(0, control, control_count);
     confined_run(1, control, control_count);
+
+    python_checks();
+    left_on_windows_checks();
 
     /* Removes what it made, one by one (the junction itself, not what it leads to). */
     static const wchar_t *const files[] = {L"save\\new.txt", L"game\\data.txt", L"secret\\key", L"granted\\once.txt"};

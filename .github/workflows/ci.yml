@@ -87,18 +87,40 @@ jobs:
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_bench 100000
 
   windows:
-    # The Windows backend: an AppContainer and job object at spawn, an explicit broker (docs/design.md, "Windows").
-    runs-on: windows-latest
+    # The Windows backend: an AppContainer and job object at spawn, an explicit broker (docs/design.md, "Windows"),
+    # on x64 and on ARM64 (Windows on ARM computers run the agent natively; Droidtop/tracker#606).
+    name: windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+          - runner: windows-11-arm
+            arch: ARM64
     steps:
       - uses: actions/checkout@v4
       - name: Windows version
         run: cmd /c ver
+      - name: Python for the plugin test (the runner's own interpreter, as the agent bundles one)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Build
         run: |
-          cmake -S . -B build
+          cmake -S . -B build -A ${{ matrix.arch }}
           cmake --build build --config Release
       - name: Test
-        run: .\build\Release\sbx_test_win.exe
+        shell: pwsh
+        run: |
+          $env:SBX_TEST_PYTHON = (python -c "import sys; print(sys.executable)")
+          .\build\Release\sbx_test_win.exe
+      - name: A consumer's build (add_subdirectory, the DLL C runtime /MD)
+        run: |
+          cmake -S tests/consumer -B build-consumer -A ${{ matrix.arch }}
+          cmake --build build-consumer --config Release
+          .\build-consumer\Release\sbx_consumer.exe
 
   android-build:
     # Compiles, with its tests, for the two Android ABIs that ship; the x86_64 build also runs on the emulator below.

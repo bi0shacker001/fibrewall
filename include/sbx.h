@@ -32,10 +32,10 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.6.1"
+#define SBX_VERSION "0.7.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 6
-#define SBX_VERSION_PATCH 1
+#define SBX_VERSION_MINOR 7
+#define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -580,6 +580,13 @@ struct sbx_spawn_spec {
      * when it fails: the broker frees it when the program closes its end.
      */
     struct sbx_policy *policy;
+    /*
+     * 1-100: the job's hard cap on CPU, as a share of all the computer's
+     * processors (JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP); 0: none. There is
+     * no default: the host decides (docs/design.md, "What is left on
+     * Windows"). Appended in 0.7.0.
+     */
+    unsigned cpu_percent;
 };
 
 struct sbx_process {
@@ -611,6 +618,34 @@ int sbx_process_wait(struct sbx_process *process, int *exit_code);
 
 /* Ends the program (closes its job) and closes the handles. */
 void sbx_process_close(struct sbx_process *process);
+
+/*
+ * Removes an AppContainer and what it left: the access entries naming the
+ * container's SID on each of paths (the SBX_STATIC grants sbx_spawn made,
+ * which outlive the program), then its profile. For a host removing a
+ * plugin. Safe to repeat, and on a path that no longer exists. Returns 0,
+ * or the first negative errno met (it goes on through every path).
+ * Added in 0.7.0.
+ */
+int sbx_container_remove(const char *container, const char *const *paths, unsigned count);
+
+/* What this system can confine with (sbx_spawn_probe). */
+struct sbx_probe {
+    int appcontainer;     /* AppContainers exist (Windows 8 and later) */
+    int less_privileged;  /* less-privileged AppContainers exist (Windows 10 1703 and later) */
+    int nested_jobs;      /* a job can be made for a process already in one (Windows 8 and later) */
+    int profile;          /* an AppContainer profile could be made here (policy may refuse it) */
+    char reason[160];     /* why it cannot confine, in words; empty when it can */
+};
+
+/*
+ * Asks, before any program is started, whether this system can confine one
+ * with sbx_spawn, and why not: a host keeps computer-side plugins off, with
+ * the reason, rather than meeting a bare spawn error (fail closed with an
+ * explanation). Fills *out; returns 0 when it can, -ENOSYS when it cannot.
+ * Added in 0.7.0.
+ */
+int sbx_spawn_probe(struct sbx_probe *out);
 
 #endif /* _WIN32 */
 
