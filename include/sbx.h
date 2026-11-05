@@ -32,9 +32,9 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.2.0"
+#define SBX_VERSION "0.3.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 2
+#define SBX_VERSION_MINOR 3
 #define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -662,6 +662,11 @@ struct sbx_access {
     const char *net_rule;  /* for a network call decided by sbx_policy_net_rule's rules: the rule's text, or
                               "no rule" when none matched (then refused), or the reason ("DNS goes through
                               the broker"); NULL otherwise. Appended in 0.2.0. */
+    const char *net_name;  /* for a network call: the name the broker resolved its address for (a connect's or a
+                              send's destination, a lookup's name), or NULL. Appended in 0.3.0. */
+    int parked;            /* 1 when the request was parked (the decider answered SBX_PARK before): the decider
+                              runs on a thread of the request's own and may block, asking a person. Appended in
+                              0.3.0. */
 };
 
 /*
@@ -674,6 +679,15 @@ struct sbx_access {
  * the broker's thread; the confined call waits for it.
  */
 #define SBX_KEEP 1
+/*
+ * A decider that would have to wait (to ask a person) answers SBX_PARK
+ * instead: the request is served again from the start on a thread of its
+ * own, where the decider is called with access->parked set and may block.
+ * Only the asking thread of the confined process waits; its other calls go
+ * on. A parked decider that answers SBX_PARK again is a refusal. Added in
+ * 0.3.0.
+ */
+#define SBX_PARK 2
 typedef int (*sbx_decide_fn)(void *context, const struct sbx_access *access);
 void sbx_policy_set_decider(struct sbx_policy *policy, sbx_decide_fn decide, void *context);
 

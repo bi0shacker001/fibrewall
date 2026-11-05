@@ -35,4 +35,7 @@ extern int sbx_trace_fault_frame_pointers_only;
  */
 unsigned char *sbx_policy_serialize(const struct sbx_policy *policy, size_t *len);
 
+/* Gives the policy state it owns until it is freed (after its last broker thread): a zone session. */
+void sbx_policy_attach(struct sbx_policy *policy, void *state, void (*release)(void *));
+
 #endif

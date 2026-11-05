@@ -1,7 +1,7 @@
 # sandbox: a process sandbox library (seccomp lockdown + syscall broker).
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.18)
-project(fibrewall VERSION 0.2.0 LANGUAGES C)
+project(fibrewall VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -45,7 +45,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(sbx STATIC src/lockdown.c src/broker.c src/net.c src/spawn.c src/open.c src/attach.c src/contract.c)
+add_library(sbx STATIC src/lockdown.c src/broker.c src/net.c src/zones.c src/spawn.c src/open.c src/attach.c src/contract.c)
 target_include_directories(sbx PUBLIC include PRIVATE src)
 target_link_libraries(sbx PUBLIC Threads::Threads)
 target_compile_options(sbx PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)

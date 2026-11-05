@@ -1,9 +1,13 @@
-# Bounded zones: allow, prompt and deny profiles (design, 2026-10-28, Droidtop/tracker#651)
+# Bounded zones: allow, prompt and deny profiles (built 2026-11-05, Droidtop/tracker#651)
 
-Design only, for the owner's review. Nothing here is built. The owner said
-"Yep!" (2026-10-25) to a written design of the catalogue entries and the
-five profile tables, put to him before anything is built. This is that
-design.
+The owner said "Yep!" (2026-10-25) to a written design of the catalogue
+entries and the five profile tables, put to him before anything is built.
+This is that design, now built (0.3.0, `include/sbx_zones.h`,
+`src/zones.c`) on the same policy model as network filtering: a profile
+becomes ordinary path rules, network rules (`sbx_policy_net_rule`,
+`docs/design.md`, "Network filtering") and lockdown flags, plus one
+decider that sorts each request into its entry. "As built" below records
+where the build settled something the design left open.
 
 ## Why
 
@@ -178,7 +182,7 @@ which entry and detail, and that the call is parked. An Android app can
 show an overlay above the game's surface, or a notification while the game
 is in the background. Neither one needs the game's cooperation.
 
-## Library API (proposed)
+## Library API (as built, `include/sbx_zones.h`)
 
 ```c
 enum sbx_zone { SBX_ZONE_DENY, SBX_ZONE_PROMPT, SBX_ZONE_ALLOW };
@@ -229,6 +233,47 @@ the folders the person picked, and the answers from the launch sheet.
   It then answers from the zone, then the stored answer, then the prompt.
 
 An app that wants nothing of this keeps using rules and deciders as today.
+
+### As built (2026-11-05)
+
+- **The parked request** is a general broker mechanism, not a zones one:
+  a decider that would wait answers `SBX_PARK`, and the broker serves the
+  request again from the start on a thread of its own, where
+  `sbx_access.parked` is 1 and the decider may block. The reply socket is
+  per request, so the process's other threads are answered meanwhile (the
+  test measures a `stat` on another thread while a write waits on the
+  person). `answer` then runs: the stored answer, else, when the person
+  cannot be asked, the background action (wait polls every 250 ms and
+  answers `EINTR` once the program has exited), else `ask`.
+- **What each entry becomes:**
+  - the game's folder is a rule marked `SBX_DECIDE`, read-write when
+    `files.own.write` is allow, read-only otherwise, so every write, exec
+    and socket in it reaches the decider;
+  - `files.nearby.read` allow is a read rule on the library folder; prompt
+    leaves it to the decider, which sees each refusal there;
+  - picked folders become read or read-write rules unless their zone is
+    deny (the picker was the question);
+  - `files.watch` is `SBX_LOCK_WATCH` when allowed, or prompted and
+    allowed on the launch sheet (`launch_allowed`);
+  - the network entries are `SBX_LOCK_NET_BROKERED | SBX_LOCK_NET_FILTER`
+    with `allow`/`ask out local`, `allow`/`ask out internet` and
+    `allow`/`ask dns any`, and `allow`/`ask in any`. An internet question
+    names the host: the decider is given the name the broker resolved the
+    address for (`sbx_access.net_name`), and a lookup is asked by name, so
+    "allowed for example.com" covers its addresses;
+  - `programs.own` is `SBX_LOCK_EXEC` when the host gave the helper and
+    the child library; an exec outside the folder is refused in every
+    profile;
+  - `ipc.local` is `SBX_LOCK_UNIX`, deciding sockets in the folder. With a
+    network entry on, the two cannot be combined (a brokered network's
+    Unix binds stay refused), so its Unix connects are decided by the
+    network filter's Unix rule instead and binds are refused;
+  - `links.open` is the host's to show; `sbx_zone_of` gives its zone.
+- **The owner's four questions below are still open.** The build takes
+  the design's proposals as written (the five names; nearby read as the
+  library folder only; internet never above prompt in a shipped profile;
+  answers per detail), each a table entry or one line of `zones.c` to
+  change when the owner answers.
 
 ## What changes outside the library
 

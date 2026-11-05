@@ -1993,6 +1993,20 @@ and a refused name; UDP to port 53 refused; the broker's socket kept
 with "no rule". On the emulators bionic's own `getaddrinfo` runs through
 the relay as well.
 
+## Bounded zones (built 2026-11-05, Droidtop/tracker#651)
+
+Profiles that sort a fixed catalogue of grants into allow, prompt and deny
+are designed and documented in `docs/zones.md`, and built on this policy
+model: a profile becomes path rules, network rules and flags, and a
+decider. The one broker change they needed is general: **parking**. A
+decider that has to wait for a person answers `SBX_PARK`; the broker holds
+back that request's reply and audit and serves it again from the start on
+a thread of its own (budgeted like a blocking connect), where the decider
+is called with `sbx_access.parked` set and may block. Each request has its
+own answer socket, so the process's other threads are served meanwhile.
+Every thread the broker starts for one request (an accept, a name relay, a
+lookup) may block the same way.
+
 ## The confinement contract (built 2026-10-29, Droidtop/tracker#651)
 
 `include/sbx_contract.h` adds a report of what a policy and options
