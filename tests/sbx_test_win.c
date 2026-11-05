@@ -599,6 +599,7 @@ static const char *py_value(const struct py_item *items, size_t count, const cha
 }
 
 static char python8[MAX_PATH * 3], python_dir8[MAX_PATH * 3];
+static char bundle8[MAX_PATH * 3];  /* the interpreter as the agent bundles it, for the less-privileged run */
 static wchar_t python_dir[MAX_PATH];
 
 /* Runs the script; confined < 0: the control. Returns the items it reported. */
@@ -642,7 +643,7 @@ static size_t py_run(int confined, const wchar_t *script, const char *profile_fi
     } else {
         static char script8[24000 * 3];
         WideCharToMultiByte(CP_UTF8, 0, script, -1, script8, sizeof(script8), NULL, NULL);
-        char *argv[] = {python8, "-I", "-c", script8, handle8, port8, pid8, (char *) profile_file8, profile8, helper8,
+        char *argv[] = {confined == 1 && bundle8[0] ? bundle8 : python8, "-I", "-c", script8, handle8, port8, pid8, (char *) profile_file8, profile8, helper8,
                         (char *) granted8, (char *) marker8, NULL};
         struct sbx_policy *policy = sbx_policy_new();
         sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);  /* the interpreter and its standard library */
@@ -942,6 +943,58 @@ static void dll_probe(int less) {
     }
 }
 
+/*
+ * The interpreter as the agent bundles it (docs/design.md, "What is left on
+ * Windows"): python.exe, its DLLs and its extension modules, with no
+ * side-by-side manifest embedded in the DLLs or the .pyd files. A
+ * less-privileged container is refused the activation context the loader
+ * builds from a DLL's manifest: python312.dll fails to load (error 5) with
+ * its manifest and loads without it (CI 42063916251, x64). The standard
+ * library stays where it is, named by a python._pth file, as Python's
+ * embeddable distribution does. Into exe_dir\py-bundle; bundle8 names its
+ * python.exe, or stays empty when it could not be made.
+ */
+static void copy_without_manifests(const wchar_t *from_dir, const wchar_t *to_dir, const wchar_t *pattern) {
+    wchar_t search_path[MAX_PATH];
+    swprintf(search_path, MAX_PATH, L"%ls\\%ls", from_dir, pattern);
+    WIN32_FIND_DATAW found;
+    HANDLE search = FindFirstFileW(search_path, &found);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        wchar_t from[MAX_PATH], to[MAX_PATH];
+        swprintf(from, MAX_PATH, L"%ls\\%ls", from_dir, found.cFileName);
+        swprintf(to, MAX_PATH, L"%ls\\%ls", to_dir, found.cFileName);
+        if (!copy_bytes(from, to)) continue;
+        strip_signature(to);
+        char name8[MAX_PATH * 3];
+        to_utf8(name8, sizeof(name8), found.cFileName);
+        pe_facts(to, name8, 3);
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+}
+
+static void make_bundle(void) {
+    bundle8[0] = 0;
+    wchar_t bundle[MAX_PATH], dlls[MAX_PATH], from_dlls[MAX_PATH], exe_from[MAX_PATH], exe_to[MAX_PATH], pth[MAX_PATH];
+    swprintf(bundle, MAX_PATH, L"%ls\\py-bundle", exe_dir);
+    swprintf(dlls, MAX_PATH, L"%ls\\DLLs", bundle);
+    swprintf(from_dlls, MAX_PATH, L"%ls\\DLLs", python_dir);
+    CreateDirectoryW(bundle, NULL);
+    CreateDirectoryW(dlls, NULL);
+    swprintf(exe_from, MAX_PATH, L"%ls\\python.exe", python_dir);
+    swprintf(exe_to, MAX_PATH, L"%ls\\python.exe", bundle);
+    if (!copy_bytes(exe_from, exe_to)) return;
+    copy_without_manifests(python_dir, bundle, L"*.dll");
+    copy_without_manifests(from_dlls, dlls, L"*.pyd");
+    copy_without_manifests(from_dlls, dlls, L"*.dll");
+    /* The library path: the original standard library, then the bundle's own extension modules. */
+    swprintf(pth, MAX_PATH, L"%ls\\python._pth", bundle);  /* named for the executable, as Python accepts */
+    char lines[MAX_PATH * 3 + 64];
+    snprintf(lines, sizeof(lines), "%s\\Lib\r\nDLLs\r\n.\r\n", python_dir8);
+    make_file(pth, lines);
+    to_utf8(bundle8, sizeof(bundle8), exe_to);
+}
+
 static void python_checks(void) {
     wchar_t python[MAX_PATH];
     if (!GetEnvironmentVariableW(L"SBX_TEST_PYTHON", python, MAX_PATH)) {
@@ -952,6 +1005,8 @@ static void python_checks(void) {
     wcscpy(python_dir, python);
     *wcsrchr(python_dir, L'\\') = 0;
     to_utf8(python_dir8, sizeof(python_dir8), python_dir);
+    make_bundle();
+    printf("info python: the bundled interpreter for the less-privileged run: %s\n", bundle8[0] ? bundle8 : "(not made)");
     /* The script, read from the source tree. */
     static wchar_t script[24000];
     FILE *f = fopen(SBX_TEST_SOURCE_DIR "/tests/python_win.py", "rb");

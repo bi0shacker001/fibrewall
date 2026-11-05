@@ -1644,6 +1644,29 @@ his, and record it as built to the recommendation, owner to confirm"):
   and `sbx_open` through `sbx_py_helper.dll`, loaded with `ctypes`. That
   DLL stands in for the agent's module; a ctypes-loaded DLL needs no Python
   headers in CI and exercises the same client call.
+  **The bundled interpreter has no DLL manifests** (built to the
+  recommendation, owner to confirm). On GitHub's x64 image, LPAC could not
+  load `python312.dll` or `python3.dll`; `vcruntime140.dll`, beside them,
+  loaded. CI's DLL probe ruled out each cause in turn:
+  - the access list was the same as vcruntime's;
+  - the file opened for read and execute;
+  - every import loaded on its own;
+  - a plain copy, an unsigned copy and copies without CET or CFG flags all
+    failed the same way.
+
+  The one that loaded was a copy with its embedded side-by-side manifest
+  (`RT_MANIFEST`) hidden (CI 42063916251). The loader builds an activation
+  context from a DLL's manifest, and LPAC is refused it. ARM64's Python
+  passed as it was.
+
+  So the Python the agent bundles ships its DLLs and `.pyd` files without
+  embedded manifests: built with `/MANIFEST:NO`, or stripped when the agent
+  packages it. The test runs such a copy in LPAC (`make_bundle`): the
+  interpreter's DLLs and extension modules with the manifest resource
+  hidden, and the standard library named by a `python._pth` file, as
+  Python's embeddable distribution does. The other choice would be giving
+  LPAC the capability the activation context needs. That widens every
+  container, so it is the owner's to make.
 - **2. `sbx_container_remove(name, paths, count)`.** It removes the access
   entries naming the container's SID from each path, then the profile. It
   is safe to repeat, and on a path that no longer exists. The test checks
