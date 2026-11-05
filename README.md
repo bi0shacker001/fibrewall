@@ -74,6 +74,12 @@ Not built yet:
 
 ### Releases
 
+- **v0.6.1** (2026-11-05): the rest of the code-quality review ([Droidtop/tracker#767](https://github.com/Droidtop/tracker/issues/767)):
+  - `sbx_attach_from_environment` refuses an over-long broker path, token, helper or library (`-ENAMETOOLONG`) instead of cutting it to a different one.
+  - One check of `sbx_open`'s flags, shared by Linux and both Windows sides.
+  - One table of brokered calls, with sbx-exec's subset checked against it.
+  - The end-to-end test is split by area (`SBX_TEST_AREA` runs one).
+
 - **v0.6.0** (2026-11-05): the GPU proxy on Linux, and the first review fixes ([Droidtop/tracker#815](https://github.com/Droidtop/tracker/issues/815), [#767](https://github.com/Droidtop/tracker/issues/767)):
   - `sbx_policy_add_gpu_proxy`: a confined process's Mesa virgl (GL) or venus (Vulkan) driver reaches the GPU through a vtest renderer of its own, started confined for each connection and reachable by nothing else. The process holds no GPU node.
   - The listener closes its descriptor only when the listener is freed, gives a connection 5 seconds to greet, and serves at most 64 connections at once.
