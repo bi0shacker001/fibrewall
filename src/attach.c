@@ -144,22 +144,30 @@ int sbx_attach_from_environment(void) {
     options.flags = flags;
     options.own_opens = own_count ? own : NULL;
     options.own_open_count = own_count;
-    /* SBX_LOCK_EXEC (in SBX_LOCK_CONTAIN): the host's sbx-exec and this library, by absolute path. */
-    static char helper[4096], library[4096];
+    /*
+     * SBX_LOCK_EXEC (in SBX_LOCK_CONTAIN): the host's sbx-exec and this
+     * library, by absolute path (sbx_lockdown copies both). A value too long
+     * for its buffer is refused, never cut to another path or token (#767).
+     */
+    char helper[4096], library[4096];
     const char *helper_text = getenv("SBX_EXEC_HELPER"), *library_text = getenv("SBX_CHILD_LIBRARY");
+    char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+    char secret[128];
+    int result = 0;
     if (helper_text) {
-        snprintf(helper, sizeof(helper), "%s", helper_text);
-        options.exec_helper = helper;
+        if (strlen(helper_text) >= sizeof(helper)) result = -ENAMETOOLONG;
+        else options.exec_helper = strcpy(helper, helper_text);
     }
     if (library_text) {
-        snprintf(library, sizeof(library), "%s", library_text);
-        options.child_library = library;
+        if (strlen(library_text) >= sizeof(library)) result = -ENAMETOOLONG;
+        else options.child_library = strcpy(library, library_text);
     }
-    char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
-    snprintf(path, sizeof(path), "%s", broker);
-    char secret[128];
-    snprintf(secret, sizeof(secret), "%s", token);
-    int result = sbx_attach(path, secret, &options);
+    if (strlen(broker) >= sizeof(path) || strlen(token) >= sizeof(secret)) result = -ENAMETOOLONG;
+    if (result == 0) {
+        strcpy(path, broker);
+        strcpy(secret, token);
+        result = sbx_attach(path, secret, &options);
+    }
     memset(secret, 0, sizeof(secret));
     /* own_opens' paths are copied by sbx_lockdown; the list itself is not kept. */
     free(copy);

@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include "sbx.h"
+#include "open_flags.h"
 #include "windows_protocol.h"
 
 #include <errno.h>
@@ -17,8 +18,6 @@
 #include <string.h>
 #include <wchar.h>
 
-#define WRITING (SBX_OPEN_WRITE | SBX_OPEN_CREATE | SBX_OPEN_TRUNCATE | SBX_OPEN_EXCLUSIVE | SBX_OPEN_APPEND)
-#define ALL (SBX_OPEN_READ | WRITING | SBX_OPEN_DIRECTORY)
 
 static SRWLOCK channel_lock = SRWLOCK_INIT;
 static HANDLE channel;
@@ -44,7 +43,7 @@ static HANDLE broker_channel(void) {
 }
 
 int sbx_open(const char *path, unsigned flags, sbx_handle *out) {
-    if (!path || !out || (flags & ~ALL)) return -EINVAL;
+    if (!path || !out || !sbx_open_flags_valid(flags)) return -EINVAL;
     size_t length = strlen(path) + 1;
     if (length > SBXW_PATH_MAX) return -ENAMETOOLONG;
     struct sbxw_request request;

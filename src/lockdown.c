@@ -2192,17 +2192,17 @@ static void emit_paths(unsigned flags) {
 #endif
     }
     if (unbrokered) return;
+#define SBX_NR(name) __NR_##name,
     static const unsigned brokered[] = {
-        __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
-        __NR_unlinkat, __NR_renameat2, __NR_statfs, __NR_chdir, __NR_fchdir, __NR_getcwd, __NR_fchmodat,
+        SBX_BROKERED_CALLS(SBX_NR)
 #ifdef __NR_renameat
         __NR_renameat,
 #endif
 #ifdef __NR_open
-        __NR_open, __NR_creat, __NR_stat, __NR_lstat, __NR_access, __NR_readlink, __NR_mkdir, __NR_unlink,
-        __NR_rmdir, __NR_rename, __NR_chmod,
+        SBX_BROKERED_LEGACY_CALLS(SBX_NR)
 #endif
     };
+#undef SBX_NR
     for (size_t i = 0; i < sizeof(brokered) / sizeof(brokered[0]); i++) rule(brokered[i], TRAP);
     /* Callers fall back to the brokered forms. */
     rule(__NR_statx, NOSYS);
