@@ -305,6 +305,67 @@ position moves for both, and `lseek`/`rewinddir` work as before. One reply
 carries at most `SBX_LIST_MAX` (32 KiB) of records; a longer read is
 answered short, as the kernel may answer it.
 
+**Folders held by path (built 2026-11-05, Droidtop/tracker#741).** Android
+checks every descriptor a process receives (SELinux `file_receive`), and an
+isolated_app may receive a regular file its app opened for it but not a
+folder (`avc: denied { read } ... app-data/... isolated_app`). So a brokered
+open of a folder came back without its descriptor, and the handler answered
+`EIO`: `File.list` returned null, and `File.mkdirs` failed, because bionic's
+`realpath` opens the folder (`O_PATH`) and reads `/proc/self/fd/N`.
+Listing through `SBX_LIST` never ran, since there was no descriptor to list.
+
+Now the handler asks for a folder's path along with an open or a chdir
+(`want_folder` in the request). The broker answers a folder with result 1,
+its path as the process names it (aliases undone), and the descriptor.
+`sbx_policy_set_folders_by_path` leaves the descriptor out, so the denial
+is never even logged. When no descriptor arrives, the handler holds the
+folder by its path:
+- **The placeholder.** It answers with a placeholder: a duplicate of "/"
+  (`O_PATH`), placed in a range of 64 descriptors at the top of the
+  process's descriptor limit (`held_base`). Each slot of the range keeps a
+  folder's path, the flags it was opened with and a read position.
+- **Calls on it go by the path, decided by the rules as any path is:**
+  - `getdents64` is `SBX_LIST` by path. The broker opens the folder for
+    reading, seeks to the slot's position (the last entry's `d_off`, or 0)
+    and reads.
+  - `fstat` and `fstatat(fd, "", AT_EMPTY_PATH)` are `SBX_STAT` of the path,
+    so `realpath`'s inode check holds.
+  - `readlink` of `/proc/self/fd/N` is the path.
+  - The *at calls relative to it send the path joined to the name, gathered
+    into the request without a buffer on the signal stack.
+  - `fchdir`, `chdir` and `getcwd` keep the current directory as a slot of
+    its own.
+  - `lseek` (`rewinddir`, `seekdir`) moves the position.
+  - `F_GETFL` answers the open's own flags, since glibc's `fdopendir`
+    refuses `O_PATH`.
+- **Keeping slots in step.** The filter traps `close`, `close_range`, `dup`,
+  `dup2`, `dup3`, `fcntl`, `lseek`, `fstat`, `getdents64` and `fchdir` when
+  their descriptor is in the range, unless the handler's gateway made them
+  (`held_rules`), so a slot always follows its descriptor:
+  - a close empties it;
+  - a duplicate is a placeholder of its own for the same folder;
+  - a duplicate out of the range is refused (`EBADF`), since no slot could
+    follow it.
+
+Regular files cross as before. Calls on descriptors outside the range cost
+nothing more. The range is placed only when the broker's descriptor and the
+sealed ones lie below it.
+
+**Not by path**, each answered and documented in `sbx.h`:
+- `sbx_list_stat` on a held folder (`EOPNOTSUPP`);
+- a relative Unix socket address or inotify mark from a held current
+  directory (`EOPNOTSUPP`);
+- a placeholder is always close-on-exec;
+- an exec from a held current directory starts the new program in "/".
+
+Tests (area paths, brokered and in passthrough, with the descriptors kept
+back):
+- open, fstat against `stat`, the fd link, and readdir over several
+  requests and after `rewinddir`;
+- openat, fstatat and mkdirat relative to it, and a deny rule under it;
+- dup, close, fchdir with a relative open and getcwd, and chdir by name;
+- the range's end (EMFILE, then free again).
+
 **Network** (`SBX_LOCK_INET`) is for a process that talks to the network
 itself, such as droidtop's Syncthing plugin (Droidtop/tracker#553): it
 dials peers and listens for them, so the host cannot open its sockets for

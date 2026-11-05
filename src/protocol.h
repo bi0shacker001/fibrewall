@@ -30,7 +30,8 @@
 #define SBX_LIST_MAX 32768
 
 enum sbx_op {
-    SBX_OPEN = 1,      /* flags = open flags, mode = creation mode */
+    SBX_OPEN = 1,      /* flags = open flags, mode = creation mode; with want_folder, a folder's reply may be its
+                          path instead (below) */
     SBX_STAT = 2,      /* flags = AT_SYMLINK_NOFOLLOW or 0; data = struct stat */
     SBX_ACCESS = 3,    /* mode = R_OK|W_OK|X_OK or F_OK */
     SBX_READLINK = 4,  /* mode = the caller's buffer size; data = the target */
@@ -38,10 +39,12 @@ enum sbx_op {
     SBX_UNLINK = 6,    /* flags = AT_REMOVEDIR or 0 */
     SBX_RENAME = 7,    /* flags = renameat2 flags; path2 = the new name */
     SBX_STATFS = 8,    /* data = struct statfs */
-    SBX_CHDIR = 9,     /* the reply carries an O_PATH descriptor of the directory */
+    SBX_CHDIR = 9,     /* the reply carries an O_PATH descriptor of the directory (or its path: want_folder) */
     SBX_GETCWD = 10,   /* path = "."; mode = the caller's buffer size; data = the directory's name */
     SBX_LIST = 11,     /* path = "."; the directory's own descriptor is sent; mode = the caller's buffer size;
-                          data = linux_dirent64 records read from that descriptor (its position moves) */
+                          data = linux_dirent64 records read from that descriptor (its position moves).
+                          Or, for a folder held by path (want_folder): path = the folder's absolute path, no
+                          descriptor, path2 = the int64 position to read from (a d_off, or 0) */
     SBX_CHMOD = 12,    /* mode = the new mode (the broker keeps 0777 of it) */
     SBX_UTIMENS = 13,  /* flags = AT_SYMLINK_NOFOLLOW or 0; path2 = two struct timespec (atime, mtime), or
                           empty for "now" */
@@ -150,7 +153,16 @@ struct sbx_request {
     int32_t tid;        /* for /proc/thread-self; the broker checks it is the sender's */
     uint8_t dirfd_sent;
     uint8_t dirfd2_sent;
-    uint8_t reserved[6];
+    /*
+     * SBX_OPEN, SBX_CHDIR: the handler can hold a folder by its path
+     * (Droidtop/tracker#741). When what was opened is a folder, the reply's
+     * result is 1 and its data the folder's path as the process names it
+     * (NUL-terminated); the descriptor comes too unless the policy keeps
+     * folders' descriptors back (sbx_policy_set_folders_by_path). Without
+     * it a folder's reply is the descriptor alone, as before.
+     */
+    uint8_t want_folder;
+    uint8_t reserved[5];
 };
 
 struct sbx_reply {

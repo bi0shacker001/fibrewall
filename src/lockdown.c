@@ -434,6 +434,74 @@ static void free_claims(void) {
 static int current_directory(void) { return __atomic_load_n(&cwd, __ATOMIC_ACQUIRE); }
 
 /*
+ * Folders held by path (sbx.h, sbx_policy_set_folders_by_path;
+ * Droidtop/tracker#741). An Android isolated process is refused any folder
+ * descriptor its app sends it, so when a brokered open of a folder comes
+ * back with the folder's path and no descriptor, the handler answers with a
+ * placeholder: a duplicate of "/" (O_PATH) placed in the range [held_base,
+ * held_base + HELD_MAX) at the top of the descriptor limit, whose slot keeps
+ * the path. The filter traps close, dup, fcntl, lseek, fstat and
+ * getdents64 on that range to the handler (held_rules), so a slot is
+ * emptied whenever its descriptor goes and never names a descriptor that is
+ * not its placeholder. Slot i is descriptor held_base + i.
+ */
+#define HELD_MAX 64
+struct held {
+    int state;        /* 1 while held_base + i is a placeholder */
+    int flags;        /* what F_GETFL answers: the open's own (the placeholder's are O_PATH, which fdopendir refuses) */
+    int64_t position; /* where the next listing reads from: the last entry's d_off */
+    char path[SBX_PATH_MAX];
+};
+static struct held held[HELD_MAX];
+static int held_base = -1;  /* -1: no range (unbrokered, or the descriptor limit too small) */
+static int held_root = -1;  /* "/", O_PATH: what placeholders duplicate */
+
+static struct held *held_slot(int fd) {
+    if (held_base < 0 || fd < held_base || fd >= held_base + HELD_MAX) return NULL;
+    struct held *h = &held[fd - held_base];
+    return __atomic_load_n(&h->state, __ATOMIC_ACQUIRE) == 1 ? h : NULL;
+}
+
+static int in_held_range(long fd) { return held_base >= 0 && fd >= held_base && fd < held_base + HELD_MAX; }
+
+/* The folder a held descriptor (or AT_FDCWD, the current directory) stands for, or NULL. */
+static const char *held_path(int dirfd) {
+    struct held *h = held_slot(dirfd == AT_FDCWD ? current_directory() : dirfd);
+    return h ? h->path : NULL;
+}
+
+/* A new placeholder for path, opened with flags, read from position: its descriptor, or -errno. */
+static long held_open(const char *path, int flags, int64_t position) {
+    if (held_base < 0 || held_root < 0 || path[0] != '/') return -EIO;
+    size_t length = strnlen(path, SBX_PATH_MAX);
+    if (length == SBX_PATH_MAX) return -ENAMETOOLONG;
+    long fd = through(__NR_fcntl, held_root, F_DUPFD_CLOEXEC, held_base, 0, 0, 0);
+    if (fd == -EINVAL) return -EMFILE;  /* the descriptor limit was lowered under the range */
+    if (fd < 0) return fd;
+    if (!in_held_range(fd)) {
+        through(__NR_close, fd, 0, 0, 0, 0, 0);
+        return -EMFILE;
+    }
+    struct held *h = &held[fd - held_base];
+    memcpy(h->path, path, length + 1);
+    h->position = position;
+    h->flags = (flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | O_LARGEFILE;
+    __atomic_store_n(&h->state, 1, __ATOMIC_RELEASE);
+    return fd;
+}
+
+/* Empties fd's slot, if it has one; the caller then closes or replaces the descriptor. */
+static void held_release(long fd) {
+    if (in_held_range(fd)) __atomic_store_n(&held[fd - held_base].state, 0, __ATOMIC_RELEASE);
+}
+
+/* Closes a descriptor of the handler's own, emptying its slot first. */
+static void held_close(int fd) {
+    held_release(fd);
+    through(__NR_close, fd, 0, 0, 0, 0, 0);
+}
+
+/*
  * One request and its reply. extra are the descriptors after the answer
  * socket (the directories, or the socket a network call is about); body
  * and body2 are the request's bytes. The reply's data goes to out, and a
@@ -554,7 +622,8 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
     size_t length = strnlen(path, SBX_PATH_MAX);
     size_t length2 = named2 ? strnlen(path2, SBX_PATH_MAX)
                    : (op == SBX_UTIMENS && path2 != NULL) ? 2 * sizeof(struct timespec)
-                   : op == SBX_TRUNCATE ? sizeof(int64_t) : 0;
+                   : op == SBX_TRUNCATE ? sizeof(int64_t)
+                   : (op == SBX_LIST && path2 != NULL) ? sizeof(int64_t) : 0;
     if (length == SBX_PATH_MAX || length2 == SBX_PATH_MAX) return -ENAMETOOLONG;
     if (length == 0 || (named2 && length2 == 0)) return -ENOENT;
 
@@ -568,22 +637,61 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
     request.path2_len = (uint32_t) length2;
     request.tid = (int32_t) syscall(__NR_gettid);
 
+    /*
+     * A name relative to a folder held by path (held_path) is sent whole: the folder's path, "/", the name.
+     * The pieces are gathered as they are, so no buffer is needed on the signal stack.
+     */
     int extra[2];
     int count = 0;
+    struct iovec parts[6];
+    int part_count = 0;
+    const char *base = NULL, *base2 = NULL;
     if (path[0] != '/') {
-        extra[count++] = dirfd == AT_FDCWD ? current_directory() : dirfd;
-        request.dirfd_sent = 1;
+        /* For these "." is the descriptor itself, which a held folder never sends (their callers answer it first). */
+        base = (op == SBX_LIST || op == SBX_LIST_STAT || op == SBX_GETCWD) ? NULL : held_path(dirfd);
+        if (!base) {
+            extra[count++] = dirfd == AT_FDCWD ? current_directory() : dirfd;
+            request.dirfd_sent = 1;
+        }
     }
     if ((op == SBX_RENAME || op == SBX_LINK) && path2[0] != '/') {
-        extra[count++] = dirfd2 == AT_FDCWD ? current_directory() : dirfd2;
-        request.dirfd2_sent = 1;
+        base2 = held_path(dirfd2);
+        if (!base2) {
+            extra[count++] = dirfd2 == AT_FDCWD ? current_directory() : dirfd2;
+            request.dirfd2_sent = 1;
+        }
     }
+    size_t total = length, total2 = length2;
+    if (base) {
+        size_t n = strcmp(base, "/") == 0 ? 0 : strlen(base);
+        parts[part_count++] = (struct iovec) {(void *) base, n};
+        parts[part_count++] = (struct iovec) {(void *) "/", 1};
+        total += n + 1;
+    }
+    parts[part_count++] = (struct iovec) {(void *) path, length};
+    if (base2) {
+        size_t n = strcmp(base2, "/") == 0 ? 0 : strlen(base2);
+        parts[part_count++] = (struct iovec) {(void *) base2, n};
+        parts[part_count++] = (struct iovec) {(void *) "/", 1};
+        total2 += n + 1;
+    }
+    parts[part_count++] = (struct iovec) {(void *) path2, length2};
+    if (total >= SBX_PATH_MAX || total2 >= SBX_PATH_MAX) return -ENAMETOOLONG;
+    request.path_len = (uint32_t) total;
+    request.path2_len = (uint32_t) total2;
+    /* An open or chdir given room for a folder's path can hold the folder by it (held_open). */
+    request.want_folder = (op == SBX_OPEN || op == SBX_CHDIR) && held_base >= 0 && out != NULL && out_len >= SBX_PATH_MAX;
     int passed;
-    long result = exchange(&request, extra, count, path, length, path2, length2, out, out_len,
-                           op == SBX_OPEN && !(flags & O_CLOEXEC), &passed);
+    long result = exchange_parts(&request, extra, count, parts, part_count, out, out_len,
+                                 op == SBX_OPEN && !(flags & O_CLOEXEC), &passed);
     if ((op == SBX_OPEN || op == SBX_CHDIR || op == SBX_EXEC) && result >= 0) {
-        if (passed < 0) return -EIO;
-        return passed;
+        if (passed >= 0) return passed;
+        if (result == 1 && request.want_folder) {
+            char *name = out;
+            name[out_len - 1] = '\0';
+            return held_open(name, op == SBX_OPEN ? flags : O_PATH | O_DIRECTORY, 0);
+        }
+        return -EIO;
     }
     if (passed >= 0) close(passed);
     return result;
@@ -592,10 +700,18 @@ static long forward(uint32_t op, int dirfd, const char *path, int dirfd2, const 
 /* Makes directory the current one, taking it; closes the one it replaces. */
 static void set_directory(int directory) {
     int old = __atomic_exchange_n(&cwd, directory, __ATOMIC_ACQ_REL);
-    if (old >= 0) close(old);
+    if (old >= 0) held_close(old);
 }
 
 static long change_directory_fd(int fd) {
+    struct held *h = held_slot(fd);
+    if (h) {
+        /* The current directory becomes a placeholder of its own for the same folder. */
+        long copy = held_open(h->path, h->flags, 0);
+        if (copy < 0) return copy;
+        set_directory((int) copy);
+        return 0;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0) return -errno;
     if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
@@ -646,8 +762,22 @@ static long route(int dirfd, const char *path, char *buffer, const char **where)
     char link[32];
     fd_link(link, dirfd == AT_FDCWD ? current_directory() : dirfd);
     size_t length = strnlen(path, SBX_PATH_MAX);
-    long n = through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) link, (long) (uintptr_t) buffer,
-                     SBX_PATH_MAX - 1, 0, 0);
+    const char *held_name = held_path(dirfd);
+    long n;
+    if (held_name) {
+        /* A folder held by path: its name is the slot's, and the kernel is given the whole path, never the placeholder. */
+        n = strcmp(held_name, "/") == 0 ? 0 : (long) strlen(held_name);
+        memcpy(buffer, held_name, (size_t) n);
+        if ((size_t) n + 1 + length >= SBX_PATH_MAX) return -ENAMETOOLONG;
+        buffer[n] = '/';
+        memcpy(buffer + n + 1, path, length);
+        buffer[n + 1 + length] = '\0';
+        if (claimed(buffer)) return ROUTE_BROKER;
+        *where = buffer;
+        return ROUTE_KERNEL;
+    }
+    n = through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) link, (long) (uintptr_t) buffer,
+                SBX_PATH_MAX - 1, 0, 0);
     if (n < 0) return n == -ENOENT ? -EBADF : n;
     if (buffer[0] == '/' && (size_t) n + 1 + length < SBX_PATH_MAX) {
         buffer[n] = '/';
@@ -672,7 +802,8 @@ static long open_path(int dirfd, const char *path, int flags, uint32_t mode, cha
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
     if (to == ROUTE_KERNEL) return through(__NR_openat, PASS_DIRFD, (long) (uintptr_t) where, flags, mode, 0, 0);
-    return forward(SBX_OPEN, dirfd, path, 0, NULL, flags, mode, NULL, 0);
+    /* buffer is free again once routed (route's ROUTE_BROKER leaves the caller's own path): room for a folder's path. */
+    return forward(SBX_OPEN, dirfd, path, 0, NULL, flags, mode, buffer, SBX_PATH_MAX);
 }
 
 static long stat_path(int dirfd, const char *path, struct stat *st, int flags, char *buffer) {
@@ -722,7 +853,17 @@ static int own_fd_link(const char *path) {
 static long readlink_path(int dirfd, const char *path, char *out, long size, char *buffer) {
     if (size <= 0) return -EINVAL;
     if (path == NULL) return -EFAULT;
-    if (own_fd_link(path)) return through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) path, (long) (uintptr_t) out, size, 0, 0);
+    if (own_fd_link(path)) {
+        /* A folder held by path reads as that path, as its own descriptor's link would (bionic's realpath reads it). */
+        const char *held_name = held_path((int) strtol(strrchr(path, '/') + 1, NULL, 10));
+        if (held_name) {
+            size_t length = strlen(held_name);
+            if ((long) length > size) length = (size_t) size;
+            memcpy(out, held_name, length);
+            return (long) length;
+        }
+        return through(__NR_readlinkat, PASS_DIRFD, (long) (uintptr_t) path, (long) (uintptr_t) out, size, 0, 0);
+    }
     const char *where = NULL;
     long to = route(dirfd, path, buffer, &where);
     if (to < 0) return to;
@@ -794,7 +935,7 @@ static long change_directory(const char *path, char *buffer) {
     if (to < 0) return to;
     long fd;
     if (to == ROUTE_KERNEL) fd = through(__NR_openat, PASS_DIRFD, (long) (uintptr_t) where, O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
-    else fd = forward(SBX_CHDIR, AT_FDCWD, path, 0, NULL, 0, 0, NULL, 0);
+    else fd = forward(SBX_CHDIR, AT_FDCWD, path, 0, NULL, 0, 0, buffer, SBX_PATH_MAX);
     if (fd < 0) return fd;
     set_directory((int) fd);
     return 0;
@@ -802,6 +943,13 @@ static long change_directory(const char *path, char *buffer) {
 
 static long get_directory(char *out, size_t size) {
     if (out == NULL || size == 0) return -EINVAL;
+    const char *held_name = held_path(AT_FDCWD);
+    if (held_name) {
+        size_t length = strlen(held_name) + 1;
+        if (length > size) return -ERANGE;
+        memcpy(out, held_name, length);
+        return (long) length;
+    }
     if (!passthrough) {
         /* The broker counts the terminating NUL, as the kernel does. */
         return forward(SBX_GETCWD, AT_FDCWD, ".", 0, NULL, 0, (uint32_t) size, out, size);
@@ -839,7 +987,33 @@ static long utimens_path(int dirfd, const char *path, const struct timespec *tim
  * goes to the broker with its descriptor, which lists it from the same open
  * file description when it may read it.
  */
+struct dirent_head {
+    uint64_t ino;
+    int64_t off;
+    unsigned short reclen;
+};
+
+/* getdents64 of a folder held by path: the broker reads it from the slot's position, which moves to the last entry's. */
+static long held_list(struct held *h, void *out, unsigned count) {
+    int64_t position = h->position;
+    size_t asked = count < SBX_LIST_MAX ? count : SBX_LIST_MAX;
+    long n = forward(SBX_LIST, AT_FDCWD, h->path, 0, (const char *) &position, 0, (uint32_t) asked, out, asked);
+    if (n <= 0) return n;
+    int64_t last = position;
+    for (long at = 0; at + (long) sizeof(struct dirent_head) <= n;) {
+        struct dirent_head head;
+        memcpy(&head, (char *) out + at, sizeof(head));
+        if (head.reclen == 0) break;
+        last = head.off;
+        at += head.reclen;
+    }
+    h->position = last;
+    return n;
+}
+
 static long list_directory(int fd, void *out, unsigned count) {
+    struct held *h = held_slot(fd);
+    if (h) return held_list(h, out, count);
     /* Through the gateway: the filter allows it by its address, not a forgeable marker (review A-06). */
     long n = through(__NR_getdents64, fd, (long) (uintptr_t) out, (long) count, 0, 0, 0);
     if (n != -EACCES) return n;
@@ -1141,6 +1315,7 @@ static long unix_call(uint32_t op, int fd, const struct sockaddr *address, sockl
     if (address->sa_family != AF_UNIX || length > sizeof(struct sockaddr_un)) return -EINVAL;
     const struct sockaddr_un *un = (const struct sockaddr_un *) address;
     int relative = length > offsetof(struct sockaddr_un, sun_path) && un->sun_path[0] != '/' && un->sun_path[0] != '\0';
+    if (relative && held_path(AT_FDCWD)) return -EOPNOTSUPP;  /* the current directory is a folder held by path */
     struct sbx_request request;
     memset(&request, 0, sizeof(request));
     request.version = SBX_PROTOCOL_VERSION;
@@ -1174,6 +1349,7 @@ static long watch_call(int fd, const char *path, uint32_t mask) {
     if (length == SBX_PATH_MAX) return -ENAMETOOLONG;
     if (length == 0) return -ENOENT;
     int relative = path[0] != '/';
+    if (relative && held_path(AT_FDCWD)) return -EOPNOTSUPP;  /* the current directory is a folder held by path */
     struct sbx_request request;
     memset(&request, 0, sizeof(request));
     request.version = SBX_PROTOCOL_VERSION;
@@ -1458,7 +1634,10 @@ static long exec_call(int dirfd, const char *path, char *const *argv, char *cons
     }
     /* The helper's descriptors, kept across the exec; every other one of ours is close-on-exec. */
     int kept[4] = {
-        fcntl(broker, F_DUPFD, 3), fcntl(current_directory(), F_DUPFD, 3), fcntl((int) target, F_DUPFD, 3),
+        fcntl(broker, F_DUPFD, 3),
+        /* A current directory held by path has no descriptor to give: the new program starts in "/" (sbx.h). */
+        (int) through(__NR_fcntl, held_path(AT_FDCWD) ? held_root : current_directory(), F_DUPFD, 3, 0, 0, 0),
+        fcntl((int) target, F_DUPFD, 3),
         fcntl(helper_fd, F_DUPFD, 3),
     };
     close((int) target);
@@ -1500,6 +1679,75 @@ static long exec_call(int dirfd, const char *path, char *const *argv, char *cons
     return result;
 }
 
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
+
+/*
+ * A descriptor call the filter trapped because it names a descriptor in the
+ * placeholder range (held_rules): the handler keeps the slots in step and
+ * makes the call itself through its gateway. A placeholder's duplicate is a
+ * placeholder of its own for the same folder; one cannot be duplicated out
+ * of the range, where no slot could follow it.
+ */
+static long held_call(long nr, long a0, long a1, long a2) {
+    struct held *h = held_slot((int) a0);
+    switch (nr) {
+    case __NR_close:
+        if (net_filter && a0 == broker) return -EPERM;  /* the broker's descriptor stays pinned */
+        held_release(a0);
+        return through(__NR_close, a0, 0, 0, 0, 0, 0);
+    case __NR_close_range: {
+        if (net_filter) return -ENOSYS;  /* as without the range: it could close the broker's descriptor */
+        if (!((unsigned long) a2 & CLOSE_RANGE_CLOEXEC)) {
+            for (int i = 0; i < HELD_MAX; i++) {
+                unsigned fd = (unsigned) (held_base + i);
+                if (fd >= (unsigned) a0 && fd <= (unsigned) a1) held_release(fd);
+            }
+        }
+        return through(__NR_close_range, a0, a1, a2, 0, 0, 0);
+    }
+    case __NR_dup:
+        return h ? held_open(h->path, h->flags, h->position) : through(__NR_dup, a0, 0, 0, 0, 0, 0);
+    case __NR_fcntl:
+        if (h && (a1 == F_DUPFD || a1 == F_DUPFD_CLOEXEC)) return held_open(h->path, h->flags, h->position);
+        if (h && a1 == F_GETFL) return h->flags;
+        return through(__NR_fcntl, a0, a1, a2, 0, 0, 0);
+    case __NR_lseek:
+        if (!h) return through(__NR_lseek, a0, a1, a2, 0, 0, 0);
+        /* What readdir's rewinddir and seekdir ask: a position is an entry's d_off, or 0. */
+        if (a2 == SEEK_SET && a1 >= 0) {
+            h->position = a1;
+            return a1;
+        }
+        if (a2 == SEEK_CUR && a1 == 0) return (long) h->position;
+        return -EINVAL;
+    case __NR_fstat:
+        if (h) return forward(SBX_STAT, AT_FDCWD, h->path, 0, NULL, 0, 0, (void *) a1, sizeof(struct stat));
+        return through(__NR_fstat, a0, a1, 0, 0, 0, 0);
+#ifdef __NR_dup2
+    case __NR_dup2:
+#endif
+    case __NR_dup3: {
+        if (net_filter && a1 == broker) return -EPERM;
+        if (a0 == a1) return through(nr, a0, a1, a2, 0, 0, 0);
+        if (h && !in_held_range(a1)) return -EBADF;
+        held_release(a1);
+        long result = through(nr, a0, a1, a2, 0, 0, 0);
+        if (result >= 0 && h) {
+            struct held *copy = &held[a1 - held_base];
+            memcpy(copy->path, h->path, strlen(h->path) + 1);
+            copy->position = h->position;
+            copy->flags = h->flags;
+            __atomic_store_n(&copy->state, 1, __ATOMIC_RELEASE);
+        }
+        return result;
+    }
+    default:
+        return -ENOSYS;
+    }
+}
+
 static long dispatch(long nr, ucontext_t *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3), a4 = ARG(uc, 4);
     char buffer[SBX_PATH_MAX];
@@ -1527,7 +1775,9 @@ static long dispatch(long nr, ucontext_t *uc) {
     case __NR_newfstatat: {
         const char *path = (const char *) a1;
         if ((a3 & AT_EMPTY_PATH) && path != NULL && path[0] == '\0') {
-            return syscall(__NR_fstat, (int) a0, (void *) a2) == 0 ? 0 : -errno;
+            const char *held_name = held_path((int) a0);
+            if (held_name) return forward(SBX_STAT, AT_FDCWD, held_name, 0, NULL, 0, 0, (void *) a2, sizeof(struct stat));
+            return through(__NR_fstat, a0, a2, 0, 0, 0, 0);
         }
         return stat_path((int) a0, path, (struct stat *) a2, (int) a3, buffer);
     }
@@ -1562,6 +1812,17 @@ static long dispatch(long nr, ucontext_t *uc) {
         return utimens_path((int) a0, (const char *) a1, (const struct timespec *) a2, (int) a3, buffer);
     case __NR_getdents64:
         return list_directory((int) a0, (void *) a1, (unsigned) a2);
+    case __NR_close:
+    case __NR_close_range:
+    case __NR_dup:
+    case __NR_dup3:
+#ifdef __NR_dup2
+    case __NR_dup2:
+#endif
+    case __NR_fcntl:
+    case __NR_lseek:
+    case __NR_fstat:
+        return held_call(nr, a0, a1, a2);
     case __NR_linkat:
         return link_path((int) a0, (const char *) a1, (int) a2, (const char *) a3, (int) a4);
     case __NR_symlinkat:
@@ -2171,8 +2432,51 @@ static void emit_utimensat(unsigned with_path) {
     block_end(block);
 }
 
+/*
+ * The placeholder range (held_base): nr, when its argument arg is a
+ * descriptor in the range, traps to the handler (held_call) unless the
+ * handler's gateway made it. Before every other rule for these calls, so a
+ * placeholder's slot follows whatever is done to its descriptor.
+ */
+static void held_block(unsigned nr, unsigned arg) {
+    unsigned short block = block_begin(nr);
+    load(ARG_LO(arg));
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, (unsigned) held_base, 0, 7));
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, (unsigned) (held_base + HELD_MAX - 1), 6, 0));
+    from_gateway_then(TRAP);
+    load(offsetof(struct seccomp_data, nr));
+    block_end(block);
+}
+
+static void held_rules(void) {
+    if (held_base < 0) return;
+    held_block(__NR_close, 0);
+    held_block(__NR_dup, 0);
+    held_block(__NR_dup3, 0);
+    held_block(__NR_dup3, 1);
+#ifdef __NR_dup2
+    held_block(__NR_dup2, 0);
+    held_block(__NR_dup2, 1);
+#endif
+    held_block(__NR_fcntl, 0);
+    held_block(__NR_lseek, 0);
+    held_block(__NR_fstat, 0);
+    held_block(__NR_getdents64, 0);
+    held_block(__NR_fchdir, 0);
+    /* close_range(first, last, flags): when the two ranges overlap. */
+    unsigned short block = block_begin(__NR_close_range);
+    load(ARG_LO(0));
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, (unsigned) (held_base + HELD_MAX - 1), 8, 0));
+    load(ARG_LO(1));
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, (unsigned) held_base, 0, 6));
+    from_gateway_then(TRAP);
+    load(offsetof(struct seccomp_data, nr));
+    block_end(block);
+}
+
 /* Calls that name a path: to the broker, to the handler's gateway in passthrough, refused, or the kernel's. */
 static void emit_paths(unsigned flags) {
+    held_rules();
     int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (flags & SBX_LOCK_PASSTHROUGH) != 0;
     /* readlink of the process's own descriptor link is answered by the handler whenever it brokers paths (own_fd_link). */
@@ -2608,6 +2912,30 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
             return mapped;
         }
     }
+    /*
+     * The placeholder range (held_base): the top HELD_MAX descriptors under the
+     * limit the process will run with, when every descriptor the filter names
+     * (the broker's, the sealed ones) lies below it.
+     */
+    held_base = -1;
+    if (held_root >= 0) {
+        close(held_root);
+        held_root = -1;
+    }
+    if (!unbrokered) {
+        struct rlimit limit;
+        long top = getrlimit(RLIMIT_NOFILE, &limit) == 0 ? (long) (limit.rlim_cur > (1u << 20) ? (1u << 20) : limit.rlim_cur) : 0;
+        for (unsigned i = 0; i < options->limit_count; i++) {
+            if (options->limits[i].resource == RLIMIT_NOFILE && (long) options->limits[i].value < top) {
+                top = (long) options->limits[i].value;
+            }
+        }
+        long base = top - HELD_MAX;
+        int clear = base >= 128 && broker_fd < base;
+        for (unsigned i = 0; clear && i < options->sealed_count; i++) clear = options->sealed_fds[i] < base;
+        if (clear) held_root = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (held_root >= 0 && held_root < base) held_base = (int) base;
+    }
     filter_broker = broker_fd;
     ioctl_allow = options->ioctl_allow;
     ioctl_allow_count = options->ioctl_allow_count;
@@ -2794,6 +3122,7 @@ long sbx_list_stat(int dir_fd, void *buffer, size_t size) {
     if (!locked || broker < 0) return -EPERM;
     if (dir_fd < 0) return -EBADF;
     if (buffer == NULL) return -EFAULT;
+    if (held_slot(dir_fd)) return -EOPNOTSUPP;  /* a folder held by path (sbx.h, sbx_policy_set_folders_by_path) */
     size_t asked = size < SBX_LIST_MAX ? size : SBX_LIST_MAX;
     return forward(SBX_LIST_STAT, dir_fd, ".", 0, NULL, 0, (uint32_t) asked, buffer, asked);
 }

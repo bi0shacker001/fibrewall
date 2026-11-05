@@ -591,7 +591,7 @@ int main(int argc, char **argv) {
     if (area("paths")) {
         sealed_failures |= pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() |
                            einval_drop_check() | watch_check() | unbrokered_check() | passthrough_check() | list_check() |
-                           perf_check();
+                           perf_check() | folders_check(0) | folders_check(1);
     }
     if (area("net")) {
         sealed_failures |= unix_check() | inet_check() |

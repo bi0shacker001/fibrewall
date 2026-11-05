@@ -115,6 +115,7 @@ struct sbx_policy {
     struct gpu_proxy *gpu;  /* sbx_policy_add_gpu_proxy */
     void (*attached_free)(void *);
     int refs;           /* the host's, plus one per broker thread that outlives a request (accept, relays) */
+    int folders_by_path;  /* sbx_policy_set_folders_by_path */
 };
 
 static void default_audit(void *context, const struct sbx_access *access, int result) {
@@ -332,6 +333,10 @@ void sbx_policy_set_decider(struct sbx_policy *policy, sbx_decide_fn decide, voi
     if (!policy) return;
     policy->decide = decide;
     policy->decide_context = context;
+}
+
+void sbx_policy_set_folders_by_path(struct sbx_policy *policy, int on) {
+    if (policy) policy->folders_by_path = on != 0;
 }
 
 void sbx_policy_set_audit(struct sbx_policy *policy, sbx_audit_fn audit, void *context) {
@@ -1069,6 +1074,25 @@ static int readable_path_handle(const struct check *c, int fd) {
 static void handle_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
                        const char *path2, const char *base, const char *base2, pid_t pid, int answer);
 
+/*
+ * The reply to an open or chdir that succeeded. A folder, when the handler
+ * can hold one by its path (want_folder), is answered 1 with that path, as
+ * the process names it, and its descriptor unless the policy keeps folders'
+ * descriptors back: an Android isolated process is refused any folder
+ * descriptor its app sends it (SELinux checks file_receive), and holds the
+ * path instead (Droidtop/tracker#741).
+ */
+static void reply_opened(const struct sbx_policy *policy, const struct sbx_request *request, int fd, int answer) {
+    struct stat st;
+    char name[SBX_PATH_MAX];
+    if (request->want_folder && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && fd_path(fd, name) == 0 &&
+        name[0] == '/' && unapply_alias(policy, name) == 0) {
+        reply(answer, 1, name, (uint32_t) strlen(name) + 1, policy->folders_by_path ? -1 : fd);
+        return;
+    }
+    reply(answer, 0, NULL, 0, fd);
+}
+
 /* Serves one path request; one that may have changed a folder empties the parent cache after it. */
 static void handle(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
                    const char *path2, const char *base, const char *base2, pid_t pid, int answer) {
@@ -1113,7 +1137,7 @@ static void handle_one(const struct sbx_policy *policy, const struct sbx_request
             int current = fcntl(fd, F_GETFL);
             if (current >= 0) fcntl(fd, F_SETFL, current & ~O_NONBLOCK);
         }
-        reply(answer, 0, NULL, 0, fd);
+        reply_opened(policy, request, fd, answer);
         close(fd);
         return;
     }
@@ -1122,7 +1146,7 @@ static void handle_one(const struct sbx_policy *policy, const struct sbx_request
         if (error != 0) break;
         int fd = open_decided(&c, O_PATH | O_DIRECTORY, 0, LOOKUP);
         if (fd < 0) { error = fd; break; }
-        reply(answer, 0, NULL, 0, fd);
+        reply_opened(policy, request, fd, answer);
         close(fd);
         return;
     }
@@ -1418,8 +1442,40 @@ static void list_stat_one(const struct sbx_policy *policy, const struct sbx_requ
     reply(answer, (int64_t) used, out, (uint32_t) used, -1);
 }
 
-static void list_one(const struct sbx_policy *policy, const struct sbx_request *request, int *fds, pid_t pid,
-                     int answer) {
+/* SBX_LIST of a folder the process holds by path: decided as an open for reading, read from the position it names. */
+static void list_by_path(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                         pid_t pid, int answer) {
+    if (body[0] != '/' || request->path2_len != sizeof(int64_t)) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    struct check c;
+    c.policy = policy;
+    c.op = request->op;
+    c.pid = pid;
+    c.tid = request->tid;
+    c.flags = 0;
+    int error = decide(&c, "/", body, request->path_len, SBX_READ, 1, 0);
+    if (error != 0) { reply(answer, error, NULL, 0, -1); return; }
+    int dir = open_decided(&c, O_RDONLY | O_DIRECTORY, 0, SBX_READ);
+    if (dir < 0) { reply(answer, dir, NULL, 0, -1); return; }
+    int64_t position;
+    memcpy(&position, body + request->path_len, sizeof(position));
+    static __thread char records[SBX_LIST_MAX];
+    size_t asked = request->mode < SBX_LIST_MAX ? request->mode : SBX_LIST_MAX;
+    long n = lseek(dir, (off_t) position, SEEK_SET) < 0 ? -1 : syscall(__NR_getdents64, dir, records, asked);
+    error = n < 0 ? -errno : 0;
+    close(dir);
+    if (n < 0) { reply(answer, error, NULL, 0, -1); return; }
+    reply(answer, n, records, (uint32_t) n, -1);
+}
+
+static void list_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body, int *fds,
+                     pid_t pid, int answer) {
+    if (!request->dirfd_sent) {
+        list_by_path(policy, request, body, pid, answer);
+        return;
+    }
     char base[SBX_PATH_MAX];
     if (!request->dirfd_sent || request->path_len != 1 || fd_path(fds[1], base) != 0 || base[0] != '/') {
         reply(answer, -EBADF, NULL, 0, -1);
@@ -2810,6 +2866,7 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         request->path2_len != (named2 ? request->path2_len
                                : request->op == SBX_UTIMENS ? (request->path2_len ? 2 * sizeof(struct timespec) : 0)
                                : request->op == SBX_TRUNCATE ? sizeof(int64_t)
+                               : request->op == SBX_LIST && !request->dirfd_sent ? sizeof(int64_t)
                                : 0) ||
         (named2 && request->path2_len == 0)) {
         reply(answer, -EINVAL, NULL, 0, -1);
@@ -2829,7 +2886,7 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         return;
     }
     if (request->op == SBX_LIST) {
-        list_one(policy, request, fds, pid, answer);
+        list_one(policy, request, body, fds, pid, answer);
         return;
     }
     if (request->op == SBX_LIST_STAT) {

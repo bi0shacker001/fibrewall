@@ -941,3 +941,155 @@ static int perf_check(void) {
     if (outside_fd >= 0) close(outside_fd);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
+
+/* ---- Folders held by path (Droidtop/tracker#741): an isolated process is refused folder descriptors. ---- */
+
+static int count_entries(DIR *dir, int *saw_sub) {
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        if (strcmp(e->d_name, "sub") == 0 && saw_sub) *saw_sub = 1;
+        n++;
+    }
+    return n;
+}
+
+/*
+ * With sbx_policy_set_folders_by_path the broker answers a folder's open
+ * with its path and no descriptor, as Android's SELinux leaves an isolated
+ * process: every folder call is then the handler's, by that path. Run
+ * brokered and in passthrough (the folder claimed).
+ */
+static int folders_check(int pass) {
+    const char *mode = pass ? "folders by path (passthrough)" : "folders by path";
+    char tree[400], sub[500], hidden[500], path[600], what[200];
+    snprintf(tree, sizeof(tree), "%s/held-%d", root, pass);
+    snprintf(sub, sizeof(sub), "%s/sub", tree);
+    snprintf(hidden, sizeof(hidden), "%s/hidden", tree);
+    mkdir(tree, 0755);
+    mkdir(sub, 0755);
+    mkdir(hidden, 0755);
+    for (int i = 0; i < 300; i++) {
+        snprintf(path, sizeof(path), "%s/file-with-a-longish-name-%03d", tree, i);
+        write_file(path, "x");
+    }
+    snprintf(path, sizeof(path), "%s/first", tree);
+    write_file(path, "first file");
+    struct stat tree_st;
+    if (stat(tree, &tree_st) != 0) return 1;
+
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) return 1;
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, tree, SBX_READ | SBX_WRITE);
+    sbx_policy_add(policy, hidden, SBX_DENY);
+    sbx_policy_set_folders_by_path(policy, 1);
+    if (sbx_broker_prepare(pair[0]) != 0 || sbx_broker_start(policy, pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(60);
+        close(pair[0]);
+        const char *claims[] = {tree};
+        struct sbx_lockdown_options options = {.flags = pass ? SBX_LOCK_PASSTHROUGH : 0, .claims = claims,
+                                               .claim_count = pass ? 1 : 0};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        snprintf(what, sizeof(what), "%s: lockdown", mode);
+        EXPECT(locked == 0, what);
+        if (locked != 0) _exit(1);
+
+        int fd = open(tree, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        snprintf(what, sizeof(what), "%s: a folder's open answers a descriptor, not EIO", mode);
+        EXPECT(fd >= 0, what);
+        if (fd < 0) _exit(1);
+        struct stat st;
+        snprintf(what, sizeof(what), "%s: fstat names the folder itself (its inode, a directory)", mode);
+        EXPECT(fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && st.st_ino == tree_st.st_ino && st.st_dev == tree_st.st_dev, what);
+        char link[64], target[600];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n >= 0) target[n] = '\0';
+        snprintf(what, sizeof(what), "%s: readlink of /proc/self/fd/<it> is the folder's path (realpath reads it)", mode);
+        EXPECT(n > 0 && strcmp(target, tree) == 0, what);
+
+        /* readdir, over several requests (301 entries and sub), then again after a rewind. */
+        int dup_fd = dup(fd);
+        DIR *dir = fdopendir(fd);
+        int saw_sub = 0;
+        int entries = dir ? count_entries(dir, &saw_sub) : -1;
+        snprintf(what, sizeof(what), "%s: readdir lists every entry, over several requests", mode);
+        EXPECT(entries == 303 && saw_sub, what);
+        if (dir) rewinddir(dir);
+        entries = dir ? count_entries(dir, NULL) : -1;
+        snprintf(what, sizeof(what), "%s: and again after rewinddir", mode);
+        EXPECT(entries == 303, what);
+
+        /* Calls relative to it, and fchdir. */
+        int file = dir ? openat(dirfd(dir), "first", O_RDONLY | O_CLOEXEC) : -1;
+        char word[32] = {0};
+        snprintf(what, sizeof(what), "%s: openat relative to it opens the file in the folder", mode);
+        EXPECT(file >= 0 && read(file, word, sizeof(word) - 1) == 10 && strcmp(word, "first file") == 0, what);
+        if (file >= 0) close(file);
+        snprintf(what, sizeof(what), "%s: fstatat relative to it", mode);
+        EXPECT(dir && fstatat(dirfd(dir), "sub", &st, 0) == 0 && S_ISDIR(st.st_mode), what);
+        snprintf(what, sizeof(what), "%s: mkdirat relative to it makes the folder where it belongs", mode);
+        EXPECT(dir && mkdirat(dirfd(dir), "made", 0700) == 0, what);
+        snprintf(what, sizeof(what), "%s: a folder under a deny rule stays refused, relative to it", mode);
+        EXPECT(dir && openat(dirfd(dir), "hidden", O_RDONLY | O_DIRECTORY | O_CLOEXEC) < 0 && errno == EACCES, what);
+        static char records[1024];
+        snprintf(what, sizeof(what), "%s: sbx_list_stat answers EOPNOTSUPP on it", mode);
+        EXPECT(dir && sbx_list_stat(dirfd(dir), records, sizeof(records)) == -EOPNOTSUPP, what);
+        snprintf(what, sizeof(what), "%s: it cannot be duplicated out of the range", mode);
+        EXPECT(dir && dup3(dirfd(dir), 50, O_CLOEXEC) < 0 && errno == EBADF, what);
+        int held_number = dir ? dirfd(dir) : -1;
+        if (dir) closedir(dir);
+        snprintf(what, sizeof(what), "%s: closed, its descriptor is gone", mode);
+        EXPECT(fcntl(held_number, F_GETFD) < 0 && errno == EBADF, what);
+        snprintf(what, sizeof(what), "%s: a duplicate is a folder of its own, still listed after the original closed", mode);
+        DIR *again = dup_fd >= 0 ? fdopendir(dup_fd) : NULL;
+        EXPECT(again && count_entries(again, NULL) == 304, what);  /* with "made" */
+        if (again) {
+            snprintf(what, sizeof(what), "%s: fchdir to it; a relative open and getcwd go by its path", mode);
+            char cwd[600];
+            int ok = fchdir(dirfd(again)) == 0;
+            int rel = ok ? open("first", O_RDONLY | O_CLOEXEC) : -1;
+            EXPECT(ok && rel >= 0 && getcwd(cwd, sizeof(cwd)) && strcmp(cwd, tree) == 0, what);
+            if (rel >= 0) close(rel);
+            closedir(again);
+        }
+        snprintf(what, sizeof(what), "%s: chdir by name to a folder held by path, then up and back", mode);
+        char cwd[600];
+        EXPECT(chdir(sub) == 0 && getcwd(cwd, sizeof(cwd)) && strcmp(cwd, sub) == 0 && chdir("..") == 0 &&
+               getcwd(cwd, sizeof(cwd)) && strcmp(cwd, tree) == 0, what);
+        snprintf(what, sizeof(what), "%s: a folder under a deny rule is refused", mode);
+        EXPECT(open(hidden, O_RDONLY | O_DIRECTORY | O_CLOEXEC) < 0 && errno == EACCES, what);
+
+        /* The range is finite: past it an open fails EMFILE, and closing frees it. */
+        int many[80], opened = 0, last_error = 0;
+        for (int i = 0; i < 80; i++) {
+            many[i] = open(sub, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (many[i] >= 0) opened++;
+            else last_error = errno;
+        }
+        snprintf(what, sizeof(what), "%s: at most 64 at once (one is the current directory), then EMFILE", mode);
+        EXPECT(opened == 63 && last_error == EMFILE, what);
+        for (int i = 0; i < 80; i++) {
+            if (many[i] >= 0) close(many[i]);
+        }
+        int one = open(sub, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        snprintf(what, sizeof(what), "%s: closed, the range is free again", mode);
+        EXPECT(one >= 0, what);
+        if (one >= 0) close(one);
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    struct stat made;
+    snprintf(path, sizeof(path), "%s/made", tree);
+    snprintf(what, sizeof(what), "%s: the folder made relative to it is there", mode);
+    EXPECT(stat(path, &made) == 0 && S_ISDIR(made.st_mode), what);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}

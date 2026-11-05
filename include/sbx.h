@@ -814,6 +814,29 @@ typedef void (*sbx_audit_fn)(void *context, const struct sbx_access *access, int
 void sbx_policy_set_audit(struct sbx_policy *policy, sbx_audit_fn audit, void *context);
 
 /*
+ * Folders by path (Droidtop/tracker#741). A confined process that opens a
+ * folder through the broker normally receives the folder's descriptor. An
+ * Android isolated process is refused any folder descriptor its app sends
+ * it (SELinux checks file_receive on the receiver), so its handler holds
+ * such a folder by path instead: it answers the open with a placeholder
+ * descriptor from a small range at the top of the process's descriptor
+ * limit and keeps the folder's path for it. getdents64 (readdir), fstat,
+ * fchdir, lseek, the *at calls relative to it and readlink of
+ * /proc/self/fd/<it> then go by that path, decided by the rules as any path
+ * is; close, dup and fcntl on the range are the handler's, so an entry
+ * never outlives its descriptor. The handler does this whenever a folder's
+ * descriptor does not arrive. With on, the broker does not send folders'
+ * descriptors at all (the denial is then never logged); regular files
+ * cross as before.
+ *
+ * Not by path: sbx_list_stat on such a folder (-EOPNOTSUPP), a relative
+ * Unix socket address or inotify mark from such a current directory
+ * (-EOPNOTSUPP), and a placeholder is always close-on-exec. An exec from such
+ * a current directory starts the new program in "/".
+ */
+void sbx_policy_set_folders_by_path(struct sbx_policy *policy, int on);
+
+/*
  * Serves fd, the broker's end of the socket sbx_lockdown() was given,
  * until the other end closes it; then closes fd and frees the policy.
  * Call sbx_broker_prepare(fd) before the confined side can send anything.
