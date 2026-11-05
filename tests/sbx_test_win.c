@@ -744,6 +744,31 @@ static int import_names(const wchar_t *path, char names[][64], int count, int ma
     return count;
 }
 
+static void print_streams(const wchar_t *path, const char *name8) {
+    WIN32_FIND_STREAM_DATA stream;
+    HANDLE search = FindFirstStreamW(path, FindStreamInfoStandard, &stream, 0);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        char stream8[MAX_PATH * 3];
+        to_utf8(stream8, sizeof(stream8), stream.cStreamName);
+        printf("info dll stream: %s %s (%lld bytes)\n", name8, stream8, (long long) stream.StreamSize.QuadPart);
+    } while (FindNextStreamW(search, &stream));
+    FindClose(search);
+}
+
+static int copy_bytes(const wchar_t *from, const wchar_t *to) {
+    HANDLE in = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (in == INVALID_HANDLE_VALUE) return 0;
+    HANDLE out = CreateFileW(to, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok = out != INVALID_HANDLE_VALUE;
+    static char buffer[65536];
+    DWORD got = 0, put = 0;
+    while (ok && ReadFile(in, buffer, sizeof(buffer), &got, NULL) && got) ok = WriteFile(out, buffer, got, &put, NULL) && put == got;
+    CloseHandle(in);
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    return ok;
+}
+
 static void dll_probe(int less) {
     wchar_t pattern[MAX_PATH];
     swprintf(pattern, MAX_PATH, L"%ls\\*.dll", python_dir);
@@ -759,7 +784,24 @@ static void dll_probe(int less) {
         to_utf8(dll8, sizeof(dll8), dll);
         to_utf8(name8, sizeof(name8), found.cFileName);
         print_sddl(dll, name8);
-        probe_one(dll8, less);
+        int code = probe_one(dll8, less);
+        print_streams(dll, name8);
+        /* A copy made byte by byte carries the same contents (and signature) but none of the file's
+           streams or extended attributes: whether it loads says which of the two is refused. */
+        if (code > 0 && (code & 0xffff)) {
+            wchar_t copy[MAX_PATH];
+            swprintf(copy, MAX_PATH, L"%ls\\dll-copy", exe_dir);
+            CreateDirectoryW(copy, NULL);
+            swprintf(copy, MAX_PATH, L"%ls\\dll-copy\\%ls", exe_dir, found.cFileName);
+            if (copy_bytes(dll, copy)) {
+                char copy8[MAX_PATH * 3];
+                to_utf8(copy8, sizeof(copy8), copy);
+                probe_one(copy8, less);
+                DeleteFileW(copy);
+            }
+            *wcsrchr(copy, L'\\') = 0;
+            RemoveDirectoryW(copy);
+        }
         import_count = import_names(dll, imports, import_count, 96);
     } while (FindNextFileW(search, &found));
     FindClose(search);
