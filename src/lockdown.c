@@ -2069,11 +2069,38 @@ static void net_filter_rules(void) {
     rule(__NR_close_range, NOSYS);
 }
 
-static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
-    filter_length = 0;
-    int learn = (flags & SBX_LOCK_LEARN) != 0;
-    refuse_action = learn ? LEARN_EACCES : REFUSE_ALWAYS;
-    deny_action = learn ? LEARN_EPERM : DENY_ALWAYS;
+/*
+ * A block that applies to one system call: block_begin emits "if the call
+ * is not nr, skip the block" and block_end aims that skip past whatever the
+ * block emitted, so no skip is counted by hand (#767). Every path through a
+ * block returns, or reloads the call number, so the accumulator holds nr
+ * again for the rules after it.
+ */
+static unsigned short block_begin(unsigned nr) {
+    unsigned short at = filter_length;
+    jeq(nr, 0, 0);
+    return at;
+}
+
+static void block_end(unsigned short at) {
+    unsigned skip = (unsigned) (filter_length - at - 1);
+    if (at < FILTER_MAX) filter[at].jf = (unsigned char) (skip > 255 ? 255 : skip);
+    if (skip > 255) filter_length = FILTER_MAX + 1;  /* too far for a BPF jump: the build fails with E2BIG */
+}
+
+/* The call is allowed only when made from the gateway at trampoline_after(); the rest of the block decides otherwise. */
+static void from_gateway_then(unsigned otherwise) {
+    uint64_t after = (uint64_t) trampoline_after();
+    load(offsetof(struct seccomp_data, instruction_pointer));
+    jeq((unsigned) after, 0, 3);
+    load(offsetof(struct seccomp_data, instruction_pointer) + 4);
+    jeq((unsigned) (after >> 32), 0, 1);
+    ret(ALLOW);
+    ret(otherwise);
+}
+
+/* The architecture, the x32 bit, and the calls only the library's own code makes: exec's probe and run, learning's. */
+static void emit_entry(unsigned flags) {
     load(offsetof(struct seccomp_data, arch));
     jeq(SBX_ARCH, 1, 0);
     ret(REFUSE_ALWAYS);
@@ -2085,17 +2112,18 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
 #endif
     if (flags & SBX_LOCK_EXEC) {
         /* The adoption probe (sbx_adopt): proof, in an image sbx-exec started, that this filter is in place. */
-        jeq(__NR_prctl, 0, 3);
+        unsigned short probe = block_begin(__NR_prctl);
         load(ARG_LO(0));
         jeq(SBX_EXEC_PROBE, 0, 1);
         ret(SECCOMP_RET_ERRNO | ENOTRECOVERABLE);
         load(offsetof(struct seccomp_data, nr));
+        block_end(probe);
         /*
          * The handler's run of sbx-exec: execveat(fd, "", ..., AT_EMPTY_PATH)
          * through the trampoline. Every other exec traps (exec_call).
          */
         uint64_t after = (uint64_t) trampoline_after();
-        jeq(__NR_execveat, 0, 7);
+        unsigned short run = block_begin(__NR_execveat);
         load(offsetof(struct seccomp_data, instruction_pointer));
         jeq((unsigned) after, 0, 5);
         load(offsetof(struct seccomp_data, instruction_pointer) + 4);
@@ -2104,8 +2132,9 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, AT_EMPTY_PATH, 0, 1));
         ret(ALLOW);
         load(offsetof(struct seccomp_data, nr));
+        block_end(run);
     }
-    if (learn) {
+    if (flags & SBX_LOCK_LEARN) {
         /*
          * The learning handler makes a recorded call through its own
          * trampoline, which only a learning filter lets through: anything
@@ -2119,6 +2148,24 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         ret(ALLOW);
         load(offsetof(struct seccomp_data, nr));
     }
+}
+
+/* utimensat(fd, NULL, ...) is futimens, on a descriptor, any code's; with a path it is a path call: then otherwise. */
+static void emit_utimensat(unsigned with_path) {
+    unsigned short block = block_begin(__NR_utimensat);
+    load(ARG_LO(1));
+    jeq(0, 0, 3);
+    load(ARG_HI(1));
+    jeq(0, 0, 1);
+    ret(ALLOW);
+    if (with_path == ALLOW) ret(ALLOW);
+    else if (with_path == TRAP) ret(TRAP);
+    else from_gateway_then(TRAP);  /* passthrough: the handler's own call, by its address (review A-06) */
+    block_end(block);
+}
+
+/* Calls that name a path: to the broker, to the handler's gateway in passthrough, refused, or the kernel's. */
+static void emit_paths(unsigned flags) {
     int unbrokered = (flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (flags & SBX_LOCK_PASSTHROUGH) != 0;
     /* readlink of the process's own descriptor link is answered by the handler whenever it brokers paths (own_fd_link). */
@@ -2129,23 +2176,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
             __NR_fchmodat,
         };
         for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++) allow_from_gateway(one[i]);
-        /*
-         * utimensat: futimens (no path) is a descriptor call any code may make, so a null path is
-         * allowed whatever its caller; with a path it is a path op, allowed only from the handler's
-         * gateway (trampoline_after), not by a forgeable argument value (review A-06).
-         */
-        uint64_t utimens_after = (uint64_t) trampoline_after();
-        jeq(__NR_utimensat, 0, 10);
-        load(ARG_LO(1));
-        jeq(0, 0, 2);
-        load(ARG_HI(1));
-        jeq(0, 4, 0);
-        load(offsetof(struct seccomp_data, instruction_pointer));
-        jeq((unsigned) utimens_after, 0, 3);
-        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
-        jeq((unsigned) (utimens_after >> 32), 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
+        emit_utimensat(0);
         /* getdents64 names no path, but an isolated process may be refused a brokered folder's listing (list_directory). */
         allow_from_gateway(__NR_getdents64);
         allow_from_gateway(__NR_renameat2);
@@ -2153,7 +2184,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         allow_from_gateway(__NR_renameat);
 #endif
     }
-    /* Brokered. */
+    if (unbrokered) return;
     static const unsigned brokered[] = {
         __NR_openat, __NR_newfstatat, __NR_faccessat, __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
         __NR_unlinkat, __NR_renameat2, __NR_statfs, __NR_chdir, __NR_fchdir, __NR_getcwd, __NR_fchmodat,
@@ -2165,30 +2196,44 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         __NR_rmdir, __NR_rename, __NR_chmod,
 #endif
     };
-    if (!unbrokered) {
-        for (size_t i = 0; i < sizeof(brokered) / sizeof(brokered[0]); i++) rule(brokered[i], TRAP);
-        /* Callers fall back to the brokered forms. */
-        rule(__NR_statx, NOSYS);
-        rule(__NR_openat2, NOSYS);
+    for (size_t i = 0; i < sizeof(brokered) / sizeof(brokered[0]); i++) rule(brokered[i], TRAP);
+    /* Callers fall back to the brokered forms. */
+    rule(__NR_statx, NOSYS);
+    rule(__NR_openat2, NOSYS);
 #ifdef __NR_fchmodat2
-        rule(__NR_fchmodat2, NOSYS);
+    rule(__NR_fchmodat2, NOSYS);
 #endif
+    if (pass) return;  /* the other path calls are the kernel's in passthrough */
+    emit_utimensat(TRAP);
+    /* link, symlink and truncate: to the broker with SBX_LOCK_PATHOPS, else refused. */
+    static const unsigned pathops[] = {
+        __NR_truncate, __NR_linkat, __NR_symlinkat,
+#ifdef __NR_link
+        __NR_link, __NR_symlink,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(pathops) / sizeof(pathops[0]); i++) {
+        rule(pathops[i], (flags & SBX_LOCK_PATHOPS) ? TRAP : REFUSE);
     }
-    if (!unbrokered && !pass) {
-        /* utimensat(fd, NULL, ...) is futimens, on a descriptor; with a path it goes to the broker. */
-        jeq(__NR_utimensat, 0, 6);
-        load(ARG_LO(1));
-        jeq(0, 0, 3);
-        load(ARG_HI(1));
-        jeq(0, 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
-    }
-    /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
-    rule(__NR_clone3, NOSYS);
+    /* inotify marks: to the broker with SBX_LOCK_WATCH, the kernel's with SBX_LOCK_INOTIFY, else refused. */
+    if (flags & SBX_LOCK_WATCH) rule(__NR_inotify_add_watch, TRAP);
+    else if (!(flags & SBX_LOCK_INOTIFY)) rule(__NR_inotify_add_watch, REFUSE);
+    static const unsigned refused_paths[] = {
+        __NR_mknodat, __NR_fchownat, __NR_fanotify_mark, __NR_name_to_handle_at, __NR_open_by_handle_at,
+        __NR_setxattr, __NR_lsetxattr, __NR_getxattr, __NR_lgetxattr, __NR_listxattr, __NR_llistxattr,
+        __NR_removexattr, __NR_lremovexattr,
+#ifdef __NR_open
+        __NR_mknod, __NR_chown, __NR_lchown, __NR_utime, __NR_utimes, __NR_futimesat, __NR_uselib,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) rule(refused_paths[i], REFUSE);
+}
+
+/* socket, connect, bind, listen, accept: the brokered network's, SBX_LOCK_UNIX's, or the kernel's for the families allowed. */
+static void emit_sockets(unsigned flags) {
     if (flags & SBX_LOCK_NET_BROKERED) {
         /* Inet sockets are the broker's; Unix ones the process's own. connect and accept4 pass from the gateway only. */
-        jeq(__NR_socket, 0, 7);
+        unsigned short block = block_begin(__NR_socket);
         load(ARG_LO(0));
         jeq(AF_INET, 3, 0);
         jeq(AF_INET6, 2, 0);
@@ -2196,6 +2241,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         ret(ALLOW);
         ret(TRAP);
         ret(REFUSE);
+        block_end(block);
         if (flags & SBX_LOCK_NET_FILTER) {
             net_filter_rules();
         } else {
@@ -2207,6 +2253,7 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
 #ifdef __NR_accept
         rule(__NR_accept, TRAP);
 #endif
+        return;
     }
     if (flags & SBX_LOCK_UNIX) {
         /* The address is in memory the filter cannot read: the handler sends each to the broker. */
@@ -2214,12 +2261,10 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         rule(__NR_bind, TRAP);
     }
     /* A Unix datagram socket for the system log, or inet sockets, when asked; no other socket. */
-    if (flags & SBX_LOCK_NET_BROKERED) {
-        /* decided above */
-    } else if (flags & (SBX_LOCK_UNIX | SBX_LOCK_SOCKETS)) {
+    if (flags & (SBX_LOCK_UNIX | SBX_LOCK_SOCKETS)) {
         socket_rule(flags);
     } else if (flags & SBX_LOCK_LOG_SOCKET) {
-        jeq(__NR_socket, 0, 7);
+        unsigned short block = block_begin(__NR_socket);
         load(ARG_LO(0));
         jeq(AF_UNIX, 0, 4);
         load(ARG_LO(1));
@@ -2227,8 +2272,9 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         jeq(SOCK_DGRAM, 0, 1);
         ret(ALLOW);
         ret(REFUSE);
+        block_end(block);
     } else if (flags & SBX_LOCK_INET) {
-        jeq(__NR_socket, 0, 9);
+        unsigned short block = block_begin(__NR_socket);
         load(ARG_LO(0));
         jeq(AF_INET, 1, 0);
         jeq(AF_INET6, 0, 5);
@@ -2238,43 +2284,44 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         jeq(SOCK_DGRAM, 0, 1);
         ret(ALLOW);
         ret(REFUSE);
+        block_end(block);
     } else {
         rule(__NR_socket, REFUSE);
     }
-    /* No new namespaces through clone. */
-    jeq(__NR_clone, 0, 4);
+    /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
+    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_SOCKETS | SBX_LOCK_UNIX))) rule(__NR_connect, REFUSE);
+    if (!(flags & (SBX_LOCK_INET | SBX_LOCK_SOCKETS | SBX_LOCK_UNIX))) rule(__NR_bind, REFUSE);
+}
+
+/* clone without namespaces, the SIGSYS handler and mask kept ours, and signals to this process (or its tree) alone. */
+static void emit_process(unsigned flags, pid_t pid) {
+    /* clone3 takes its flags in memory a filter cannot read; callers fall back to clone, whose flags it can. */
+    rule(__NR_clone3, NOSYS);
+    unsigned short clone = block_begin(__NR_clone);
     load(ARG_LO(0));
     emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x7e020000u /* CLONE_NEW* */, 0, 1));
     ret(DENY_ALWAYS);  /* even learning: a clone made from the handler would run the child on its stack */
     ret(ALLOW);
-    if (!unbrokered) {
+    block_end(clone);
+    if (!(flags & SBX_LOCK_UNBROKERED)) {
         /*
          * The SIGSYS handler stays ours. Any other handler is installed by our
          * handler (sigaction_call), with SIGSYS left out of its mask, through
          * the trampoline, which is let through here for rt_sigaction alone.
+         * With SBX_LOCK_EXEC each new image installs its handler, through the
+         * trampoline (sbx-exec's, then libsbx_child.so's), so a SIGSYS handler
+         * is allowed there too; code that replaces ours only loses its own
+         * file access, as the filter still refuses what the handler would
+         * have forwarded.
          */
-        uint64_t after = (uint64_t) trampoline_after();
-        if (flags & SBX_LOCK_EXEC) {
-            /*
-             * Each new image installs its handler, through the trampoline
-             * (sbx-exec's, then libsbx_child.so's), so a SIGSYS handler is
-             * allowed there too. Code that replaces ours only loses its own
-             * file access: the filter still refuses what the handler would
-             * have forwarded.
-             */
-            jeq(__NR_rt_sigaction, 0, 6);
-        } else {
-            jeq(__NR_rt_sigaction, 0, 9);
+        unsigned short sigaction = block_begin(__NR_rt_sigaction);
+        if (!(flags & SBX_LOCK_EXEC)) {
             load(ARG_LO(0));
             jeq(SIGSYS, 0, 1);
             ret(DENY_ALWAYS);  /* even learning: without our handler nothing after it would be recorded */
         }
-        load(offsetof(struct seccomp_data, instruction_pointer));
-        jeq((unsigned) after, 0, 3);
-        load(offsetof(struct seccomp_data, instruction_pointer) + 4);
-        jeq((unsigned) (after >> 32), 0, 1);
-        ret(ALLOW);
-        ret(TRAP);
+        from_gateway_then(TRAP);
+        block_end(sigaction);
         /* And SIGSYS stays open on every thread: the handler makes the call (sigmask_call). */
         rule(__NR_rt_sigprocmask, TRAP);
     }
@@ -2286,8 +2333,12 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         own_process_only(__NR_tgkill, pid, otherwise);
         own_process_only(__NR_rt_sigqueueinfo, pid, otherwise);
         own_process_only(__NR_rt_tgsigqueueinfo, pid, otherwise);
-        if (flags & SBX_LOCK_SIGNAL_TREE) rule(__NR_tkill, TRAP);
+        rule(__NR_tkill, otherwise);
     }
+}
+
+/* ioctl: never the terminal-input pair, only the allowlist's requests when there is one; sealed descriptors unused. */
+static void emit_descriptors(const int *sealed, unsigned sealed_count) {
     /*
      * TIOCSTI and TIOCLINUX push bytes into the input queue of a terminal
      * the process inherited; a confined process could use either to plant a
@@ -2296,12 +2347,13 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
      * request as a 32-bit int, so match the low word alone: the high bits
      * are discarded and cannot be used to slip a request past this.
      */
-    jeq(__NR_ioctl, 0, 4);
+    unsigned short terminal = block_begin(__NR_ioctl);
     load(ARG_LO(1));
     jeq(TIOCSTI, 1, 0);
     jeq(TIOCLINUX, 0, 1);
     ret(DENY);
     load(offsetof(struct seccomp_data, nr));
+    block_end(terminal);
     /*
      * The ioctl allowlist (sbx_lockdown_options.ioctl_allow): a request not
      * listed is refused (recorded, when learning), on every descriptor. A
@@ -2309,11 +2361,12 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
      */
     if (ioctl_allow_count > 0) {
         unsigned n = ioctl_allow_count;
-        jeq(__NR_ioctl, 0, (unsigned char) (n + 3));
+        unsigned short allowlist = block_begin(__NR_ioctl);
         load(ARG_LO(1));
         for (unsigned k = 0; k < n; k++) jeq(ioctl_allow[k], (unsigned char) (n - k), 0);
         ret(DENY);
         load(offsetof(struct seccomp_data, nr));
+        block_end(allowlist);
     }
     /* Sealed descriptors: kept, but no longer used. */
     if (sealed_count > 0) {
@@ -2326,35 +2379,10 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
         sealed_block(__NR_dup2, 0, sealed, sealed_count);
 #endif
     }
-    /* Refused: other paths (the kernel's own checks decide them when there is no broker, and in passthrough). */
-    static const unsigned refused_paths[] = {
-        __NR_truncate, __NR_linkat, __NR_symlinkat, __NR_mknodat, __NR_fchownat,
-        __NR_inotify_add_watch, __NR_fanotify_mark, __NR_name_to_handle_at, __NR_open_by_handle_at,
-        __NR_setxattr, __NR_lsetxattr, __NR_getxattr, __NR_lgetxattr, __NR_listxattr, __NR_llistxattr,
-        __NR_removexattr, __NR_lremovexattr,
-#ifdef __NR_open
-        __NR_link, __NR_symlink, __NR_mknod, __NR_chown, __NR_lchown, __NR_utime, __NR_utimes,
-        __NR_futimesat, __NR_uselib,
-#endif
-    };
-    if (!unbrokered && !pass) {
-        /* SBX_LOCK_PATHOPS sends link, symlink and truncate to the broker; SBX_LOCK_INOTIFY lets marks through. */
-        static const unsigned pathops[] = {
-            __NR_truncate, __NR_linkat, __NR_symlinkat,
-#ifdef __NR_link
-            __NR_link, __NR_symlink,
-#endif
-        };
-        if (flags & SBX_LOCK_PATHOPS) {
-            for (size_t i = 0; i < sizeof(pathops) / sizeof(pathops[0]); i++) rule(pathops[i], TRAP);
-        }
-        /* SBX_LOCK_WATCH sends inotify marks to the broker. */
-        if (flags & SBX_LOCK_WATCH) rule(__NR_inotify_add_watch, TRAP);
-        for (size_t i = 0; i < sizeof(refused_paths) / sizeof(refused_paths[0]); i++) {
-            if (refused_paths[i] == __NR_inotify_add_watch && (flags & (SBX_LOCK_INOTIFY | SBX_LOCK_WATCH))) continue;
-            rule(refused_paths[i], REFUSE);
-        }
-    }
+}
+
+/* Reaching past the process: exec (the broker's with SBX_LOCK_EXEC), other processes, namespaces, the kernel's own surfaces. */
+static void emit_refusals(unsigned flags, pid_t pid) {
     /*
      * Reading its own memory reaches nothing past the process, and ART does
      * it: art::SafeCopy reads with process_vm_readv on getpid(), and
@@ -2366,30 +2394,33 @@ static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned s
      * other process's memory stays refused.
      */
     own_process_only(__NR_process_vm_readv, pid, REFUSE);
-    /* Refused: reaching past the process. */
+    rule(__NR_execve, (flags & SBX_LOCK_EXEC) ? TRAP : REFUSE);
+    rule(__NR_execveat, (flags & SBX_LOCK_EXEC) ? TRAP : REFUSE);
     static const unsigned refused[] = {
-        __NR_execve, __NR_execveat, __NR_ptrace, __NR_process_vm_writev,
-        __NR_process_madvise, __NR_bpf, __NR_perf_event_open, __NR_io_uring_setup, __NR_io_uring_enter,
-        __NR_io_uring_register,
+        __NR_ptrace, __NR_process_vm_writev, __NR_process_madvise, __NR_bpf, __NR_perf_event_open,
+        __NR_io_uring_setup, __NR_io_uring_enter, __NR_io_uring_register,
     };
-    if (flags & SBX_LOCK_EXEC) {
-        rule(__NR_execve, TRAP);
-        rule(__NR_execveat, TRAP);
-    }
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) rule(refused[i], REFUSE);
-    /* connect only when a socket can be made (the log's, or inet ones); bind only for inet ones, the only sockets then. */
-    if (!(flags & (SBX_LOCK_LOG_SOCKET | SBX_LOCK_INET | SBX_LOCK_NET_BROKERED | SBX_LOCK_SOCKETS))) rule(__NR_connect, REFUSE);
-    if (!(flags & (SBX_LOCK_INET | SBX_LOCK_NET_BROKERED | SBX_LOCK_SOCKETS))) rule(__NR_bind, REFUSE);
     static const unsigned denied[] = {
         __NR_unshare, __NR_setns, __NR_mount, __NR_umount2, __NR_pivot_root, __NR_chroot, __NR_open_tree,
         __NR_move_mount, __NR_fsopen, __NR_fsconfig, __NR_fsmount, __NR_fspick, __NR_mount_setattr,
         __NR_keyctl, __NR_add_key, __NR_request_key, __NR_kcmp, __NR_pidfd_open, __NR_pidfd_getfd,
-        __NR_pidfd_send_signal, __NR_tkill, __NR_init_module, __NR_finit_module, __NR_delete_module,
+        __NR_pidfd_send_signal, __NR_init_module, __NR_finit_module, __NR_delete_module,
     };
-    for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) {
-        if (denied[i] == __NR_tkill && (flags & (SBX_LOCK_SIGNALS | SBX_LOCK_SIGNAL_TREE))) continue;
-        rule(denied[i], DENY);
-    }
+    for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) rule(denied[i], DENY);
+}
+
+static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
+    filter_length = 0;
+    int learn = (flags & SBX_LOCK_LEARN) != 0;
+    refuse_action = learn ? LEARN_EACCES : REFUSE_ALWAYS;
+    deny_action = learn ? LEARN_EPERM : DENY_ALWAYS;
+    emit_entry(flags);
+    emit_paths(flags);
+    emit_sockets(flags);
+    emit_process(flags, pid);
+    emit_descriptors(sealed, sealed_count);
+    emit_refusals(flags, pid);
     ret(ALLOW);
     return filter_length <= FILTER_MAX ? 0 : -E2BIG;
 }
@@ -2416,38 +2447,67 @@ static void open_sigsys_in_handlers(void) {
  * thread's SigBlk line in /proc/self/task/<tid>/status. Answered before the
  * filter goes on; afterwards no thread can block it (sigmask_call).
  */
+/*
+ * Whether task tid (of this process) has SIGSYS blocked: 1, or 0 when it
+ * does not, has exited (Z, X: a joined thread can still be listed for a
+ * moment, with its last mask), or is gone. State comes before SigBlk.
+ */
+static int task_blocks_sigsys(const char *tid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/task/%s/status", tid);
+    FILE *status = fopen(path, "re");
+    if (!status) return 0;
+    char line[256];
+    int exited = 0, blocks = 0;
+    while (fgets(line, sizeof(line), status)) {
+        char state;
+        unsigned long long blocked;
+        if (sscanf(line, "State: %c", &state) == 1) {
+            exited = state == 'Z' || state == 'X';
+        } else if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
+            blocks = !exited && (blocked & SIGSYS_BIT) != 0;
+            break;
+        }
+    }
+    fclose(status);
+    return blocks;
+}
+
+/*
+ * Whether a thread that stays has SIGSYS blocked. The threads found
+ * blocked are each looked at again, alone, for up to 100 ms: on a slow
+ * machine a thread on its way out stays listed, not yet Z or X, for a
+ * while after pthread_join returns (the API 28 emulator failed at random
+ * without this wait), and nothing but time tells it from one that stays.
+ * Only a thread still blocked after that is a reason to refuse. No check
+ * can close the window between it and the filter's install: a thread that
+ * blocks SIGSYS in that window dies on its next trapped call (after the
+ * install, rt_sigprocmask traps and SIGSYS is always left open).
+ */
+#define BLOCKED_TASKS_MAX 64
 static int sigsys_blocked_somewhere(void) {
     DIR *tasks = opendir("/proc/self/task");
     if (!tasks) return 0;
-    int found = 0;
+    char blocked[BLOCKED_TASKS_MAX][16];
+    int count = 0, overflow = 0;
     struct dirent *entry;
-    while (!found && (entry = readdir(tasks)) != NULL) {
-        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
-        char path[sizeof("/proc/self/task//status") + sizeof(entry->d_name)];
-        snprintf(path, sizeof(path), "/proc/self/task/%s/status", entry->d_name);
-        FILE *status = fopen(path, "re");
-        if (!status) continue;
-        /*
-         * A thread that has exited (Z, X) can still be listed for a moment
-         * after pthread_join returns, with its last mask; it makes no calls.
-         * State comes before SigBlk in the file.
-         */
-        char line[256];
-        int exited = 0;
-        while (fgets(line, sizeof(line), status)) {
-            char state;
-            unsigned long long blocked;
-            if (sscanf(line, "State: %c", &state) == 1) {
-                exited = state == 'Z' || state == 'X';
-            } else if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
-                found = !exited && (blocked & SIGSYS_BIT) != 0;
-                break;
-            }
-        }
-        fclose(status);
+    while ((entry = readdir(tasks)) != NULL) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9' || strlen(entry->d_name) >= sizeof(blocked[0])) continue;
+        if (!task_blocks_sigsys(entry->d_name)) continue;
+        if (count < BLOCKED_TASKS_MAX) strcpy(blocked[count++], entry->d_name);
+        else overflow = 1;
     }
     closedir(tasks);
-    return found;
+    if (overflow) return 1;
+    for (int waited = 0; count > 0 && waited < 20; waited++) {
+        usleep(5000);
+        int still = 0;
+        for (int i = 0; i < count; i++) {
+            if (task_blocks_sigsys(blocked[i])) memmove(blocked[still++], blocked[i], sizeof(blocked[0]));
+        }
+        count = still;
+    }
+    return count > 0;
 }
 
 /*
@@ -2464,14 +2524,14 @@ static int apply_limits(const struct sbx_lockdown_options *options) {
     return 0;
 }
 
-int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
-    if (locked) return -EALREADY;
-    struct sbx_lockdown_options none = {.flags = 0};
-    if (!options) options = &none;
+/*
+ * Every combination of flags and options sbx_lockdown refuses, in one place
+ * (#767): 0, -EINVAL or -EBADF. Nothing is installed when this fails.
+ */
+static int validate_options(int broker_fd, const struct sbx_lockdown_options *options) {
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
     int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
     if (unbrokered && pass) return -EINVAL;
-    unsigned install = SECCOMP_FILTER_FLAG_TSYNC | ((options->flags & SBX_LOCK_AUDIT) ? SECCOMP_FILTER_FLAG_LOG : 0);
     /* Learning sends every record to the broker. */
     if ((options->flags & SBX_LOCK_LEARN) && unbrokered) return -EINVAL;
     /* With SBX_LOCK_UNIX, bind goes to the broker, so the log's Unix socket can no longer take a name unseen. */
@@ -2500,8 +2560,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
                  options->child_library[0] != '/' || strnlen(options->child_library, SBX_PATH_MAX) == SBX_PATH_MAX)) {
         return -EINVAL;
     }
-    if (unbrokered) broker_fd = -1;
-    else if (broker_fd < 0) return -EBADF;
+    if (!unbrokered && broker_fd < 0) return -EBADF;
     if (options->claim_count > SBX_CLAIMS_MAX || (options->claim_count && !options->claims)) return -EINVAL;
     for (unsigned k = 0; k < options->claim_count; k++) {
         const char *claim = options->claims[k];
@@ -2512,23 +2571,24 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (options->limit_count > SBX_LIMITS_MAX || (options->limit_count && !options->limits)) return -EINVAL;
     if (options->ioctl_allow_count > SBX_IOCTL_ALLOW_MAX || (options->ioctl_allow_count && !options->ioctl_allow)) return -EINVAL;
     for (unsigned k = 0; k < options->sealed_count; k++) {
-        if (options->sealed_fds[k] < 0 || options->sealed_fds[k] == broker_fd) return -EINVAL;
+        if (options->sealed_fds[k] < 0 || (!unbrokered && options->sealed_fds[k] == broker_fd)) return -EINVAL;
     }
+    return 0;
+}
+
+int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
+    if (locked) return -EALREADY;
+    struct sbx_lockdown_options none = {.flags = 0};
+    if (!options) options = &none;
+    int invalid = validate_options(broker_fd, options);
+    if (invalid != 0) return invalid;
+    int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
+    int pass = (options->flags & SBX_LOCK_PASSTHROUGH) != 0;
+    int exec = (options->flags & SBX_LOCK_EXEC) != 0;
+    unsigned install = SECCOMP_FILTER_FLAG_TSYNC | ((options->flags & SBX_LOCK_AUDIT) ? SECCOMP_FILTER_FLAG_LOG : 0);
+    if (unbrokered) broker_fd = -1;
     /* A thread that has SIGSYS blocked would kill the process on its first trapped call. */
-    if (!unbrokered) {
-        /*
-         * A thread on its way out can still be listed with its last mask, in
-         * a state that is not yet Z or X, for a while after pthread_join on a
-         * slow machine (the API 28 emulator failed this way at random).
-         * Only a thread that stays blocked is a reason to refuse.
-         */
-        int blocked = sigsys_blocked_somewhere();
-        for (int tries = 0; blocked && tries < 20; tries++) {
-            usleep(5000);
-            blocked = sigsys_blocked_somewhere();
-        }
-        if (blocked) return -EDEADLK;
-    }
+    if (!unbrokered && sigsys_blocked_somewhere()) return -EDEADLK;
     /* So would a handler whose mask blocks it, for any trapped call made while it runs. */
     if (!unbrokered) open_sigsys_in_handlers();
     int helper = -1;
