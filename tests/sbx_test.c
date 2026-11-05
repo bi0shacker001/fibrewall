@@ -2040,6 +2040,46 @@ static int listen_check(const char *self) {
         EXPECT(code == 127, "listen: with the wrong token it ends before main (127)");
         failed |= code != 127;
     }
+    /*
+     * #767: a peer that connects and never greets is dropped after the
+     * greeting timeout, and connections past the listener's cap are closed
+     * at once, so neither can park the broker's threads. The control: a
+     * proper attach still works afterwards.
+     */
+    enum { SILENT = 70, CAP = 64 };
+    int silent[SILENT];
+    struct sockaddr_un at;
+    memset(&at, 0, sizeof(at));
+    at.sun_family = AF_UNIX;
+    size_t path_length = strlen(broker_path);
+    if (path_length >= sizeof(at.sun_path)) path_length = sizeof(at.sun_path) - 1;
+    memcpy(at.sun_path, broker_path, path_length);
+    int connected = 0;
+    for (int i = 0; i < SILENT; i++) {
+        silent[i] = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        if (silent[i] >= 0 && connect(silent[i], (struct sockaddr *) &at, sizeof(at)) == 0) connected++;
+    }
+    usleep(500 * 1000);
+    int dropped_now = 0;
+    char byte;
+    for (int i = 0; i < SILENT; i++) {
+        if (silent[i] >= 0 && recv(silent[i], &byte, 1, MSG_DONTWAIT) == 0) dropped_now++;
+    }
+    EXPECT(connected == SILENT && dropped_now >= SILENT - CAP && dropped_now < SILENT,
+           "listen: connections past the listener's cap are closed at once (#767)");
+    int dropped_later = 0;
+    for (int i = 0; i < SILENT; i++) {
+        struct timeval wait = {.tv_sec = 9};
+        if (silent[i] >= 0) setsockopt(silent[i], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+        if (silent[i] >= 0 && recv(silent[i], &byte, 1, 0) == 0) dropped_later++;
+        if (silent[i] >= 0) close(silent[i]);
+    }
+    EXPECT(dropped_later == SILENT, "listen: a connection that never greets is dropped after the greeting timeout (#767)");
+    fflush(stdout);
+    pid_t again = fork();
+    if (again == 0) _exit(sbx_attach(broker_path, TEST_TOKEN, NULL) == 0 ? 0 : 1);
+    waitpid(again, &status, 0);
+    EXPECT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "listen: afterwards, a proper attach still works");
     sbx_listener_close(listener);
     EXPECT(access(broker_path, F_OK) != 0, "listen: closing removes the socket");
     return failed || failures;

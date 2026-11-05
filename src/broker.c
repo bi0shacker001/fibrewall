@@ -120,6 +120,18 @@ static void default_audit(void *context, const struct sbx_access *access, int re
             access->resolved[0] ? access->resolved : "unresolved", strerror(-result));
 }
 
+/* Starts fn(argument) on a detached thread: 0, or a negative errno. The one way the broker starts a thread. */
+static int start_detached(void *(*fn)(void *), void *argument) {
+    pthread_attr_t attributes;
+    int error = pthread_attr_init(&attributes);
+    if (error != 0) return -error;
+    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    error = pthread_create(&thread, &attributes, fn, argument);
+    pthread_attr_destroy(&attributes);
+    return -error;
+}
+
 /*
  * Parking (sbx.h, SBX_PARK): a decider that would block -- it has to ask a
  * person -- answers SBX_PARK on the serve thread. The request's reply and
@@ -1713,14 +1725,9 @@ static void net_wait_launch(struct net_wait *w, int answer, struct conn_budget *
         goto undo;
     }
     w->budget = budget;
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    int error = pthread_create(&thread, &attributes, net_wait_thread, w);
-    pthread_attr_destroy(&attributes);
+    int error = start_detached(net_wait_thread, w);
     if (error == 0) return;
-    if (answer >= 0) reply(answer, -error, NULL, 0, -1);
+    if (answer >= 0) reply(answer, error, NULL, 0, -1);
     net_wait_unreserve(budget);
 undo:
     net_wait_free(w);
@@ -2708,13 +2715,7 @@ static void serve_request(const struct sbx_policy *policy, const struct sbx_requ
         p->body = copy;
         p->body_len = body_len;
         p->pid = pid;
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-        pthread_t thread;
-        int error = pthread_create(&thread, &attributes, parked_serve, p);
-        pthread_attr_destroy(&attributes);
-        if (error == 0) return;
+        if (start_detached(parked_serve, p) == 0) return;
         policy_release(policy);
         net_wait_unreserve(budget);
     }
@@ -2825,15 +2826,32 @@ struct sbx_listener {
     char token[TOKEN_MAX];
     size_t token_length;
     char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
-    int users;   /* the listener itself and each connection; the last one out frees it all */
+    int users;   /* the accept thread, sbx_listener_close and each connection; the last one out frees it all */
     int closing;
+    int live;    /* connections being served or greeted (LISTENER_CONNECTIONS_MAX) */
 };
 
+/*
+ * The listening descriptor is closed only here, when the last user is
+ * gone: sbx_listener_close shuts it down to wake the accept thread, but
+ * never closes it, so its number cannot be reused under a thread still
+ * calling accept4 on it (#767).
+ */
 static void listener_release(struct sbx_listener *listener) {
     if (__atomic_sub_fetch(&listener->users, 1, __ATOMIC_ACQ_REL) != 0) return;
+    if (listener->fd >= 0) close(listener->fd);
     sbx_policy_free(listener->policy);
     free(listener);
 }
+
+/*
+ * A connection has GREETING_SECONDS to send its token, and a listener
+ * serves at most LISTENER_CONNECTIONS_MAX at once: a same-UID peer that
+ * connects and says nothing, or connects again and again, cannot park the
+ * broker's threads (#767). A connection past the cap is closed and audited.
+ */
+#define GREETING_SECONDS 5
+#define LISTENER_CONNECTIONS_MAX 64
 
 /* Equal without saying where they differ. */
 static int same_token(const char *a, size_t a_length, const char *b, size_t b_length) {
@@ -2865,9 +2883,13 @@ static void *connection_thread(void *argument) {
     message.msg_iovlen = 1;
     message.msg_control = control.buffer;
     message.msg_controllen = sizeof(control.buffer);
+    struct timeval wait = {.tv_sec = GREETING_SECONDS};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
     ssize_t n;
     do n = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
     while (n < 0 && errno == EINTR);
+    struct timeval forever = {0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &forever, sizeof(forever));
     int trusted = 0;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&message); n > 0 && c; c = CMSG_NXTHDR(&message, c)) {
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
@@ -2895,6 +2917,7 @@ static void *connection_thread(void *argument) {
         listener->policy->audit(listener->policy->audit_context, &access, -EACCES);
     }
     close(fd);
+    __atomic_sub_fetch(&listener->live, 1, __ATOMIC_ACQ_REL);
     listener_release(listener);
     return NULL;
 }
@@ -2904,31 +2927,41 @@ static void *accept_thread(void *argument) {
     for (;;) {
         int fd = accept4(listener->fd, NULL, NULL, SOCK_CLOEXEC);
         if (fd < 0) {
+            if (__atomic_load_n(&listener->closing, __ATOMIC_ACQUIRE)) break;  /* shut down by sbx_listener_close */
             if (errno == EINTR || errno == ECONNABORTED) continue;
-            break;  /* closed by sbx_listener_close */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                /* Out of descriptors or memory for now: wait and accept again, rather than stop serving. */
+                usleep(100 * 1000);
+                continue;
+            }
+            break;
         }
         if (__atomic_load_n(&listener->closing, __ATOMIC_ACQUIRE)) {
             close(fd);
             break;
         }
+        if (__atomic_add_fetch(&listener->live, 1, __ATOMIC_ACQ_REL) > LISTENER_CONNECTIONS_MAX) {
+            __atomic_sub_fetch(&listener->live, 1, __ATOMIC_ACQ_REL);
+            close(fd);
+            struct sbx_access access = {.op = "attach", .asked = "a connection past the listener's cap",
+                                        .resolved = listener->path, .pid = 0, .rule_verdict = -EAGAIN};
+            listener->policy->audit(listener->policy->audit_context, &access, -EAGAIN);
+            continue;
+        }
         sbx_broker_prepare(fd);
         struct connection *connection = malloc(sizeof(*connection));
         if (!connection) {
             close(fd);
+            __atomic_sub_fetch(&listener->live, 1, __ATOMIC_ACQ_REL);
             continue;
         }
         connection->listener = listener;
         connection->fd = fd;
         __atomic_add_fetch(&listener->users, 1, __ATOMIC_ACQ_REL);
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-        pthread_t thread;
-        int error = pthread_create(&thread, &attributes, connection_thread, connection);
-        pthread_attr_destroy(&attributes);
-        if (error != 0) {
+        if (start_detached(connection_thread, connection) != 0) {
             close(fd);
             free(connection);
+            __atomic_sub_fetch(&listener->live, 1, __ATOMIC_ACQ_REL);
             listener_release(listener);
         }
     }
@@ -2957,14 +2990,7 @@ int sbx_broker_listen(struct sbx_policy *policy, const char *socket_path, const 
     if (listener->fd < 0) error = -errno;
     else if (bind(listener->fd, (struct sockaddr *) &address, sizeof(address)) != 0) error = -errno;
     else if (listen(listener->fd, 64) != 0) error = -errno;
-    if (error == 0) {
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-        pthread_t thread;
-        error = -pthread_create(&thread, &attributes, accept_thread, listener);
-        pthread_attr_destroy(&attributes);
-    }
+    if (error == 0) error = start_detached(accept_thread, listener);
     if (error != 0) {
         if (listener->fd >= 0) {
             close(listener->fd);
@@ -2981,9 +3007,8 @@ void sbx_listener_close(struct sbx_listener *listener) {
     if (!listener) return;
     __atomic_store_n(&listener->closing, 1, __ATOMIC_RELEASE);
     unlink(listener->path);
-    /* Wakes the accept thread: shutdown makes a blocked accept fail. */
+    /* Wakes the accept thread: shutdown makes a blocked accept fail. The descriptor is closed by the last release. */
     shutdown(listener->fd, SHUT_RDWR);
-    close(listener->fd);
     listener_release(listener);
 }
 
@@ -3007,17 +3032,9 @@ int sbx_broker_start(struct sbx_policy *policy, int fd) {
     if (!session) return -ENOMEM;
     session->policy = policy;
     session->fd = fd;
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    int error = pthread_create(&thread, &attributes, serve_thread, session);
-    pthread_attr_destroy(&attributes);
-    if (error != 0) {
-        free(session);
-        return -error;
-    }
-    return 0;
+    int error = start_detached(serve_thread, session);
+    if (error != 0) free(session);
+    return error;
 }
 
 /*
