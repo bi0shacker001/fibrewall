@@ -769,6 +769,74 @@ static int copy_bytes(const wchar_t *from, const wchar_t *to) {
     return ok;
 }
 
+/*
+ * A DLL's PE header facts that differ between images, and two edits for the
+ * probe: what to print (mode 0), or the copy at path rewritten with the CET
+ * shadow-stack compatibility bit cleared (mode 1) or Control Flow Guard's
+ * flag cleared (mode 2). 1 when it did what was asked.
+ */
+static DWORD rva_to_offset(const IMAGE_NT_HEADERS *nt, DWORD rva) {
+    const IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, section++) {
+        DWORD size = section->SizeOfRawData > section->Misc.VirtualSize ? section->SizeOfRawData : section->Misc.VirtualSize;
+        if (rva >= section->VirtualAddress && rva < section->VirtualAddress + size) {
+            return rva - section->VirtualAddress + section->PointerToRawData;
+        }
+    }
+    return 0;
+}
+
+static int pe_facts(const wchar_t *path, const char *name8, int mode) {
+    HANDLE file = CreateFileW(path, GENERIC_READ | (mode ? GENERIC_WRITE : 0), FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    DWORD size = GetFileSize(file, NULL), got = 0;
+    BYTE *image = size != INVALID_FILE_SIZE ? malloc(size) : NULL;
+    int done = 0;
+    if (image && ReadFile(file, image, size, &got, NULL) && got == size && size > sizeof(IMAGE_DOS_HEADER)) {
+        LONG at = ((IMAGE_DOS_HEADER *) image)->e_lfanew;
+        IMAGE_NT_HEADERS *nt = at > 0 && (DWORD) at + sizeof(IMAGE_NT_HEADERS) < size ? (IMAGE_NT_HEADERS *) (image + at) : NULL;
+        DWORD ex = 0, *ex_at = NULL, guard = 0, tls = 0;
+        if (nt) {
+            IMAGE_DATA_DIRECTORY debug = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+            DWORD off = debug.VirtualAddress ? rva_to_offset(nt, debug.VirtualAddress) : 0;
+            for (DWORD k = 0; off && k < debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY); k++) {
+                IMAGE_DEBUG_DIRECTORY *d = (IMAGE_DEBUG_DIRECTORY *) (image + off) + k;
+                if ((BYTE *) (d + 1) > image + size) break;
+                if (d->Type == 20 /* IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS */ && d->PointerToRawData + 4 <= size) {
+                    ex_at = (DWORD *) (image + d->PointerToRawData);
+                    ex = *ex_at;
+                }
+            }
+            IMAGE_DATA_DIRECTORY config = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            DWORD config_off = config.VirtualAddress ? rva_to_offset(nt, config.VirtualAddress) : 0;
+            /* GuardFlags' offset in the 64-bit load configuration (older MinGW headers lack the field). */
+            const DWORD guard_at = sizeof(void *) == 8 ? 0x90 : 0x58;
+            if (config_off && config.Size >= guard_at + 4 && config_off + guard_at + 4 <= size) {
+                memcpy(&guard, image + config_off + guard_at, sizeof(guard));
+            }
+            tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+            if (mode == 0) {
+                printf("info dll pe: %s characteristics 0x%04x ex 0x%08lx guard 0x%08lx tls %lu\n", name8,
+                       (unsigned) nt->OptionalHeader.DllCharacteristics, ex, guard, tls);
+                done = 1;
+            } else if (mode == 1 && ex_at && (ex & 1)) {
+                *ex_at = ex & ~(DWORD) 1;
+                done = 1;
+            } else if (mode == 2 && (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF)) {
+                nt->OptionalHeader.DllCharacteristics &= (WORD) ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
+                done = 1;
+            }
+            DWORD put = 0;
+            if (done && mode) {
+                done = SetFilePointer(file, 0, NULL, FILE_BEGIN) == 0 && WriteFile(file, image, size, &put, NULL) && put == size;
+            }
+        }
+    }
+    free(image);
+    CloseHandle(file);
+    return done;
+}
+
 static int strip_signature(const wchar_t *path) {
     HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (file == INVALID_HANDLE_VALUE) return 0;
@@ -805,6 +873,7 @@ static void dll_probe(int less) {
         to_utf8(dll8, sizeof(dll8), dll);
         to_utf8(name8, sizeof(name8), found.cFileName);
         print_sddl(dll, name8);
+        pe_facts(dll, name8, 0);
         int code = probe_one(dll8, less);
         print_streams(dll, name8);
         /* A copy made byte by byte carries the same contents (and signature) but none of the file's
@@ -821,6 +890,15 @@ static void dll_probe(int less) {
                 /* The same copy with its Authenticode signature taken out: the security directory emptied. */
                 if (strip_signature(copy)) {
                     printf("info dll probe: %s unsigned:\n", name8);
+                    probe_one(copy8, less);
+                }
+                /* Then the unsigned copy without CET shadow-stack compatibility, and a fresh one without CFG's flag. */
+                if (pe_facts(copy, name8, 1)) {
+                    printf("info dll probe: %s unsigned, CET compatibility cleared:\n", name8);
+                    probe_one(copy8, less);
+                }
+                if (copy_bytes(dll, copy) && strip_signature(copy) && pe_facts(copy, name8, 2)) {
+                    printf("info dll probe: %s unsigned, CFG flag cleared:\n", name8);
                     probe_one(copy8, less);
                 }
                 DeleteFileW(copy);
