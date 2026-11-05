@@ -35,6 +35,10 @@ jobs:
           # LeakSanitizer stops the world with ptrace, which the lockdown refuses.
           ASAN_OPTIONS: detect_leaks=0
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+      - name: Benchmark (a measurement, not a gate; Droidtop/tracker#791)
+        if: matrix.sanitize == 'OFF'
+        continue-on-error: true
+        run: TMPDIR="$RUNNER_TEMP" ./build/sbx_bench 100000
 
   fuzz:
     # The broker request path under clang's libFuzzer + ASan/UBSan (review finding A-09).
@@ -74,6 +78,9 @@ jobs:
           cmake --build build -j
       - name: Test
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+      - name: Benchmark (a measurement, not a gate; Droidtop/tracker#791)
+        continue-on-error: true
+        run: TMPDIR="$RUNNER_TEMP" ./build/sbx_bench 100000
 
   windows:
     # The Windows backend: an AppContainer and job object at spawn, an explicit broker (docs/design.md, "Windows").
@@ -115,7 +122,7 @@ jobs:
         run: |
           cmake -S . -B build             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-26
           cmake --build build -j
-          cp build/sbx_test build/gpu_probe build/libsbx_child.so build/sbx-exec .
+          cp build/sbx_test build/sbx_bench build/gpu_probe build/libsbx_child.so build/sbx-exec .
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -131,13 +138,15 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
           # The GPU probe is a measurement, not a gate: its output is the answer (see tests/android/gpu_probe.c).
           script: |
-            adb push sbx_test gpu_probe libsbx_child.so sbx-exec /data/local/tmp/
+            adb push sbx_test sbx_bench gpu_probe libsbx_child.so sbx-exec /data/local/tmp/
             adb shell 'uname -a; cat /proc/sys/kernel/seccomp/actions_avail; cd /data/local/tmp && chmod 755 sbx_test gpu_probe sbx-exec && TMPDIR=/data/local/tmp ./sbx_test; echo "exit=$?"' | tee result.txt
             # A test process that dies by a signal leaves its reason here (debuggerd, seccomp audit).
             adb logcat -d | grep -iE 'sbx_test|sbx-exec|F DEBUG|type=1326' | tail -60 || true
             adb logcat -c || true
             adb shell 'cd /data/local/tmp && ./gpu_probe; echo "probe_exit=$?"' || true
             adb shell 'cd /data/local/tmp && ./gpu_probe --no-seal; echo "probe_exit=$?"' || true
+            # The cost of confinement (Droidtop/tracker#791): a measurement, not a gate.
+            adb shell 'cd /data/local/tmp && chmod 755 sbx_bench && TMPDIR=/data/local/tmp ./sbx_bench 20000' || true
             adb logcat -d | grep -iE 'gpu_probe|binder|gralloc|mapper|F DEBUG|F libc|seccomp|avc' | tail -60 || true
             grep -q '^exit=0' result.txt
 
@@ -159,6 +168,7 @@ jobs:
               -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-26
             cmake --build "build-$abi" -j
             cp "build-$abi/sbx_test" "sbx_test-$abi"
+            cp "build-$abi/sbx_bench" "sbx_bench-$abi"
             cp "build-$abi/gpu_probe" "gpu_probe-$abi"
             mkdir -p "child-$abi" && cp "build-$abi/libsbx_child.so" "child-$abi/libsbx_child.so"
             (cd "child-$abi" && zip -q "../libsbx_child-$abi.zip" libsbx_child.so)
@@ -170,7 +180,7 @@ jobs:
           gh release view probe-latest >/dev/null 2>&1 || \
             gh release create probe-latest --prerelease --title "Test and GPU probe binaries (rolling)" \
               --notes "Built from main by CI. Rebuilt on every push; see the commit in the asset upload time."
-          gh release upload probe-latest sbx_test-* gpu_probe-* libsbx_child-*.zip --clobber
+          gh release upload probe-latest sbx_test-* sbx_bench-* gpu_probe-* libsbx_child-*.zip --clobber
           gh release edit probe-latest --notes "Built from ${GITHUB_SHA} by CI run ${GITHUB_RUN_ID}."
 
   release:

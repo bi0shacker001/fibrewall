@@ -1,7 +1,7 @@
 # sandbox: a process sandbox library (seccomp lockdown + syscall broker).
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.18)
-project(fibrewall VERSION 0.3.0 LANGUAGES C)
+project(fibrewall VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -82,6 +82,10 @@ if(SBX_SANITIZE)
 endif()
 
 if(SBX_TESTS)
+  # The cost of confinement, for Droidtop/tracker#791: a measurement, not a gate.
+  add_executable(sbx_bench tests/sbx_bench.c)
+  target_link_libraries(sbx_bench PRIVATE sbx)
+  target_compile_options(sbx_bench PRIVATE -Wall -Wextra -Werror -O2)
   add_executable(sbx_test tests/sbx_test.c)
   target_link_libraries(sbx_test PRIVATE sbx)
   # src/ for protocol.h: the broker-protocol harness builds requests in the real wire format.

@@ -2704,3 +2704,11 @@ int sbx_resolve(const char *name, int family, struct sockaddr_storage *out, int 
     if (passed >= 0) close(passed);
     return (int) result;
 }
+
+long sbx_list_stat(int dir_fd, void *buffer, size_t size) {
+    if (!locked || broker < 0) return -EPERM;
+    if (dir_fd < 0) return -EBADF;
+    if (buffer == NULL) return -EFAULT;
+    size_t asked = size < SBX_LIST_MAX ? size : SBX_LIST_MAX;
+    return forward(SBX_LIST_STAT, dir_fd, ".", 0, NULL, 0, (uint32_t) asked, buffer, asked);
+}

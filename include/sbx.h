@@ -32,9 +32,9 @@
 #define SBX_H
 
 /* The release this header belongs to (git tag v<SBX_VERSION>). */
-#define SBX_VERSION "0.3.0"
+#define SBX_VERSION "0.4.0"
 #define SBX_VERSION_MAJOR 0
-#define SBX_VERSION_MINOR 3
+#define SBX_VERSION_MINOR 4
 #define SBX_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -832,6 +832,34 @@ int sbx_attach_from_environment(void);
  */
 struct sockaddr_storage;
 int sbx_resolve(const char *name, int family, struct sockaddr_storage *out, int max);
+
+/*
+ * In a locked-down process: lists the folder dir_fd holds (a descriptor the
+ * process opened with O_DIRECTORY) from its current position, with each
+ * entry's metadata, in one broker request instead of a stat per name
+ * (Droidtop/tracker#791). Fills buffer with struct sbx_list_stat_entry
+ * records, each record_len bytes (a multiple of 8), and moves the
+ * descriptor's position past the entries returned, as getdents64 would.
+ * Returns the bytes filled, 0 at the end of the folder, or a negative errno
+ * (-EACCES when the rules do not let the process read the folder, -EINVAL
+ * when size cannot hold the next record). "." and ".." are left out. An
+ * entry the rules do not let the process look up comes with its name and
+ * type only (has_stat 0). At most 32 KiB per call. Added in 0.4.0.
+ */
+struct sbx_list_stat_entry {
+    uint16_t record_len;   /* this record's size; the next one starts there */
+    uint16_t name_len;     /* without the terminating NUL */
+    uint8_t type;          /* DT_REG, DT_DIR, DT_LNK, ... as getdents64 gives it */
+    uint8_t has_stat;      /* 1 when the fields below are filled */
+    uint16_t reserved;
+    uint32_t mode;         /* st_mode */
+    uint32_t mtime_nsec;
+    uint64_t ino;
+    int64_t size;
+    int64_t mtime_sec;
+    char name[];           /* NUL-terminated */
+};
+long sbx_list_stat(int dir_fd, void *buffer, size_t size);
 #endif
 
 #ifdef __cplusplus

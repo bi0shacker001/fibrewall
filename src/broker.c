@@ -56,6 +56,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <poll.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef O_PATH
@@ -617,7 +618,104 @@ static int split(const char *path, char *parent, const char **name) {
  * itself (lstat, readlink, unlink, rename, mkdir). A final name that does
  * not exist is kept when may_create, else ENOENT.
  */
+/*
+ * ---- The parent cache (Droidtop/tracker#791) ----
+ *
+ * Resolving a path costs one readlink per component, and a tree walk asks
+ * about thousands of names in the same few folders. So the broker keeps
+ * what each folder it walked resolved to, for a moment. A stale entry can
+ * only refuse, never reach elsewhere: every action opens the decided parent
+ * and checks through /proc/self/fd that it is that folder (open_parent),
+ * and acts on the last name with O_NOFOLLOW. Entries live RESOLVED_SECONDS,
+ * and every change the broker makes to a folder (mkdir, unlink, rename,
+ * link, symlink) empties the cache, so its own changes are never stale.
+ */
+#define RESOLVED_SLOTS 512
+#define RESOLVED_SECONDS 2
+static pthread_mutex_t resolved_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char from[SBX_PATH_MAX];
+    char to[SBX_PATH_MAX];
+    time_t until;
+} *resolved_cache;
+static unsigned resolved_generation;
+
+static unsigned resolved_slot(const char *path) {
+    unsigned h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *) path; *p; p++) h = (h ^ *p) * 16777619u;
+    return h % RESOLVED_SLOTS;
+}
+
+static int resolved_get(const char *from, char *to) {
+    int hit = 0;
+    pthread_mutex_lock(&resolved_lock);
+    if (resolved_cache) {
+        unsigned slot = resolved_slot(from);
+        if (resolved_cache[slot].until >= time(NULL) && strcmp(resolved_cache[slot].from, from) == 0) {
+            strcpy(to, resolved_cache[slot].to);
+            hit = 1;
+        }
+    }
+    pthread_mutex_unlock(&resolved_lock);
+    return hit;
+}
+
+static void resolved_put(const char *from, const char *to, unsigned generation) {
+    pthread_mutex_lock(&resolved_lock);
+    if (!resolved_cache) resolved_cache = calloc(RESOLVED_SLOTS, sizeof(*resolved_cache));
+    /* A change the broker made since this walk began would make it stale: then it is not kept. */
+    if (resolved_cache && generation == resolved_generation) {
+        unsigned slot = resolved_slot(from);
+        strcpy(resolved_cache[slot].from, from);
+        strcpy(resolved_cache[slot].to, to);
+        resolved_cache[slot].until = time(NULL) + RESOLVED_SECONDS;
+    }
+    pthread_mutex_unlock(&resolved_lock);
+}
+
+/* Every folder the broker changes empties the cache. */
+static void resolved_forget(void) {
+    pthread_mutex_lock(&resolved_lock);
+    resolved_generation++;
+    for (unsigned i = 0; resolved_cache && i < RESOLVED_SLOTS; i++) resolved_cache[i].until = 0;
+    pthread_mutex_unlock(&resolved_lock);
+}
+
+static int resolve_walk(const char *path, int follow_last, int may_create, char *out);
+
+/*
+ * Resolves path as the kernel would (resolve_walk), taking its folder from
+ * the parent cache when it can: the last name is still checked here, and
+ * anything unusual (a link as the last name, an error) takes the full walk.
+ */
 static int resolve(const char *path, int follow_last, int may_create, char *out) {
+    const char *slash = strrchr(path, '/');
+    if (path[0] != '/' || !slash || slash == path || slash[1] == '\0' || strlen(path) >= SBX_PATH_MAX) {
+        return resolve_walk(path, follow_last, may_create, out);
+    }
+    char folder[SBX_PATH_MAX], real_folder[SBX_PATH_MAX];
+    size_t folder_len = (size_t) (slash - path);
+    memcpy(folder, path, folder_len);
+    folder[folder_len] = '\0';
+    if (!resolved_get(folder, real_folder)) {
+        pthread_mutex_lock(&resolved_lock);
+        unsigned generation = resolved_generation;
+        pthread_mutex_unlock(&resolved_lock);
+        if (resolve_walk(folder, 1, 0, real_folder) != 0) return resolve_walk(path, follow_last, may_create, out);
+        resolved_put(folder, real_folder, generation);
+    }
+    const char *name = slash + 1;
+    int written = snprintf(out, SBX_PATH_MAX, "%s/%s", strcmp(real_folder, "/") == 0 ? "" : real_folder, name);
+    if (written < 0 || written >= SBX_PATH_MAX) return resolve_walk(path, follow_last, may_create, out);
+    if (!follow_last) return 0;
+    char target[8];
+    if (readlink(out, target, sizeof(target)) >= 0) return resolve_walk(path, follow_last, may_create, out);
+    if (errno == EINVAL) return 0;
+    if (errno == ENOENT) return may_create ? 0 : -ENOENT;
+    return resolve_walk(path, follow_last, may_create, out);
+}
+
+static int resolve_walk(const char *path, int follow_last, int may_create, char *out) {
     char work[SBX_PATH_MAX];
     if (strlen(path) >= sizeof(work)) return -ENAMETOOLONG;
     strcpy(work, path);
@@ -698,6 +796,7 @@ static const char *op_name(uint32_t op) {
     case SBX_CHDIR: return "chdir";
     case SBX_GETCWD: return "getcwd";
     case SBX_LIST: return "list";
+    case SBX_LIST_STAT: return "list";
     case SBX_CHMOD: return "chmod";
     case SBX_UTIMENS: return "utimens";
     case SBX_SOCKET: return "socket";
@@ -947,8 +1046,21 @@ static int readable_path_handle(const struct check *c, int fd) {
     return readable;
 }
 
+static void handle_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
+                       const char *path2, const char *base, const char *base2, pid_t pid, int answer);
+
+/* Serves one path request; one that may have changed a folder empties the parent cache after it. */
 static void handle(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
                    const char *path2, const char *base, const char *base2, pid_t pid, int answer) {
+    handle_one(policy, request, path, path2, base, base2, pid, answer);
+    switch (request->op) {
+    case SBX_MKDIR: case SBX_UNLINK: case SBX_RENAME: case SBX_LINK: case SBX_SYMLINK: resolved_forget(); break;
+    default: break;
+    }
+}
+
+static void handle_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *path,
+                       const char *path2, const char *base, const char *base2, pid_t pid, int answer) {
     struct check c;
     c.policy = policy;
     c.op = request->op;
@@ -1198,6 +1310,94 @@ static void handle(const struct sbx_policy *policy, const struct sbx_request *re
  * the folder it names may be read, and from that same open file
  * description, so the position the process sees moves with it.
  */
+struct list_dirent {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+/*
+ * SBX_LIST_STAT: one folder's entries with their metadata, in one reply.
+ * The folder is decided as SBX_LIST decides it; each entry is stat()ed
+ * relative to the process's own descriptor of the folder, never following
+ * a link, and only when the rules let the process look the entry up.
+ * Entries are read from that descriptor, so its position moves as
+ * getdents64's would; when the reply is full the position is put back to
+ * the first entry it leaves out.
+ */
+static void list_stat_one(const struct sbx_policy *policy, const struct sbx_request *request, int *fds, pid_t pid,
+                          int answer) {
+    char base[SBX_PATH_MAX];
+    if (!request->dirfd_sent || request->path_len != 1 || fd_path(fds[1], base) != 0 || base[0] != '/') {
+        reply(answer, -EBADF, NULL, 0, -1);
+        return;
+    }
+    struct check c;
+    c.policy = policy;
+    c.op = request->op;
+    c.pid = pid;
+    c.tid = request->tid;
+    c.flags = 0;
+    int error = decide(&c, base, ".", 1, SBX_READ, 1, 0);
+    if (error != 0) { reply(answer, error, NULL, 0, -1); return; }
+    if (strcmp(c.real, base) != 0 && !permits(allowed(policy, base, pid), SBX_READ)) {
+        reply(answer, -EACCES, NULL, 0, -1);
+        return;
+    }
+    static __thread char out[SBX_LIST_MAX];
+    static __thread char dirents[8192];
+    size_t asked = request->mode < SBX_LIST_MAX ? request->mode : SBX_LIST_MAX;
+    size_t used = 0;
+    int dir = fds[1];
+    for (int full = 0; !full;) {
+        off_t start = lseek(dir, 0, SEEK_CUR);
+        long n = syscall(__NR_getdents64, dir, dirents, sizeof(dirents));
+        if (n < 0) {
+            if (used == 0) { reply(answer, -errno, NULL, 0, -1); return; }
+            break;
+        }
+        if (n == 0) break;
+        off_t resume = start;  /* where the folder's position goes back to if this read does not fit */
+        for (long at = 0; at < n;) {
+            const struct list_dirent *d = (const void *) (dirents + at);
+            at += d->d_reclen;
+            const char *name = d->d_name;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) { resume = (off_t) d->d_off; continue; }
+            size_t name_len = strlen(name);
+            size_t record = (sizeof(struct sbx_list_stat_entry) + name_len + 1 + 7) & ~(size_t) 7;
+            if (used + record > asked) {
+                full = 1;
+                if (used == 0) { reply(answer, -EINVAL, NULL, 0, -1); lseek(dir, start, SEEK_SET); return; }
+                lseek(dir, resume, SEEK_SET);
+                break;
+            }
+            struct sbx_list_stat_entry *e = (struct sbx_list_stat_entry *) (out + used);
+            memset(e, 0, sizeof(*e));
+            e->record_len = (uint16_t) record;
+            e->name_len = (uint16_t) name_len;
+            e->type = d->d_type;
+            memcpy(e->name, name, name_len + 1);
+            char path[SBX_PATH_MAX];
+            int written = snprintf(path, sizeof(path), "%s/%s", strcmp(c.real, "/") == 0 ? "" : c.real, name);
+            struct stat st;
+            if (written > 0 && (size_t) written < sizeof(path) && permits(allowed(policy, path, pid), LOOKUP) &&
+                fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+                e->has_stat = 1;
+                e->mode = st.st_mode;
+                e->ino = st.st_ino;
+                e->size = st.st_size;
+                e->mtime_sec = st.st_mtim.tv_sec;
+                e->mtime_nsec = (uint32_t) st.st_mtim.tv_nsec;
+            }
+            used += record;
+            resume = (off_t) d->d_off;
+        }
+    }
+    reply(answer, (int64_t) used, out, (uint32_t) used, -1);
+}
+
 static void list_one(const struct sbx_policy *policy, const struct sbx_request *request, int *fds, pid_t pid,
                      int answer) {
     char base[SBX_PATH_MAX];
@@ -2436,6 +2636,10 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
     }
     if (request->op == SBX_LIST) {
         list_one(policy, request, fds, pid, answer);
+        return;
+    }
+    if (request->op == SBX_LIST_STAT) {
+        list_stat_one(policy, request, fds, pid, answer);
         return;
     }
     char base[SBX_PATH_MAX] = "/";

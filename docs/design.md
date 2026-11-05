@@ -1993,6 +1993,74 @@ and a refused name; UDP to port 53 refused; the broker's socket kept
 with "no rule". On the emulators bionic's own `getaddrinfo` runs through
 the relay as well.
 
+## Performance: fewer and cheaper broker round trips (built 2026-11-05, Droidtop/tracker#791)
+
+The owner (2026-10-29) asked whether a Syncthing scan of a very large
+folder can run through the broker, proposed folder grants ("just the base
+of the path and the action"), and then asked for a readdirplus-style
+request so the plugin's Syncthing reads a folder's metadata at once. The
+issue says to measure first, so the library carries a benchmark,
+`tests/sbx_bench.c`, run by CI on Linux x86_64 and arm64 and on both
+emulators (a measurement, not a gate) and published for the rig in
+`probe-latest` as `sbx_bench-<abi>`.
+
+**What one call costs** (a 4-core Xeon VM at 2.1 GHz, a 100k-file tree, x86_64, before this change):
+
+| Per call (µs) | native | confined |
+| --- | --- | --- |
+| a trapped call answered in the process (the trap alone) | 0.74 | 1.74 |
+| stat of one file, repeated | 0.51 | 53.9 |
+| walk: stat every file | 1.40 | 51.7 |
+| walk: open and close every file | 1.89 | 56.5 |
+
+The trap is about 1 µs; the rest is the round trip and the broker's own
+work, about 29 µs of broker CPU per request. Counting the broker's system
+calls (`strace -c`) put most of it in resolving the path: one `readlink`
+per component, about 11 per request in the benchmark's tree, then the
+socket traffic, opening the decided parent and checking it.
+
+**What changed:**
+- **The parent cache.** The broker keeps what each folder it walked
+  resolved to, for two seconds, in 512 slots, so a call in a folder it
+  has just seen checks only the last name. A stale entry can only refuse,
+  never reach elsewhere: every action opens the decided parent and checks
+  through `/proc/self/fd` that it is that folder (`open_parent`), and acts
+  on the last name with `O_NOFOLLOW`. Every folder change the broker makes
+  (mkdir, unlink, rename, link, symlink) empties the cache, and a walk that
+  began before such a change does not store its result. The test swaps a
+  cached folder for a link to a secret folder from outside the broker and
+  checks the next open is refused. Readlinks fell from 10.7 to 3.75 per
+  request; a brokered stat from 54 to 45 µs.
+- **`sbx_list_stat`** (`SBX_LIST_STAT`), the owner's request: a folder's
+  entries with type, size, mtime and inode, up to 32 KiB of records per
+  request. The folder is decided as a listing is; each entry is stat()ed
+  relative to the process's own descriptor of the folder, never following
+  a link, and only when the rules let the process look the entry up
+  (otherwise it comes with its name and type only). The descriptor's
+  position moves as `getdents64`'s would, and a full reply puts it back
+  to the first entry left out. A 100k-file metadata walk under lockdown
+  went from **4.9 s** (a stat per file) to **0.16 s** (native readdir and
+  fstatat: 0.11 s).
+- **Folder grants, as the owner described them, are what the rules
+  already are**: a rule on a folder covers everything under it, decided by
+  the longest matching rule, and the decision itself costs little next to
+  the system calls around it. A prefix trie keyed on the parent is not
+  built; it would only pay with thousands of rules.
+
+**Not done, and why.** Reusing one answer socket per thread would save a
+`socketpair` and two `close`s per request, but a forked child would share
+its parent's socket; it needs a fork-safe design first. Batching several
+requests into one, or seccomp user notification instead of SIGSYS, is not
+available on the 4.19 kernels this targets (user notification needs 5.0).
+Per-file opens for reading and hashing stay one brokered open each, with
+the descriptor then untouched.
+
+**For the owner's slow SD card** (the issue's second comment), the gain is
+in touching the card less: `sbx_list_stat` reads metadata a folder at a
+time and in order, which is what the card handles well; trusting the
+change watcher and keeping each folder's last-seen state is the plugin's
+Syncthing side (Droidtop/tracker#553).
+
 ## Bounded zones (built 2026-11-05, Droidtop/tracker#651)
 
 Profiles that sort a fixed catalogue of grants into allow, prompt and deny

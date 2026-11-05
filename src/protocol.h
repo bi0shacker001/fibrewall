@@ -97,6 +97,12 @@ enum sbx_op {
     SBX_SEND = 28,
     /* sbx_resolve: path = the name, mode = the family; data = struct sockaddr_storage[result] */
     SBX_RESOLVE = 29,
+    /*
+     * sbx_list_stat (Droidtop/tracker#791): like SBX_LIST, the folder's own descriptor is sent and its position
+     * moves; mode = the caller's buffer size; data = struct sbx_list_stat_entry records (sbx.h), with what
+     * fstatat answers for each entry the rules let the process look up.
+     */
+    SBX_LIST_STAT = 30,
 };
 
 /* The most bytes one SBX_SEND carries: a datagram's largest, with room for its header. */

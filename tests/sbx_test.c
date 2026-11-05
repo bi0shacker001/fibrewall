@@ -3908,6 +3908,143 @@ static int zones_check(void) {
     return (WIFEXITED(status) ? WEXITSTATUS(status) : 1) | !ok;
 }
 
+/* ---- Fewer round trips (Droidtop/tracker#791): sbx_list_stat and the broker's parent cache. ---- */
+
+static int perf_count(int fd, size_t buffer_size, int *with_stat, int *link_as_link, long *size_of_big, int *denied_no_stat) {
+    static char records[32768];
+    int entries = 0;
+    long got;
+    while ((got = sbx_list_stat(fd, records, buffer_size)) > 0) {
+        for (long at = 0; at < got;) {
+            const struct sbx_list_stat_entry *e = (const void *) (records + at);
+            entries++;
+            if (e->has_stat) (*with_stat)++;
+            if (strcmp(e->name, "link") == 0 && e->has_stat && S_ISLNK(e->mode)) *link_as_link = 1;
+            if (strcmp(e->name, "big") == 0 && e->has_stat) *size_of_big = (long) e->size;
+            if (strcmp(e->name, "hidden") == 0 && !e->has_stat) *denied_no_stat = 1;
+            at += e->record_len;
+        }
+    }
+    return got < 0 ? (int) got : entries;
+}
+
+struct perf_broker {
+    struct sbx_policy *policy;
+    int fd;
+};
+
+static void *perf_serve(void *argument) {
+    struct perf_broker *b = argument;
+    sbx_broker_serve(b->policy, b->fd);
+    return NULL;
+}
+
+static int perf_check(void) {
+    char tree[400], hidden[500], outside[400], swap[400], secret_dir[400], secret_file[500], path[600];
+    snprintf(tree, sizeof(tree), "%s/perf", root);
+    snprintf(hidden, sizeof(hidden), "%s/perf/hidden", root);
+    snprintf(outside, sizeof(outside), "%s/perf-outside", root);
+    snprintf(swap, sizeof(swap), "%s/perf/swap", root);
+    snprintf(secret_dir, sizeof(secret_dir), "%s/perf-secret", root);
+    snprintf(secret_file, sizeof(secret_file), "%s/perf-secret/f", root);
+    mkdir(tree, 0755);
+    mkdir(hidden, 0755);
+    mkdir(outside, 0755);
+    mkdir(swap, 0755);
+    mkdir(secret_dir, 0755);
+    write_file(secret_file, "secret");
+    for (int i = 0; i < 300; i++) {
+        snprintf(path, sizeof(path), "%s/file-with-a-longish-name-%03d", tree, i);
+        write_file(path, "x");
+    }
+    snprintf(path, sizeof(path), "%s/big", tree);
+    write_file(path, "0123456789");
+    snprintf(path, sizeof(path), "%s/link", tree);
+    symlink(secret_file, path);
+    snprintf(path, sizeof(path), "%s/f", swap);
+    write_file(path, "in the swap folder");
+    int outside_fd = open(outside, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, tree, SBX_READ);
+    sbx_policy_add(policy, hidden, SBX_DENY);
+    int pair[2], go[2], ready[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0 || pipe(go) != 0 || pipe(ready) != 0 ||
+        sbx_broker_prepare(pair[0]) != 0) {
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(60);
+        close(pair[0]);
+        close(go[1]);
+        close(ready[0]);
+        struct sbx_lockdown_options options = {.flags = 0};
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "list_stat: lockdown");
+        if (locked == 0) {
+            int fd = open(tree, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            int with_stat = 0, link_as_link = 0, denied_no_stat = 0;
+            long big = -1;
+            int entries = fd >= 0 ? perf_count(fd, 32768, &with_stat, &link_as_link, &big, &denied_no_stat) : -1;
+            /* 300 files, big, link, hidden and swap: 304 entries; all but hidden with their metadata. */
+            EXPECT(entries == 304 && with_stat == 303, "list_stat: a folder's entries with their metadata, in few requests");
+            EXPECT(big == 10, "list_stat: an entry's size");
+            EXPECT(link_as_link, "list_stat: a link is reported as itself, never followed");
+            EXPECT(denied_no_stat, "list_stat: an entry under a deny rule comes without its metadata");
+            if (fd >= 0) close(fd);
+            fd = open(tree, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            with_stat = 0;
+            int paged = fd >= 0 ? perf_count(fd, 512, &with_stat, &link_as_link, &big, &denied_no_stat) : -1;
+            EXPECT(paged == 304 && with_stat == 303, "list_stat: a small buffer pages through the folder, no entry lost or repeated");
+            if (fd >= 0) close(fd);
+            static char records[1024];
+            EXPECT(outside_fd >= 0 && sbx_list_stat(outside_fd, records, sizeof(records)) == -EACCES,
+                   "list_stat: a folder outside the rules is refused, even through a descriptor held from before");
+            /* The parent cache: the swap folder is resolved and kept; then replaced, from outside, by a link to a secret. */
+            char inside[600], stale[600];
+            snprintf(inside, sizeof(inside), "%s/f", swap);
+            snprintf(stale, sizeof(stale), "%s/f", swap);
+            struct stat st;
+            EXPECT(stat(inside, &st) == 0, "parent cache: a file in a folder, resolved and kept");
+            ssize_t told = write(ready[1], "r", 1);
+            (void) told;
+            char byte;
+            /* The parent swaps the folder, then writes one byte. */
+            EXPECT(read(go[0], &byte, 1) == 1, "parent cache: the folder swapped for a link, from outside the broker");
+            int opened = open(stale, O_RDONLY | O_CLOEXEC);
+            EXPECT(opened < 0 && errno == EACCES,
+                   "parent cache: within its lifetime, a stale entry refuses; the secret behind the link is never opened");
+            if (opened >= 0) close(opened);
+        }
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    close(go[0]);
+    close(ready[1]);
+    /* The broker runs on a thread, so this process can swap the folder while the child is locked down. */
+    pthread_t broker_thread;
+    struct perf_broker args = {policy, pair[0]};
+    pthread_create(&broker_thread, NULL, perf_serve, &args);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) printf("info parent cache: the child never got to the swap\n");
+    close(ready[0]);
+    char moved[500];
+    snprintf(moved, sizeof(moved), "%s-moved", swap);
+    rename(swap, moved);
+    symlink(secret_dir, swap);
+    ssize_t w = write(go[1], "s", 1);
+    (void) w;
+    close(go[1]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    pthread_join(broker_thread, NULL);
+    if (outside_fd >= 0) close(outside_fd);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -4059,7 +4196,7 @@ int main(int argc, char **argv) {
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
     int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
-                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check();
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

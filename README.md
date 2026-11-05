@@ -74,6 +74,11 @@ Not built yet:
 
 ### Releases
 
+- **v0.4.0** (2026-11-05): fewer and cheaper broker round trips ([Droidtop/tracker#791](https://github.com/Droidtop/tracker/issues/791); [docs/design.md](docs/design.md), "Performance"):
+  - `sbx_list_stat`: a folder's entries with their metadata in one request. Under lockdown, a 100k-file metadata walk takes 0.16 s instead of 4.9 s.
+  - The broker keeps the folders it resolved for two seconds, so a call in a folder it has just seen checks only the last name. A stale entry can only refuse.
+  - `sbx_bench`, the benchmark, runs in CI and ships in `probe-latest` for the rig.
+
 - **v0.3.0** (2026-11-05): bounded zones ([Droidtop/tracker#651](https://github.com/Droidtop/tracker/issues/651); [docs/zones.md](docs/zones.md)):
   - `include/sbx_zones.h`: the catalogue of eleven entries, the five shipped profiles (Locked, Careful as the default, Balanced, Relaxed, Open), a person's own profiles parsed from text, and `sbx_zone_apply`, which turns one profile for one program into path rules, network rules and lockdown flags, and a decider that answers from the zone, the person's stored answer, then the host's prompt.
   - `SBX_PARK`: a decider that has to ask a person parks the request on a thread of its own (`sbx_access.parked`); only the asking thread of the program waits.
