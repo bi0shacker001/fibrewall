@@ -769,6 +769,27 @@ static int copy_bytes(const wchar_t *from, const wchar_t *to) {
     return ok;
 }
 
+static int strip_signature(const wchar_t *path) {
+    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    static BYTE head[4096];
+    DWORD got = 0, put = 0;
+    int ok = ReadFile(file, head, sizeof(head), &got, NULL) && got >= sizeof(IMAGE_DOS_HEADER);
+    LONG at = ok ? ((IMAGE_DOS_HEADER *) head)->e_lfanew : 0;
+    ok = ok && at > 0 && (DWORD) at + sizeof(IMAGE_NT_HEADERS) <= got;
+    if (ok) {
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *) (head + at);
+        IMAGE_DATA_DIRECTORY *security = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+        ok = security->VirtualAddress != 0;
+        security->VirtualAddress = 0;
+        security->Size = 0;
+        nt->OptionalHeader.CheckSum = 0;
+        ok = ok && SetFilePointer(file, 0, NULL, FILE_BEGIN) == 0 && WriteFile(file, head, got, &put, NULL) && put == got;
+    }
+    CloseHandle(file);
+    return ok;
+}
+
 static void dll_probe(int less) {
     wchar_t pattern[MAX_PATH];
     swprintf(pattern, MAX_PATH, L"%ls\\*.dll", python_dir);
@@ -797,6 +818,11 @@ static void dll_probe(int less) {
                 char copy8[MAX_PATH * 3];
                 to_utf8(copy8, sizeof(copy8), copy);
                 probe_one(copy8, less);
+                /* The same copy with its Authenticode signature taken out: the security directory emptied. */
+                if (strip_signature(copy)) {
+                    printf("info dll probe: %s unsigned:\n", name8);
+                    probe_one(copy8, less);
+                }
                 DeleteFileW(copy);
             }
             *wcsrchr(copy, L'\\') = 0;
