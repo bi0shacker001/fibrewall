@@ -35,6 +35,7 @@
 #include "sbx.h"
 #include "protocol.h"
 #include "internal.h"
+#include "net.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -54,6 +55,7 @@
 #include <sys/inotify.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <poll.h>
 #include <unistd.h>
 
 #ifndef O_PATH
@@ -104,6 +106,8 @@ struct sbx_policy {
     size_t unix_name_lengths[SBX_UNIX_NAMES_MAX];
     unsigned unix_name_modes[SBX_UNIX_NAMES_MAX];
     unsigned unix_name_count;
+    struct netp *netp;  /* the network rules (sbx_policy_net_rule) and the addresses the broker resolved */
+    int refs;           /* the host's, plus one per broker thread that outlives a request (accept, relays) */
 };
 
 static void default_audit(void *context, const struct sbx_access *access, int result) {
@@ -237,13 +241,29 @@ struct sbx_policy *sbx_policy_new(void) {
         free(policy);
         return NULL;
     }
+    policy->netp = netp_new();
+    if (!policy->netp) {
+        free(policy->tree);
+        free(policy);
+        return NULL;
+    }
     pthread_mutex_init(&policy->tree->lock, NULL);
     policy->audit = default_audit;
+    policy->refs = 1;
     return policy;
 }
 
+/* A broker thread that outlives its request (an accept, a name relay) keeps the policy until it ends. */
+static const struct sbx_policy *policy_hold(const struct sbx_policy *policy) {
+    __atomic_add_fetch(&((struct sbx_policy *) policy)->refs, 1, __ATOMIC_ACQ_REL);
+    return policy;
+}
+static void policy_release(const struct sbx_policy *policy) { sbx_policy_free((struct sbx_policy *) policy); }
+
 void sbx_policy_free(struct sbx_policy *policy) {
     if (!policy) return;
+    if (__atomic_sub_fetch(&policy->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    netp_free(policy->netp);
     for (size_t i = 0; i < policy->count; i++) free(policy->rules[i].path);
     for (size_t i = 0; i < policy->alias_count; i++) {
         free(policy->aliases[i].virtual_path);
@@ -664,6 +684,8 @@ static const char *op_name(uint32_t op) {
     case SBX_EXEC: return "exec";
     case SBX_SIGNAL: return "signal";
     case SBX_WATCH: return "watch";
+    case SBX_SEND: return "send";
+    case SBX_RESOLVE: return "resolve";
     default: return "unknown";
     }
 }
@@ -1178,6 +1200,17 @@ void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants) {
     if (policy) policy->net = grants;
 }
 
+int sbx_policy_net_rule(struct sbx_policy *policy, const char *rule) {
+    if (!policy) return -EINVAL;
+    return netp_add(policy->netp, rule);
+}
+
+/* The grants in force: the host's, or in rule mode what the rules can allow (with the host's SBX_NET_DECIDE). */
+static unsigned net_grants(const struct sbx_policy *policy) {
+    if (!netp_active(policy->netp)) return policy->net;
+    return netp_grants(policy->netp) | (policy->net & SBX_NET_DECIDE);
+}
+
 int sbx_policy_add_system_socket(struct sbx_policy *policy, const char *path, unsigned grant) {
     if (!policy || !path || path[0] != '/') return -EINVAL;
     if (strlen(path) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) return -ENAMETOOLONG;
@@ -1221,8 +1254,10 @@ static unsigned short port_of(const struct sockaddr *address) {
 }
 
 /* The grants' verdict, then the decider's (on a refusal, or on every call with SBX_NET_DECIDE), then the audit. */
-static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict) {
-    struct sbx_access access = {.op = op_name(op), .asked = words, .resolved = words, .pid = pid, .rule_verdict = verdict};
+static int net_decide_rule(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict,
+                           const char *rule) {
+    struct sbx_access access = {.op = op_name(op), .asked = words, .resolved = words, .pid = pid, .rule_verdict = verdict,
+                                .net_rule = rule};
     int result = verdict;
     if (policy->decide && (verdict != 0 || (policy->net & SBX_NET_DECIDE))) {
         int said = policy->decide(policy->decide_context, &access);
@@ -1230,6 +1265,43 @@ static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *
     }
     policy->audit(policy->audit_context, &access, result);
     return result;
+}
+
+static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict) {
+    return net_decide_rule(policy, op, words, pid, verdict, NULL);
+}
+
+/* A rule's verdict through the decider and the audit: allow is 0; deny, ask and no rule are refusals the decider may turn. */
+static int rule_decide(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, struct netp_verdict v) {
+    return net_decide_rule(policy, op, words, pid, v.action == NETP_ALLOW ? 0 : -EACCES, v.rule);
+}
+
+/* A socket's protocol for the rules: NETP_TCP for a stream, NETP_UDP for a datagram, 0 for anything else. */
+static unsigned socket_protocol(int fd) {
+    int type = 0;
+    socklen_t length = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0) return 0;
+    return type == SOCK_STREAM ? NETP_TCP : type == SOCK_DGRAM ? NETP_UDP : 0;
+}
+
+/*
+ * A name the process asked for, decided and then resolved (docs/design.md,
+ * "Names: DNS through the broker"): in rule mode by the rules, else by the
+ * SBX_NET_RESOLVE grant; the decider and the audit see it as "resolve".
+ */
+struct lookup_context {
+    const struct sbx_policy *policy;
+    pid_t pid;
+};
+
+static int broker_lookup(void *argument, const char *name, int family, struct sockaddr_storage *out, int max) {
+    const struct lookup_context *l = argument;
+    const struct sbx_policy *policy = l->policy;
+    int verdict;
+    if (netp_active(policy->netp)) verdict = rule_decide(policy, SBX_RESOLVE, name, l->pid, netp_name(policy->netp, name));
+    else verdict = net_decide(policy, SBX_RESOLVE, name, l->pid, (policy->net & SBX_NET_RESOLVE) ? 0 : -EACCES);
+    if (verdict != 0) return -EACCES;
+    return netp_resolve(policy->netp, name, family, out, max);
 }
 
 /* A blocking connect or accept, on a thread of its own: it holds up no other call, and touches no policy. */
@@ -1290,74 +1362,200 @@ static void net_wait_unreserve(struct conn_budget *b) {
     if (b && remaining == 0) free(b);
 }
 
+/* What a broker thread of its own does (net_wait_thread). */
+enum { WAIT_CONNECT, WAIT_ACCEPT, WAIT_SEND, WAIT_RESOLVE, WAIT_DNSPROXY, WAIT_DNS_TCP };
+
 struct net_wait {
-    uint16_t op;
+    int kind;
     struct conn_budget *budget;
-    int socket;   /* the process's socket (a duplicate) */
-    int answer;   /* the request's answer socket (a duplicate) */
+    const struct sbx_policy *policy;  /* held: an accept's rules, a relay's or a lookup's */
+    pid_t pid;
+    int socket;   /* the process's socket (a duplicate), or a relay's end */
+    int answer;   /* the request's answer socket (a duplicate), or -1 */
     struct sockaddr_storage address;
     socklen_t length;
     int flags;
+    struct msghdr message;  /* WAIT_SEND: a copy, with its buffers */
+    struct iovec part;
+    int rights[SBX_SEND_RIGHTS_MAX];
+    int right_count;
+    char name[256];         /* WAIT_RESOLVE */
 };
+
+/* An accepted peer, under the in rules: 0, or a refusal (the connection is then closed). */
+static int accept_allowed(const struct net_wait *w, int listening, const struct sockaddr_storage *peer, socklen_t length) {
+    if (!w->policy || !netp_active(w->policy->netp)) return 0;
+    int domain = peer->ss_family;
+    if (domain != AF_INET && domain != AF_INET6) return 0;
+    struct netp_addr from;
+    if (netp_addr_of((const struct sockaddr *) peer, length, 0, &from) != 0) return -EACCES;
+    struct sockaddr_storage local;
+    socklen_t local_length = sizeof(local);
+    unsigned port = 0;
+    struct netp_addr here;
+    if (getsockname(listening, (struct sockaddr *) &local, &local_length) == 0 &&
+        netp_addr_of((struct sockaddr *) &local, local_length, 0, &here) == 0) {
+        port = here.port;
+    }
+    char words[200], address[160];
+    address_words((const struct sockaddr *) peer, length, address, sizeof(address));
+    snprintf(words, sizeof(words), "%s to port %u", address, port);
+    return rule_decide(w->policy, SBX_ACCEPT, words, w->pid, netp_in(w->policy->netp, NETP_TCP, port, &from));
+}
 
 static void *net_wait_thread(void *argument) {
     struct net_wait *w = argument;
-    if (w->op == SBX_CONNECT) {
+    if (w->kind == WAIT_CONNECT) {
         int r = connect(w->socket, (const struct sockaddr *) &w->address, w->length);
         reply(w->answer, r == 0 ? 0 : -errno, NULL, 0, -1);
-    } else {
-        struct sockaddr_storage peer;
-        socklen_t length = sizeof(peer);
-        int connection = accept4(w->socket, (struct sockaddr *) &peer, &length, (w->flags & SOCK_NONBLOCK) | SOCK_CLOEXEC);
-        if (connection < 0) reply(w->answer, -errno, NULL, 0, -1);
-        else {
+    } else if (w->kind == WAIT_ACCEPT) {
+        for (;;) {
+            struct sockaddr_storage peer;
+            socklen_t length = sizeof(peer);
+            memset(&peer, 0, sizeof(peer));
+            int connection = accept4(w->socket, (struct sockaddr *) &peer, &length, (w->flags & SOCK_NONBLOCK) | SOCK_CLOEXEC);
+            if (connection < 0) {
+                reply(w->answer, -errno, NULL, 0, -1);
+                break;
+            }
             if (length > (socklen_t) sizeof(peer)) length = sizeof(peer);
+            if (accept_allowed(w, w->socket, &peer, length) != 0) {
+                /* A peer the rules refuse never reaches the process; the next one is waited for. */
+                close(connection);
+                continue;
+            }
             reply(w->answer, (int64_t) length, &peer, (uint32_t) length, connection);
             close(connection);
+            break;
         }
+    } else if (w->kind == WAIT_SEND) {
+        ssize_t sent;
+        do sent = sendmsg(w->socket, &w->message, w->flags);
+        while (sent < 0 && errno == EINTR);
+        reply(w->answer, sent < 0 ? -errno : sent, NULL, 0, -1);
+        free(w->part.iov_base);
+        free(w->message.msg_name);
+        free(w->message.msg_control);
+        for (int i = 0; i < w->right_count; i++) close(w->rights[i]);
+        w->part.iov_base = w->message.msg_name = w->message.msg_control = NULL;
+        w->right_count = 0;
+    } else if (w->kind == WAIT_RESOLVE) {
+        struct sockaddr_storage found[SBX_RESOLVE_MAX];
+        struct lookup_context l = {w->policy, w->pid};
+        int max = w->flags < SBX_RESOLVE_MAX ? w->flags : SBX_RESOLVE_MAX;
+        int n = broker_lookup(&l, w->name, (int) w->length, found, max);
+        reply(w->answer, n, n > 0 ? found : NULL, n > 0 ? (uint32_t) (n * sizeof(found[0])) : 0, -1);
+    } else {
+        struct lookup_context l = {w->policy, w->pid};
+        if (w->kind == WAIT_DNSPROXY) netp_serve_dnsproxy(w->socket, broker_lookup, &l);
+        else netp_serve_dns_tcp(w->socket, broker_lookup, &l);
     }
     struct conn_budget *budget = w->budget;
-    close(w->socket);
-    close(w->answer);
+    if (w->socket >= 0) close(w->socket);
+    if (w->answer >= 0) close(w->answer);
+    if (w->policy) policy_release(w->policy);
     free(w);
     net_wait_unreserve(budget);
     return NULL;
 }
 
-static void net_wait_start(uint16_t op, int socket_fd, int answer, const void *address, socklen_t length, int flags,
-                           struct conn_budget *budget) {
-    if (net_wait_reserve(budget) != 0) { reply(answer, -EAGAIN, NULL, 0, -1); return; }
-    struct net_wait *w = calloc(1, sizeof(*w));
-    int s = fcntl(socket_fd, F_DUPFD_CLOEXEC, 0);
-    int a = fcntl(answer, F_DUPFD_CLOEXEC, 0);
-    if (!w || s < 0 || a < 0) {
-        reply(answer, -ENOMEM, NULL, 0, -1);
-        if (s >= 0) close(s);
-        if (a >= 0) close(a);
-        free(w);
-        net_wait_unreserve(budget);
-        return;
+static void net_wait_free(struct net_wait *w);
+
+/* Starts w (filled but for its budget) on a thread of its own; on failure answers and frees it. */
+static void net_wait_launch(struct net_wait *w, int answer, struct conn_budget *budget) {
+    if (net_wait_reserve(budget) != 0) {
+        if (answer >= 0) reply(answer, -EAGAIN, NULL, 0, -1);
+        goto undo;
     }
-    w->op = op;
     w->budget = budget;
-    w->socket = s;
-    w->answer = a;
-    if (address && length > 0) memcpy(&w->address, address, (size_t) length);
-    w->length = length;
-    w->flags = flags;
     pthread_attr_t attributes;
     pthread_attr_init(&attributes);
     pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
     pthread_t thread;
     int error = pthread_create(&thread, &attributes, net_wait_thread, w);
     pthread_attr_destroy(&attributes);
-    if (error != 0) {
-        reply(answer, -error, NULL, 0, -1);
-        close(s);
-        close(a);
+    if (error == 0) return;
+    if (answer >= 0) reply(answer, -error, NULL, 0, -1);
+    net_wait_unreserve(budget);
+undo:
+    net_wait_free(w);
+}
+
+/* Frees a net_wait that never ran, with everything it holds. */
+static void net_wait_free(struct net_wait *w) {
+    if (w->socket >= 0) close(w->socket);
+    if (w->answer >= 0) close(w->answer);
+    if (w->policy) policy_release(w->policy);
+    free(w->part.iov_base);
+    free(w->message.msg_name);
+    free(w->message.msg_control);
+    for (int i = 0; i < w->right_count; i++) close(w->rights[i]);
+    free(w);
+}
+
+/* A new net_wait with duplicates of socket_fd and answer (either may be -1); NULL (answered ENOMEM) on failure. */
+static struct net_wait *net_wait_new(int kind, int socket_fd, int answer) {
+    struct net_wait *w = calloc(1, sizeof(*w));
+    int s = socket_fd >= 0 ? fcntl(socket_fd, F_DUPFD_CLOEXEC, 0) : -1;
+    int a = answer >= 0 ? fcntl(answer, F_DUPFD_CLOEXEC, 0) : -1;
+    if (!w || (socket_fd >= 0 && s < 0) || (answer >= 0 && a < 0)) {
+        if (answer >= 0) reply(answer, -ENOMEM, NULL, 0, -1);
+        if (s >= 0) close(s);
+        if (a >= 0) close(a);
         free(w);
-        net_wait_unreserve(budget);
+        return NULL;
     }
+    w->kind = kind;
+    w->socket = s;
+    w->answer = a;
+    return w;
+}
+
+static void net_wait_start(int kind, int socket_fd, int answer, const void *address, socklen_t length, int flags,
+                           const struct sbx_policy *policy, pid_t pid, struct conn_budget *budget) {
+    struct net_wait *w = net_wait_new(kind, socket_fd, answer);
+    if (!w) return;
+    if (address && length > 0) memcpy(&w->address, address, (size_t) length);
+    w->length = length;
+    w->flags = flags;
+    w->pid = pid;
+    if (policy) w->policy = policy_hold(policy);
+    net_wait_launch(w, answer, budget);
+}
+
+/*
+ * A name server the broker answers itself, for the process: a stream
+ * socketpair whose one end is handed over (in place of the system resolver's
+ * socket, or a TCP socket to port 53), the other served on a thread of its
+ * own. The handed end keeps the process socket's non-blocking mode.
+ */
+static void relay_start(int kind, int subject, int answer, const struct sbx_policy *policy, pid_t pid,
+                        struct conn_budget *budget) {
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) { reply(answer, -errno, NULL, 0, -1); return; }
+    if (fcntl(subject, F_GETFL) & O_NONBLOCK) fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL) | O_NONBLOCK);
+    struct net_wait *w = net_wait_new(kind, -1, -1);
+    if (!w) {
+        reply(answer, -ENOMEM, NULL, 0, -1);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+    w->socket = pair[1];
+    w->pid = pid;
+    w->policy = policy_hold(policy);
+    if (net_wait_reserve(budget) != 0) {
+        reply(answer, -EAGAIN, NULL, 0, -1);
+        close(pair[0]);
+        close(pair[1]);
+        policy_release(w->policy);
+        free(w);
+        return;
+    }
+    net_wait_unreserve(budget);  /* net_wait_launch reserves again; checked here so nothing is half-handed */
+    reply(answer, 0, NULL, 0, pair[0]);
+    close(pair[0]);
+    net_wait_launch(w, -1, budget);
 }
 
 static int socket_domain(int fd);
@@ -1572,6 +1770,15 @@ static int read_int(const char *body, size_t body_len, int *out) {
     return 0;
 }
 
+/* The words for an inet address and protocol: "udp 203.0.113.5:443". */
+static void proto_words(unsigned protocol, const struct sockaddr *address, socklen_t length, char *out, size_t size) {
+    char where[160];
+    address_words(address, length, where, sizeof(where));
+    snprintf(out, size, "%s %s", protocol == NETP_UDP ? "udp" : "tcp", where);
+}
+
+static const char dns_rule[] = "DNS goes through the broker";
+
 static void net_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
                     size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
     int answer = fds[0];
@@ -1581,7 +1788,9 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
         reply(answer, -EINVAL, NULL, 0, -1);
         return;
     }
-    char words[160];
+    int ruled = netp_active(policy->netp);
+    unsigned grants = net_grants(policy);
+    char words[200];
     if (request->op == SBX_SOCKET) {
         int protocol;
         int domain = request->flags;
@@ -1590,7 +1799,7 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
         if (read_int(body, body_len, &protocol) != 0) { reply(answer, -EINVAL, NULL, 0, -1); return; }
         snprintf(words, sizeof(words), "%s %s", domain == AF_INET6 ? "inet6" : "inet", base == SOCK_DGRAM ? "udp" : "tcp");
         int verdict = (domain != AF_INET && domain != AF_INET6) || (base != SOCK_STREAM && base != SOCK_DGRAM) ? -EAFNOSUPPORT
-                    : (policy->net & (SBX_NET_CONNECT | SBX_NET_LISTEN)) ? 0 : -EACCES;
+                    : (grants & (SBX_NET_CONNECT | SBX_NET_LISTEN)) ? 0 : -EACCES;
         if (verdict != -EAFNOSUPPORT) verdict = net_decide(policy, request->op, words, pid, verdict);
         if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
         int made = socket(domain, base | (type & SOCK_NONBLOCK) | SOCK_CLOEXEC, protocol);
@@ -1618,12 +1827,20 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
         }
         if (found < 0) { reply(answer, -ENOSYS, NULL, 0, -1); return; }
         unsigned grant = policy->system_grants[found];
-        int verdict = grant == 0 || (policy->net & grant) ? 0 : -EACCES;
-        verdict = net_decide(policy, request->op, path, pid, verdict);
-        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+        int verdict = grant == 0 || (grants & grant) ? 0 : -EACCES;
         int type = 0;
         socklen_t length = sizeof(type);
         if (getsockopt(subject, SOL_SOCKET, SO_TYPE, &type, &length) != 0) { reply(answer, -errno, NULL, 0, -1); return; }
+        if (ruled && (grant & SBX_NET_RESOLVE) && type == SOCK_STREAM) {
+            /* Rule mode: the system resolver is the broker's own, which answers netd's protocol itself. */
+            snprintf(words, sizeof(words), "%s (answered by the broker)", path);
+            verdict = net_decide_rule(policy, request->op, words, pid, verdict, verdict == 0 ? NULL : dns_rule);
+            if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+            relay_start(WAIT_DNSPROXY, subject, answer, policy, pid, budget);
+            return;
+        }
+        verdict = net_decide(policy, request->op, path, pid, verdict);
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
         int nonblocking = (fcntl(subject, F_GETFL) & O_NONBLOCK) ? SOCK_NONBLOCK : 0;
         int made = socket(AF_UNIX, type | nonblocking | SOCK_CLOEXEC, 0);
         if (made < 0) { reply(answer, -errno, NULL, 0, -1); return; }
@@ -1639,26 +1856,45 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
         close(made);
         return;
     }
+    if (request->op == SBX_ACCEPT && domain == AF_UNIX) {
+        /* SBX_LOCK_NET_FILTER sends every accept here: a Unix socket's is the kernel's, made on the same socket. */
+        int value;
+        if (read_int(body, body_len, &value) != 0) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        net_wait_start(WAIT_ACCEPT, subject, answer, NULL, 0, value, NULL, pid, budget);
+        return;
+    }
     if (domain != AF_INET && domain != AF_INET6) {
-        /* The process's own Unix socket: not the broker's to bind, listen on or accept from. */
+        /* The process's own Unix socket: not the broker's to bind or listen on. */
         reply(answer, -EACCES, NULL, 0, -1);
         return;
     }
+    unsigned protocol = socket_protocol(subject);
     if (request->op == SBX_LISTEN || request->op == SBX_ACCEPT) {
         int value;
         if (read_int(body, body_len, &value) != 0) { reply(answer, -EINVAL, NULL, 0, -1); return; }
         struct sockaddr_storage local;
         socklen_t length = sizeof(local);
         memset(&local, 0, sizeof(local));
-        if (getsockname(subject, (struct sockaddr *) &local, &length) == 0) address_words((struct sockaddr *) &local, length, words, sizeof(words));
+        struct netp_addr here = {0};
+        int bound = getsockname(subject, (struct sockaddr *) &local, &length) == 0 &&
+                    netp_addr_of((struct sockaddr *) &local, length, 0, &here) == 0 && here.port != 0;
+        if (bound) address_words((struct sockaddr *) &local, length, words, sizeof(words));
         else snprintf(words, sizeof(words), "unbound");
-        int verdict = net_decide(policy, request->op, words, pid, (policy->net & SBX_NET_LISTEN) ? 0 : -EACCES);
+        int verdict;
+        if (ruled) {
+            /* The port must be one an in rule allows; an unbound socket would take a port no rule named. */
+            struct netp_verdict v = {NETP_NONE, "no rule"};
+            if (bound) v = netp_bind(policy->netp, protocol ? protocol : NETP_TCP, here.port, NULL);
+            verdict = rule_decide(policy, request->op, words, pid, v);
+        } else {
+            verdict = net_decide(policy, request->op, words, pid, (grants & SBX_NET_LISTEN) ? 0 : -EACCES);
+        }
         if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
         if (request->op == SBX_LISTEN) {
             reply(answer, listen(subject, value) == 0 ? 0 : -errno, NULL, 0, -1);
             return;
         }
-        net_wait_start(SBX_ACCEPT, subject, answer, NULL, 0, value, budget);
+        net_wait_start(WAIT_ACCEPT, subject, answer, NULL, 0, value, ruled ? policy : NULL, pid, budget);
         return;
     }
     /* connect or bind: an inet address of the socket's own family. */
@@ -1673,16 +1909,227 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
     address_words((struct sockaddr *) &address, length, words, sizeof(words));
     int verdict;
     if (request->op == SBX_BIND) {
-        /* A port of the system's choosing (0) is what a client binds; a named port is listening. */
-        unsigned need = port_of((struct sockaddr *) &address) == 0 ? (SBX_NET_CONNECT | SBX_NET_LISTEN) : SBX_NET_LISTEN;
-        verdict = net_decide(policy, request->op, words, pid, (policy->net & need) ? 0 : -EACCES);
+        unsigned port = port_of((struct sockaddr *) &address);
+        if (ruled) {
+            struct netp_verdict v;
+            if (port == 0) {
+                /* A port of the system's choosing is a client's: allowed when the rules can allow going out. */
+                v.action = (grants & SBX_NET_CONNECT) ? NETP_ALLOW : NETP_NONE;
+                v.rule = (grants & SBX_NET_CONNECT) ? "a client's own port (an out rule)" : "no rule";
+            } else {
+                int loopback_only = 0;
+                v = netp_bind(policy->netp, protocol ? protocol : NETP_TCP, port, &loopback_only);
+                struct netp_addr at;
+                static const uint8_t zero[16];
+                if (loopback_only && netp_addr_of((struct sockaddr *) &address, length, 0, &at) == 0 &&
+                    memcmp(at.a, zero, at.family == AF_INET ? 4 : 16) == 0) {
+                    /* Every rule for this port is loopback's: the wildcard bind is made on loopback, never the network. */
+                    if (address.ss_family == AF_INET) {
+                        ((struct sockaddr_in *) &address)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                    } else {
+                        ((struct sockaddr_in6 *) &address)->sin6_addr = in6addr_loopback;
+                    }
+                    size_t used = strlen(words);
+                    snprintf(words + used, sizeof(words) - used, " (made on loopback)");
+                }
+            }
+            verdict = rule_decide(policy, request->op, words, pid, v);
+        } else {
+            /* A port of the system's choosing (0) is what a client binds; a named port is listening. */
+            unsigned need = port == 0 ? (SBX_NET_CONNECT | SBX_NET_LISTEN) : SBX_NET_LISTEN;
+            verdict = net_decide(policy, request->op, words, pid, (grants & need) ? 0 : -EACCES);
+        }
         if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
         reply(answer, bind(subject, (struct sockaddr *) &address, length) == 0 ? 0 : -errno, NULL, 0, -1);
         return;
     }
-    verdict = net_decide(policy, request->op, words, pid, (policy->net & SBX_NET_CONNECT) ? 0 : -EACCES);
+    if (ruled && address.ss_family != AF_UNSPEC) {
+        struct netp_addr to;
+        if (netp_addr_of((struct sockaddr *) &address, length, 1, &to) != 0) { reply(answer, -EAFNOSUPPORT, NULL, 0, -1); return; }
+        proto_words(protocol, (struct sockaddr *) &address, length, words, sizeof(words));
+        if (to.port == 53) {
+            /* Names go through the broker: a TCP name server is the broker's own; UDP to port 53 is refused. */
+            if (protocol == NETP_TCP) {
+                size_t used = strlen(words);
+                snprintf(words + used, sizeof(words) - used, " (answered by the broker)");
+                verdict = net_decide_rule(policy, request->op, words, pid, (grants & SBX_NET_RESOLVE) ? 0 : -EACCES, dns_rule);
+                if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+                relay_start(WAIT_DNS_TCP, subject, answer, policy, pid, budget);
+                return;
+            }
+            verdict = net_decide_rule(policy, request->op, words, pid, -EACCES, dns_rule);
+        } else {
+            verdict = rule_decide(policy, request->op, words, pid, netp_out(policy->netp, protocol ? protocol : NETP_TCP, &to));
+        }
+    } else {
+        verdict = net_decide(policy, request->op, words, pid, (grants & SBX_NET_CONNECT) ? 0 : -EACCES);
+    }
     if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
-    net_wait_start(SBX_CONNECT, subject, answer, &address, length, 0, budget);
+    net_wait_start(WAIT_CONNECT, subject, answer, &address, length, 0, NULL, pid, budget);
+}
+
+/*
+ * SBX_SEND (SBX_LOCK_NET_FILTER): a send the handler could not make itself,
+ * because it names an address, carries control data or gathers a datagram.
+ * The address is decided like a connect's (a datagram's destination; a
+ * stream ignores one); the call is made on the process's own socket.
+ */
+static void send_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body, size_t body_len,
+                     int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
+    int answer = fds[0];
+    struct sbx_send_head head;
+    if (request->path_len < sizeof(head) || (size_t) request->path_len + request->path2_len != body_len ||
+        request->path2_len > SBX_SEND_MAX || request->dirfd_sent != 1 || request->dirfd2_sent || fd_count < 2) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    memcpy(&head, body, sizeof(head));
+    if (head.addr_len > sizeof(struct sockaddr_storage) || head.control_len > SBX_SEND_CONTROL_MAX ||
+        sizeof(head) + head.addr_len + head.control_len != request->path_len || head.rights > SBX_SEND_RIGHTS_MAX ||
+        (int) head.rights != fd_count - 2) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    const char *address_bytes = body + sizeof(head);
+    const char *control_bytes = address_bytes + head.addr_len;
+    const char *payload = body + request->path_len;
+    int subject = fds[1];
+    int domain = socket_domain(subject);
+    if (domain < 0) { reply(answer, domain, NULL, 0, -1); return; }
+    unsigned protocol = socket_protocol(subject);
+    struct sockaddr_storage address;
+    memset(&address, 0, sizeof(address));
+    socklen_t address_length = head.addr_len;
+    if (head.addr_len) memcpy(&address, address_bytes, head.addr_len);
+    if (head.addr_len && protocol == NETP_TCP) address_length = 0;  /* a stream ignores the address (MSG_FASTOPEN is refused) */
+    if (address_length) {
+        char words[200];
+        int verdict;
+        if (domain == AF_UNIX) {
+            /* A named Unix datagram: only to a system socket the process may have. */
+            struct sockaddr_un *un = (struct sockaddr_un *) &address;
+            size_t n = address_length > offsetof(struct sockaddr_un, sun_path) ? address_length - offsetof(struct sockaddr_un, sun_path) : 0;
+            char path[sizeof(un->sun_path) + 1];
+            if (n > sizeof(un->sun_path)) n = sizeof(un->sun_path);
+            memcpy(path, un->sun_path, n);
+            path[n] = '\0';
+            verdict = -EACCES;
+            for (unsigned i = 0; path[0] == '/' && i < policy->system_count; i++) {
+                if (strcmp(path, policy->system_paths[i]) == 0 &&
+                    (policy->system_grants[i] == 0 || (net_grants(policy) & policy->system_grants[i]))) {
+                    verdict = 0;
+                }
+            }
+            verdict = net_decide(policy, SBX_SEND, path[0] ? path : "an unnamed Unix address", pid, verdict);
+        } else if (domain == AF_INET || domain == AF_INET6) {
+            struct netp_addr to;
+            if (netp_addr_of((struct sockaddr *) &address, address_length, 1, &to) != 0) {
+                reply(answer, -EAFNOSUPPORT, NULL, 0, -1);
+                return;
+            }
+            proto_words(protocol, (struct sockaddr *) &address, address_length, words, sizeof(words));
+            if (!netp_active(policy->netp)) {
+                verdict = net_decide(policy, SBX_SEND, words, pid, (policy->net & SBX_NET_CONNECT) ? 0 : -EACCES);
+            } else if (to.port == 53) {
+                verdict = net_decide_rule(policy, SBX_SEND, words, pid, -EACCES, dns_rule);
+            } else {
+                verdict = rule_decide(policy, SBX_SEND, words, pid, netp_out(policy->netp, protocol ? protocol : NETP_UDP, &to));
+            }
+        } else {
+            verdict = -EAFNOSUPPORT;
+        }
+        if (verdict != 0) { reply(answer, verdict, NULL, 0, -1); return; }
+    }
+    /* Control: SCM_RIGHTS rebuilt from the descriptors that came, then the other messages, checked. */
+    for (size_t at = 0; at < head.control_len;) {
+        struct cmsghdr c;
+        if (head.control_len - at < sizeof(c)) { reply(answer, -EINVAL, NULL, 0, -1); return; }
+        memcpy(&c, control_bytes + at, sizeof(c));
+        if (c.cmsg_len < sizeof(c) || c.cmsg_len > head.control_len - at || c.cmsg_level == SOL_SOCKET) {
+            reply(answer, -EINVAL, NULL, 0, -1);
+            return;
+        }
+        at += CMSG_ALIGN(c.cmsg_len);
+    }
+    size_t rights_space = head.rights ? CMSG_SPACE(sizeof(int) * head.rights) : 0;
+    size_t control_size = rights_space + head.control_len;
+    char *control = control_size ? calloc(1, control_size) : NULL;
+    if (control_size && !control) { reply(answer, -ENOMEM, NULL, 0, -1); return; }
+    if (head.rights) {
+        struct cmsghdr *c = (struct cmsghdr *) control;
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int) * head.rights);
+        memcpy(CMSG_DATA(c), fds + 2, sizeof(int) * head.rights);
+    }
+    if (head.control_len) memcpy(control + rights_space, control_bytes, head.control_len);
+    struct iovec part = {(void *) payload, request->path2_len};
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_name = address_length ? &address : NULL;
+    message.msg_namelen = address_length;
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = control_size;
+    /* The broker's serve thread never blocks on the process's socket, and never takes its SIGPIPE. */
+    int flags = (request->flags & ~(MSG_FASTOPEN | MSG_DONTWAIT)) | MSG_NOSIGNAL;
+    ssize_t sent = sendmsg(subject, &message, flags | MSG_DONTWAIT);
+    int wants_wait = sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !(request->flags & MSG_DONTWAIT) &&
+                     !(fcntl(subject, F_GETFL) & O_NONBLOCK);
+    if (!wants_wait) {
+        reply(answer, sent < 0 ? -errno : sent, NULL, 0, -1);
+        free(control);
+        return;
+    }
+    /* A blocking send with a full buffer: it waits on a thread of its own, with copies of everything. */
+    struct net_wait *w = net_wait_new(WAIT_SEND, subject, answer);
+    if (!w) { free(control); return; }
+    w->part.iov_base = malloc(request->path2_len ? request->path2_len : 1);
+    w->part.iov_len = request->path2_len;
+    if (address_length) w->message.msg_name = malloc(address_length);
+    int ok = w->part.iov_base && (!address_length || w->message.msg_name);
+    for (unsigned i = 0; ok && i < head.rights; i++) {
+        w->rights[i] = fcntl(fds[2 + i], F_DUPFD_CLOEXEC, 0);
+        if (w->rights[i] < 0) ok = 0;
+        else w->right_count++;
+    }
+    if (!ok) {
+        reply(answer, -ENOMEM, NULL, 0, -1);
+        free(control);
+        net_wait_free(w);
+        return;
+    }
+    memcpy(w->part.iov_base, payload, request->path2_len);
+    if (address_length) memcpy(w->message.msg_name, &address, address_length);
+    w->message.msg_namelen = address_length;
+    w->message.msg_iov = &w->part;
+    w->message.msg_iovlen = 1;
+    if (head.rights) memcpy(CMSG_DATA((struct cmsghdr *) control), w->rights, sizeof(int) * head.rights);
+    w->message.msg_control = control;
+    w->message.msg_controllen = control_size;
+    w->flags = flags;
+    net_wait_launch(w, w->answer, budget);
+}
+
+/* SBX_RESOLVE (sbx_resolve): a name, decided and resolved on a thread of its own, since a lookup can take seconds. */
+static void resolve_one(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                        size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
+    int answer = fds[0];
+    if (fd_count != 1 || request->path2_len != 0 || request->path_len != body_len || body_len == 0 || body_len > 253 ||
+        memchr(body, '\0', body_len) || request->dirfd_sent || request->dirfd2_sent) {
+        reply(answer, -EINVAL, NULL, 0, -1);
+        return;
+    }
+    struct net_wait *w = net_wait_new(WAIT_RESOLVE, -1, answer);
+    if (!w) return;
+    memcpy(w->name, body, body_len);
+    w->name[body_len] = '\0';
+    w->length = (socklen_t) request->mode;  /* the family */
+    w->flags = request->flags > 0 ? request->flags : SBX_RESOLVE_MAX;
+    w->pid = pid;
+    w->policy = policy_hold(policy);
+    net_wait_launch(w, w->answer, budget);
 }
 
 const char *sbx_syscall_name(long nr) {
@@ -1894,6 +2341,14 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
         watch_one(policy, request, body, body_len, fds, fd_count, pid);
         return;
     }
+    if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_SEND) {
+        send_one(policy, request, body, body_len, fds, fd_count, pid, budget);
+        return;
+    }
+    if (request->version == SBX_PROTOCOL_VERSION && request->op == SBX_RESOLVE) {
+        resolve_one(policy, request, body, body_len, fds, fd_count, pid, budget);
+        return;
+    }
     if (request->version == SBX_PROTOCOL_VERSION && request->op >= SBX_SOCKET && request->op <= SBX_ACCEPT) {
         net_one(policy, request, body, body_len, fds, fd_count, pid, budget);
         return;
@@ -1950,13 +2405,20 @@ int sbx_broker_prepare(int fd) {
 /* Answers fd's requests until the other end closes it. Leaves fd open and the policy to the caller. */
 static void serve_loop(const struct sbx_policy *policy, int fd) {
     struct conn_budget *budget = conn_budget_new();
-    struct {
+    /* A path request needs two paths; a send (SBX_LOCK_NET_FILTER) a datagram and its header. */
+    struct incoming {
         struct sbx_request request;
-        char body[SBX_PATH_MAX * 2];
-    } incoming;
+        char body[SBX_SEND_MAX + 1024];
+    };
+    struct incoming *in = malloc(sizeof(*in));
+    if (!in) {
+        conn_budget_release(budget);
+        return;
+    }
+#define incoming (*in)
     for (;;) {
         union {
-            char buffer[CMSG_SPACE(sizeof(int) * 3) + CMSG_SPACE(sizeof(struct ucred))];
+            char buffer[CMSG_SPACE(sizeof(int) * SBX_FDS_MAX) + CMSG_SPACE(sizeof(struct ucred))];
             struct cmsghdr align;
         } control;
         struct iovec part = {&incoming, sizeof(incoming)};
@@ -1969,7 +2431,7 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
         ssize_t n = recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
-        int fds[3];
+        int fds[SBX_FDS_MAX];
         int fd_count = 0;
         pid_t pid = 0;
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&message); c; c = CMSG_NXTHDR(&message, c)) {
@@ -1979,7 +2441,7 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
                 for (size_t i = 0; i < count; i++) {
                     int received;
                     memcpy(&received, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
-                    if (fd_count < 3) fds[fd_count++] = received;
+                    if (fd_count < SBX_FDS_MAX) fds[fd_count++] = received;
                     else close(received);
                 }
             } else if (c->cmsg_type == SCM_CREDENTIALS) {
@@ -2002,6 +2464,8 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
         }
         for (int i = 0; i < fd_count; i++) close(fds[i]);
     }
+#undef incoming
+    free(in);
     /* The connection is done; its net_wait threads (if any still run) hold their own references. */
     conn_budget_release(budget);
 }
@@ -2289,6 +2753,11 @@ unsigned char *sbx_policy_serialize(const struct sbx_policy *policy, size_t *len
         put_u64(&p, policy->unix_name_lengths[i]);
         put_bytes(&p, policy->unix_names[i], policy->unix_name_lengths[i]);
     }
-    if (len) *len = size;
+    size_t total = size;
+    if (netp_serialize(policy->netp, &out, &total) != 0) {
+        free(out);
+        return NULL;
+    }
+    if (len) *len = total;
     return out;
 }

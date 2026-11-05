@@ -1,7 +1,7 @@
 # sandbox: a process sandbox library (seccomp lockdown + syscall broker).
 # Copyright (C) 2026 the sandbox authors. GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.18)
-project(fibrewall VERSION 0.1.7 LANGUAGES C)
+project(fibrewall VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -45,7 +45,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(sbx STATIC src/lockdown.c src/broker.c src/spawn.c src/open.c src/attach.c src/contract.c)
+add_library(sbx STATIC src/lockdown.c src/broker.c src/net.c src/spawn.c src/open.c src/attach.c src/contract.c)
 target_include_directories(sbx PUBLIC include PRIVATE src)
 target_link_libraries(sbx PUBLIC Threads::Threads)
 target_compile_options(sbx PRIVATE -Wall -Wextra -Werror -fvisibility=hidden)
@@ -94,7 +94,7 @@ endif()
 # It includes broker.c to reach the static serve_one, so it does not link libsbx (that would double-define).
 option(SBX_FUZZ "Build the broker libFuzzer target (clang only)" OFF)
 if(SBX_FUZZ)
-  add_executable(fuzz_broker tests/fuzz_broker.c)
+  add_executable(fuzz_broker tests/fuzz_broker.c src/net.c)
   target_include_directories(fuzz_broker PRIVATE src include)
   target_compile_options(fuzz_broker PRIVATE -g -O1 -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
   target_link_options(fuzz_broker PRIVATE -fsanitize=fuzzer,address,undefined)

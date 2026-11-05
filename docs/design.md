@@ -1787,6 +1787,212 @@ new program keeps the filter but not the handler, so its first trapped call
 ended it with signal 31. Learning now records exec and refuses it, as a real
 lockdown does.
 
+## Network filtering (built 2026-11-05, docs/universal.md decision 2)
+
+Before this, a confined process's network was all or nothing: the
+`SBX_NET_*` grants said "may connect" or "may listen", and anything finer
+was left to a decider reading addresses in words, which a worker could
+step around (below). The owner wants it genuine (2026-10-29, verbatim in
+`docs/universal.md` §0: "Network filtering is genuine"). A host now declares, per
+sandboxed process, which destinations it may reach; the broker enforces
+it; everything else is refused and logged. Fibrewall enforces a policy and
+never decides what an app needs: each engine host (droidtop's plugin host,
+Enginehost's runtime) writes the rules for its own processes.
+
+### Threat model
+
+The worker is hostile and has the whole of its own address space: it can
+issue any system call from any instruction, forge any argument, jump into
+the library's code (the handler's gateway included), and keep descriptors
+it was given. It wants to move data to a place the policy does not name:
+a host on the internet, a device on the local network, a service on the
+device, or a name server that relays a query on to someone who reads it
+(data carried out in DNS queries). It does not have root, and the kernel and the broker
+are trusted. The host's rules are trusted; nothing the worker says is.
+
+What has to hold:
+
+1. **No socket the worker holds can be pointed at an address the broker
+   did not decide.** A TCP socket is pointed once, at `connect`; a UDP
+   socket is pointed at `connect` and again by every `sendto` and
+   `sendmsg` that names an address. So every one of those is decided by the
+   broker, and none can be made from the worker's side, the gateway
+   included.
+2. **No name lookup leaves the device unless the policy names it.** A
+   query for `<secret>.attacker.example` carries the secret to whoever runs
+   that zone, whatever the answer. Lookups go through the broker, which
+   resolves only names the rules allow, and DNS any other way is refused.
+3. **Every refusal is logged** through the policy's audit, with the rule
+   that decided it, so the host or a person can see what was tried.
+
+### What a host declares
+
+A policy in **rule mode** has at least one network rule, added as a line of
+text (`sbx_policy_net_rule`), so a rule reads the same in the host's code,
+in the audit and in this document:
+
+```
+<allow|deny|ask> <out|in> [tcp|udp] <destination> [port N[-M]]
+<allow|deny|ask> dns <any|name>
+```
+
+- **out** is a connect, or a datagram sent to an address; the destination
+  is the peer. **in** is a bind of a named port, a listen and each accepted
+  connection; the destination is the peer allowed to connect, and the port
+  is the local one.
+- **Destinations**: `any`; `loopback` (127.0.0.0/8, ::1); `local`
+  (loopback, the private ranges 10/8, 172.16/12 and 192.168/16,
+  link-local 169.254/16 and fe80::/10, unique-local fc00::/7, broadcast
+  255.255.255.255, and multicast of link or site scope: 224.0.0.0/4 and
+  ff01:: to ff05::); `internet` (every other address); an address or a
+  prefix (`192.0.2.7`, `10.0.0.0/8`, `2001:db8::/32`); or a **name**
+  (`example.com`, or `*.example.com` for its subdomains, not the name
+  itself).
+- **Order decides**: the first rule that matches answers. A request no rule
+  matches is refused. `ask` hands it to the decider, and with no decider it
+  is refused.
+- An IPv4-mapped IPv6 address (`::ffff:192.0.2.7`) is matched as the IPv4
+  address it is, and a connect to the unspecified address (`0.0.0.0`,
+  `::`), which Linux turns into loopback, is matched as loopback. Neither
+  form gets past a rule written for the other.
+- **Local-only listening**: when every `in` rule that allows a port is
+  loopback-scoped, a bind to the wildcard address on that port is made on
+  loopback instead, so the port is never open to the network, and the audit
+  says so.
+- A process with only `in` rules can still bind port 0 (a client's own
+  port) only when some `out` rule allows that protocol.
+
+The old grants keep their meaning for a policy without rules. In rule mode
+they follow from the rules (connect when an `out` rule can allow, listen
+when an `in` rule can, the resolver when a `dns` or name rule can), and
+`SBX_NET_DECIDE` still sends every call to the decider.
+
+### Names: DNS through the broker
+
+In rule mode the broker is the only resolver the process has:
+
+- **Which names.** A lookup is allowed when a name rule (`out` or `in`)
+  matches the name, or a `dns` rule allows it, first match deciding as
+  above. `allow dns any` allows every lookup and is the only way to: the
+  host then accepts DNS as a channel out. A wildcard name rule allows the
+  same channel to that zone's owner, which the host accepts by writing it.
+- **Name rules on connect.** The broker keeps the addresses it resolved,
+  with the name, for ten minutes (`getaddrinfo` gives no TTL). A connect
+  to an address matches a name rule when the broker resolved that address
+  for a matching name. A process that learned the address another way
+  (cached, or hard-coded) is checked by the broker resolving the exact
+  names its rules give, itself; wildcard rules match only resolved names.
+- **How the process asks.** Three ways, all decided the same way:
+  - **bionic** (Android): its `getaddrinfo` talks to netd over
+    `/dev/socket/dnsproxyd`. A connect to a system socket the host
+    registered for `SBX_NET_RESOLVE` gets, in rule mode, a socket the
+    broker serves instead of netd's: the broker answers the `getaddrinfo`
+    command of netd's protocol itself, from its own resolver, and refuses
+    other commands. Java's `InetAddress` goes the same way.
+  - **DNS over TCP** (glibc with `options use-vc`, Go's resolver with the
+    same option): a TCP connect to port 53 of any address gets a socket the
+    broker serves as a name server: A and AAAA questions are answered from
+    its resolver, a refused or unknown name as NXDOMAIN, other types as
+    not implemented.
+  - **`sbx_resolve`**, for code that can call the library.
+- **Everything else is refused**: UDP to port 53 (any address), and a
+  lookup any other way the process could try needs a socket the rules
+  allow, to a destination they name.
+
+### How it is enforced
+
+The flag `SBX_LOCK_NET_FILTER`, with `SBX_LOCK_NET_BROKERED`, closes the
+ways around the broker that the plain brokered mode leaves open:
+
+- **connect and accept always trap.** In the plain mode the handler's own
+  Unix connects and accepts were allowed from its gateway (review A-06),
+  and a worker that jumps to the gateway with an inet socket and an address
+  of its own reached the kernel undecided. Under the flag no connect or
+  accept is allowed anywhere: a Unix connect goes to the broker (a system
+  socket as before; any other path decided by the file rules, an abstract
+  name by `sbx_policy_add_unix_name`, as under `SBX_LOCK_UNIX`), and the
+  broker accepts on every socket, deciding an inet peer by the `in` rules.
+- **A send that names an address traps.** `sendto` with a destination
+  traps; one without (the second-to-last argument zero) goes straight to
+  the kernel, so a connected socket's sends cost nothing. `sendmsg` names
+  its address in memory the filter cannot read, so every `sendmsg` traps
+  except on the broker's own socket, which is connected and so takes no
+  address; `sendmmsg` always traps. The handler makes a trapped send itself
+  when it cannot carry an address (a stream socket's iovecs, as `sendto`
+  without one; a datagram with one iovec and no name). Anything else, an
+  address, control data or a gathered datagram, goes to the broker
+  (`SBX_SEND`) with the socket, which decides the address and makes the
+  call on that socket. `SCM_RIGHTS` descriptors travel with it;
+  `SCM_CREDENTIALS` is refused, since the broker would send its own.
+- **`MSG_FASTOPEN` is refused** on every send: it connects a TCP socket to
+  the address in the call.
+- **The broker's socket stays the broker's.** The filter can let `sendmsg`
+  through on one descriptor number only if nothing else can take that
+  number, so `close` of it and `dup2`/`dup3` onto it are refused (EPERM),
+  and `close_range` answers ENOSYS (libc falls back to closing one by one).
+
+The broker decides in this order: the address is normalised; port 53 is
+the resolver's (relayed or refused); the rules answer; the decider is asked
+(on `ask`, on a refusal, or on everything with `SBX_NET_DECIDE`); the audit
+gets the result with `sbx_access.net_rule` naming the rule ("no rule" when
+none matched).
+
+Cost: a connect, bind, listen and accept were already a round trip to the
+broker. New is the round trip for each datagram sent to an address
+(`sendto`, a QUIC socket's `sendmsg`), and for each `sendmsg` with control
+data. A connected UDP socket's sends do not pay it.
+
+### What it does not cover
+
+- **Inbound datagrams.** An unconnected UDP socket bound to an allowed port
+  receives from anyone; the `in` rules decide the bind, not each datagram.
+  A connected UDP socket receives only from its peer (the kernel's rule).
+- **Descriptors the worker inherited or was handed** (review A-02): a
+  socket made outside the sandbox is not the broker's.
+- **The plain modes.** `SBX_LOCK_INET` (Syncthing, Droidtop/tracker#553)
+  makes its own sockets, and the filter cannot read an address, so it
+  remains any destination (`SBX_R_NETWORK_ANY`). Plain
+  `SBX_LOCK_NET_BROKERED` decides each call but leaves the gateway and
+  `sendmsg` ways open; the contract reports filtering
+  (`SBX_G_NET_FILTERED`) only with `SBX_LOCK_NET_FILTER`.
+- **Content.** Rules are L3/L4 and names. L7 inspection (SNI, HTTP) is the
+  later layer of `docs/universal.md` §5.
+- **Android below API 30**, where an isolated process may not use a socket
+  it was given: unchanged (the byte relay is still planned).
+- **The broker's identity** (review A-06): connections are made under the
+  broker's UID, so Android's per-app network rules see the host.
+
+### API
+
+```c
+#define SBX_LOCK_NET_FILTER 0x10000u           /* with SBX_LOCK_NET_BROKERED */
+int sbx_policy_net_rule(struct sbx_policy *policy, const char *rule);   /* 0, -EINVAL, -ENOSPC */
+int sbx_resolve(const char *name, int family, struct sockaddr_storage *out, int max);  /* confined side */
+/* struct sbx_access gains, at its end: const char *net_rule; */
+#define SBX_G_NET_FILTERED (1ull << 24)         /* sbx_contract.h */
+```
+
+Additive: no existing name or meaning changes.
+
+### Tests
+
+`net_filter_check` in `tests/sbx_test.c`, on Linux and both emulators, with
+a parent holding real loopback servers, runs each allow path and each deny
+path, and the controls show the same calls get through without the flag's
+rule: TCP to an allowed and a refused port; an IPv4-mapped and an
+unspecified address to a refused port; UDP connected, and unconnected by
+`sendto`, `sendmsg` and `sendmmsg`, to an allowed and a refused port (the
+parent counts what arrived); a raw `sendmsg` with a name, and `connect`
+through the library's gateway, both refused; `MSG_FASTOPEN` refused; bind
+of an allowed and a refused port, the wildcard bind made on loopback,
+accept of an allowed peer; a name rule matched by a resolved address, and
+by the broker's own lookup; `sbx_resolve` of an allowed and a refused name;
+the DNS-over-TCP relay and the netd-protocol relay, each with an allowed
+and a refused name; UDP to port 53 refused; the broker's socket kept
+(close, dup2 and dup3 onto it refused); and the audit's count of refusals
+with "no rule". On the emulators bionic's own `getaddrinfo` runs through
+the relay as well.
+
 ## The confinement contract (built 2026-10-29, Droidtop/tracker#651)
 
 `include/sbx_contract.h` adds a report of what a policy and options
@@ -1842,6 +2048,10 @@ backend's report is a later change; the bits are the shared vocabulary.
   and the gralloc mapper opened `/dev/hwbinder` and `/dev/binder` during
   setup. The probe then drew and imported a second buffer with both
   sealed (`tests/android/gpu_probe.c`).
+- **Inbound datagrams and handed sockets under network filtering**: an
+  unconnected UDP socket on an allowed port receives from anyone, and a
+  socket the process inherited or was handed is not the broker's ("Network
+  filtering", "What it does not cover").
 - **Kernel bugs** in the system calls left open, the GPU driver's ioctls
   above all. Also denial of service (rlimits help) and timing side
   channels.

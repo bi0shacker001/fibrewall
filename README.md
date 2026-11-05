@@ -52,7 +52,7 @@ The broker resolves paths itself and makes each call relative to a parent direct
 
 ## What it blocks
 
-Refused outright: sockets (a process that needs the network can be given inet sockets, and only those, with `SBX_LOCK_INET`, or have the broker make, connect, bind, listen and accept them under its own identity with `SBX_LOCK_NET_BROKERED`, for an Android isolated process that may create none), `execve`, `ptrace`, namespaces, mounts, `io_uring`, `bpf`, signals to other processes and foreign system-call ABIs.
+Refused outright: sockets (a process that needs the network can be given inet sockets, and only those, with `SBX_LOCK_INET`, or have the broker make, connect, bind, listen and accept them under its own identity with `SBX_LOCK_NET_BROKERED`, for an Android isolated process that may create none; with `SBX_LOCK_NET_FILTER` as well, only to the destinations the host's rules name, with names resolved by the broker alone and everything else refused and logged), `execve`, `ptrace`, namespaces, mounts, `io_uring`, `bpf`, signals to other processes and foreign system-call ABIs.
 
 An end-to-end test runs escape attempts first without the sandbox, as a control, and then confined, and checks that each one fails. It also races a symlink against the broker and checks that a file outside the rules is never touched.
 
@@ -72,6 +72,12 @@ Not built yet:
 - the Android AAR with its Kotlin API.
 
 ### Releases
+
+- **v0.2.0** (2026-11-05): network filtering ([docs/design.md](docs/design.md), "Network filtering"):
+  - `sbx_policy_net_rule`: a host declares, per sandboxed process, the destinations it may reach, as lines such as `allow out tcp example.com port 443`, `allow in tcp loopback port 8384` or `allow dns any`: by address, prefix, `loopback`, `local` or `internet`, or by name; by port and protocol; allow, deny or ask the decider. The first rule that matches answers; anything else is refused, and the audit names the rule (`sbx_access.net_rule`, "no rule").
+  - `SBX_LOCK_NET_FILTER`, with `SBX_LOCK_NET_BROKERED`: no socket the process holds can be pointed at an address the broker did not decide. connect and accept always go to the broker, the handler's gateway included; a send that names an address, every `sendmsg` and every `sendmmsg` trap; `MSG_FASTOPEN` is refused; the broker's own socket cannot be closed or replaced.
+  - DNS through the broker: names a rule allows are resolved by the broker, which answers bionic's `getaddrinfo` (netd's protocol), DNS over TCP and `sbx_resolve` itself; UDP to port 53 is refused.
+  - `SBX_G_NET_FILTERED` in the contract.
 
 - **v0.1.7** (2026-10-24): each open of an own-opened device after lockdown takes one of three spare descriptors opened with it, an open file of its own; binder maps each open file once, and duplicates collided with EBUSY ([Droidtop/tracker#550](https://github.com/Droidtop/tracker/issues/550)).
 
