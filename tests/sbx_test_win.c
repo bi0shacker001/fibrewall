@@ -1100,7 +1100,19 @@ static void python_checks(void) {
             if (errors) fclose(errors);
             said[said_length] = 0;
             printf("info %s: its stderr:\n%s\n", label, said_length ? said : "(nothing)");
-            if (confined_count < 13) dll_probe(less);
+            if (confined_count < 13) {
+                dll_probe(less);
+                if (less && bundle8[0]) {
+                    /* And the bundle the less-privileged run used: its own DLLs, as copied. */
+                    wchar_t saved[MAX_PATH];
+                    wcscpy(saved, python_dir);
+                    MultiByteToWideChar(CP_UTF8, 0, bundle8, -1, python_dir, MAX_PATH);
+                    *wcsrchr(python_dir, L'\\') = 0;
+                    printf("info dll probe: the bundle's own files:\n");
+                    dll_probe(less);
+                    wcscpy(python_dir, saved);
+                }
+            }
         }
     }
     DeleteFileW(profile_file);
