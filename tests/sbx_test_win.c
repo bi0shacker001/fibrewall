@@ -904,7 +904,23 @@ static void left_on_windows_checks(void) {
     unsigned granted_count = python_dir8[0] ? 3 : 2;
     EXPECT(sbx_container_remove(CONTAINER, granted, granted_count) == 0, "remove: the container and its grants are removed");
     EXPECT(!has_entry_for(exe_dir, CONTAINER), "remove: no entry for its SID is left on the folder");
-    if (python_dir8[0]) EXPECT(!has_entry_for(python_dir, CONTAINER), "remove: nor on Python's folder");
+    if (python_dir8[0]) {
+        EXPECT(!has_entry_for(python_dir, CONTAINER), "remove: nor on Python's folder");
+        /* Nor on a file under it whose access list is protected, which got an entry of its own (grant_static). */
+        wchar_t pattern[MAX_PATH], dll[MAX_PATH];
+        swprintf(pattern, MAX_PATH, L"%ls\\python3*.dll", python_dir);
+        WIN32_FIND_DATAW found;
+        HANDLE search = FindFirstFileW(pattern, &found);
+        int left = 0;
+        if (search != INVALID_HANDLE_VALUE) {
+            do {
+                swprintf(dll, MAX_PATH, L"%ls\\%ls", python_dir, found.cFileName);
+                left |= has_entry_for(dll, CONTAINER);
+            } while (FindNextFileW(search, &found));
+            FindClose(search);
+        }
+        EXPECT(!left, "remove: nor on Python's own DLLs");
+    }
     EXPECT(sbx_container_remove(CONTAINER, granted, granted_count) == 0, "remove: removing again is harmless");
     EXPECT(sbx_container_remove("", granted, 1) == -EINVAL, "remove: a container needs a name");
 }

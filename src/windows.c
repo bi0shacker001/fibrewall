@@ -691,14 +691,15 @@ static int already_granted(PACL dacl, PSID sid) {
     for (DWORD i = 0; i < dacl->AceCount; i++) {
         ACCESS_ALLOWED_ACE *ace = NULL;
         if (!GetAce(dacl, i, (void **) &ace) || ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
-        if ((ace->Header.AceFlags & INHERITED_ACE) || (ace->Header.AceFlags & STATIC_INHERIT) != STATIC_INHERIT) continue;
+        /* An entry of its own, whatever inheritance flags it was stored with (a file's carry none). */
+        if (ace->Header.AceFlags & INHERITED_ACE) continue;
         if ((ace->Mask & STATIC_RIGHTS) == STATIC_RIGHTS && EqualSid((PSID) &ace->SidStart, sid)) return 1;
     }
     return 0;
 }
 
 /* Grants the container read and execute on path and everything under it, unless it has them already. */
-static int grant_static(const wchar_t *path, PSID sid) {
+static int grant_one(const wchar_t *path, PSID sid) {
     PACL dacl = NULL, granted = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL,
@@ -775,6 +776,8 @@ static int revoke_static(const wchar_t *path, PSID sid) {
     return error == ERROR_SUCCESS ? 0 : -errno_of(error);
 }
 
+static int walk_protected(const wchar_t *folder, PSID sid, int (*act)(const wchar_t *, PSID), int depth);
+
 int sbx_container_remove(const char *container, const char *const *paths, unsigned count) {
     wchar_t *name = container ? wide(container) : NULL;
     if (!name || !name[0] || wcslen(name) > 64 || (count && !paths)) {
@@ -787,6 +790,8 @@ int sbx_container_remove(const char *container, const char *const *paths, unsign
         for (unsigned i = 0; i < count; i++) {
             wchar_t *path = paths[i] ? wide(paths[i]) : NULL;
             int result = path ? revoke_static(path, sid) : -EINVAL;
+            /* And the entries of its own a protected entry under it was given (grant_static). */
+            if (path && result == 0) result = walk_protected(path, sid, revoke_static, 0);
             if (result != 0 && first == 0) first = result;
             free(path);
         }
@@ -826,6 +831,76 @@ int sbx_spawn_probe(struct sbx_probe *out) {
     else if (!out->nested_jobs) snprintf(out->reason, sizeof(out->reason), "this Windows cannot nest job objects");
     else if (!out->profile) snprintf(out->reason, sizeof(out->reason), "making an AppContainer profile is refused here (policy)");
     return out->reason[0] ? -ENOSYS : 0;
+}
+
+/*
+ * Whether path's access list is protected: it takes no entries from its
+ * folder, so a grant on the folder does not reach it.
+ */
+static int protected_dacl(const wchar_t *path) {
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    if (GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &descriptor) !=
+        ERROR_SUCCESS) {
+        return 0;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    int result = GetSecurityDescriptorControl(descriptor, &control, &revision) && (control & SE_DACL_PROTECTED);
+    LocalFree(descriptor);
+    return result;
+}
+
+/*
+ * Applies act to every entry under folder whose access list is protected
+ * (depth-first, links not followed, at most 32 levels): the entries a grant
+ * on folder cannot reach by inheritance. Returns the first error act gave.
+ */
+static int walk_protected(const wchar_t *folder, PSID sid, int (*act)(const wchar_t *, PSID), int depth) {
+    if (depth > 32) return 0;
+    size_t length = wcslen(folder);
+    wchar_t *pattern = malloc((length + 3) * sizeof(wchar_t));
+    if (!pattern) return -ENOMEM;
+    swprintf(pattern, length + 3, L"%ls\\*", folder);
+    WIN32_FIND_DATAW found;
+    HANDLE search = FindFirstFileW(pattern, &found);
+    free(pattern);
+    if (search == INVALID_HANDLE_VALUE) return 0;
+    int first = 0;
+    do {
+        if (wcscmp(found.cFileName, L".") == 0 || wcscmp(found.cFileName, L"..") == 0) continue;
+        size_t n = length + wcslen(found.cFileName) + 2;
+        wchar_t *child = malloc(n * sizeof(wchar_t));
+        if (!child) {
+            first = first ? first : -ENOMEM;
+            break;
+        }
+        swprintf(child, n, L"%ls\\%ls", folder, found.cFileName);
+        if (protected_dacl(child)) {
+            int result = act(child, sid);
+            if (result != 0 && first == 0) first = result;
+        }
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            int result = walk_protected(child, sid, act, depth + 1);
+            if (result != 0 && first == 0) first = result;
+        }
+        free(child);
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+    return first;
+}
+
+/*
+ * An SBX_STATIC grant: read and execute for the container on path and
+ * everything under it, inherited, and an entry of its own on each entry
+ * under it whose access list is protected (Python's own DLLs on GitHub's
+ * x64 Windows image are: a less-privileged container could not load them,
+ * CI 41970914509).
+ */
+static int grant_static(const wchar_t *path, PSID sid) {
+    int result = grant_one(path, sid);
+    if (result == 0) result = walk_protected(path, sid, grant_one, 0);
+    return result;
 }
 
 /* Appends text to a growing wide buffer. */
