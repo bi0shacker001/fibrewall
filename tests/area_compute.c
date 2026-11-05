@@ -205,10 +205,14 @@ static int compute_check(void) {
 #else
     struct sbx_limit memory[] = {{RLIMIT_AS, 256ul << 20}};
     struct compute_case capped = {0, NULL, 0, memory, 1};
-    /* glibc's malloc answers NULL; bionic's allocator aborts the process: either way the cap holds. */
+    /*
+     * The cap holds when the allocation does not succeed: glibc's malloc answers NULL, an allocator may end the
+     * process instead (bionic's). 1 is the allocation succeeding; 100, the lockdown failing.
+     */
     int capped_result = compute_run(&capped, c_memory, NULL);
-    EXPECT(capped_result == 0 || capped_result == COMPUTE_KILLED - SIGABRT,
-           "compute: the memory limit: a 1 GiB allocation fails (or the allocator aborts) under a 256 MiB cap");
+    printf("info compute: the capped allocation's child: %d (0 NULL, <= %d a signal)\n", capped_result, COMPUTE_KILLED);
+    EXPECT(capped_result == 0 || capped_result <= COMPUTE_KILLED,
+           "compute: the memory limit: a 1 GiB allocation does not succeed under a 256 MiB cap");
 #endif
     struct sbx_limit cpu[] = {{RLIMIT_CPU, 1}};
     struct compute_case timed = {0, NULL, 0, cpu, 1};
