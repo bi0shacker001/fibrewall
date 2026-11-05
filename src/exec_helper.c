@@ -188,7 +188,7 @@ struct control_header { size_t length; int level; int type; };
 #define O_CLOEXEC_ 02000000
 
 /* One request and its reply, as lockdown.c's exchange makes them. */
-static long exchange(struct sbxe_request *request, int dirfd, const char *path, size_t path_length,
+static long exchange(struct sbx_request *request, int dirfd, const char *path, size_t path_length,
                      void *out, size_t out_length, int *passed) {
     *passed = -1;
     int answer[2];
@@ -213,7 +213,7 @@ static long exchange(struct sbxe_request *request, int dirfd, const char *path, 
         sys3(NR_close, answer[0], 0, 0);
         return -5; /* EIO */
     }
-    struct sbxe_reply reply;
+    struct sbx_reply reply;
     memset(&reply, 0, sizeof(reply));
     struct iov back[2] = {{&reply, sizeof(reply)}, {out, out_length}};
     union {
@@ -239,12 +239,12 @@ static long exchange(struct sbxe_request *request, int dirfd, const char *path, 
 static long forward(unsigned op, int dirfd, const char *path, int flags, unsigned mode, void *out, size_t out_length) {
     if (!path) return -14; /* EFAULT */
     size_t n = 0;
-    while (n < SBXE_PATH_MAX && path[n]) n++;
-    if (n == SBXE_PATH_MAX) return -36; /* ENAMETOOLONG */
+    while (n < SBX_PATH_MAX && path[n]) n++;
+    if (n == SBX_PATH_MAX) return -36; /* ENAMETOOLONG */
     if (n == 0) return -2;              /* ENOENT */
-    struct sbxe_request request;
+    struct sbx_request request;
     memset(&request, 0, sizeof(request));
-    request.version = SBXE_PROTOCOL_VERSION;
+    request.version = SBX_PROTOCOL_VERSION;
     request.op = (uint16_t) op;
     request.flags = flags;
     request.mode = mode;
@@ -257,7 +257,7 @@ static long forward(unsigned op, int dirfd, const char *path, int flags, unsigne
     }
     int passed;
     long result = exchange(&request, directory, path, n, out, out_length, &passed);
-    if (op == SBXE_OP_OPEN && result >= 0) return passed >= 0 ? passed : -5;
+    if (op == SBX_OPEN && result >= 0) return passed >= 0 ? passed : -5;
     if (passed >= 0) sys3(NR_close, passed, 0, 0);
     return result;
 }
@@ -327,36 +327,41 @@ struct ucontext_ {
 struct siginfo_ { int signo, errno_, code; int pad; void *call_addr; int syscall; unsigned arch; char rest[96]; };
 #define SYS_SECCOMP_ 1
 
+/*
+ * The cases below are SBXE_HELPER_CALLS and SBXE_HELPER_LEGACY_CALLS
+ * (exec_shared.h); sbx_test checks that list is a subset of the calls the
+ * library's filter brokers, so this handler never routes one it would not.
+ */
 static long dispatch(long nr, struct ucontext_ *uc) {
     long a0 = ARG(uc, 0), a1 = ARG(uc, 1), a2 = ARG(uc, 2), a3 = ARG(uc, 3);
     switch (nr) {
     case NR_openat:
-        return forward(SBXE_OP_OPEN, (int) a0, (const char *) a1, (int) a2, (unsigned) a3, 0, 0);
+        return forward(SBX_OPEN, (int) a0, (const char *) a1, (int) a2, (unsigned) a3, 0, 0);
     case NR_newfstatat:
         if ((a3 & AT_EMPTY_PATH_) && a1 && ((const char *) a1)[0] == 0) return -38; /* fstat: never trapped */
-        return forward(SBXE_OP_STAT, (int) a0, (const char *) a1, (int) (a3 & AT_SYMLINK_NOFOLLOW_), 0, (void *) a2, SBXE_STAT_SIZE);
+        return forward(SBX_STAT, (int) a0, (const char *) a1, (int) (a3 & AT_SYMLINK_NOFOLLOW_), 0, (void *) a2, SBXE_STAT_SIZE);
     case NR_faccessat:
     case NR_faccessat2:
-        return forward(SBXE_OP_ACCESS, (int) a0, (const char *) a1, 0, (unsigned) a2, 0, 0);
+        return forward(SBX_ACCESS, (int) a0, (const char *) a1, 0, (unsigned) a2, 0, 0);
     case NR_readlinkat:
         if (a3 <= 0) return -22;
-        return forward(SBXE_OP_READLINK, (int) a0, (const char *) a1, 0, (unsigned) a3, (void *) a2, (size_t) a3);
+        return forward(SBX_READLINK, (int) a0, (const char *) a1, 0, (unsigned) a3, (void *) a2, (size_t) a3);
     case NR_statfs:
-        return forward(SBXE_OP_STATFS, AT_FDCWD_, (const char *) a0, 0, 0, (void *) a1, SBXE_STATFS_SIZE);
+        return forward(SBX_STATFS, AT_FDCWD_, (const char *) a0, 0, 0, (void *) a1, SBXE_STATFS_SIZE);
     case NR_getcwd:
         if (!a0 || a1 <= 0) return -22;
-        return forward(SBXE_OP_GETCWD, AT_FDCWD_, ".", 0, (unsigned) a1, (void *) a0, (size_t) a1);
+        return forward(SBX_GETCWD, AT_FDCWD_, ".", 0, (unsigned) a1, (void *) a0, (size_t) a1);
 #if defined(__x86_64__)
     case NR_open:
-        return forward(SBXE_OP_OPEN, AT_FDCWD_, (const char *) a0, (int) a1, (unsigned) a2, 0, 0);
+        return forward(SBX_OPEN, AT_FDCWD_, (const char *) a0, (int) a1, (unsigned) a2, 0, 0);
     case NR_stat:
     case NR_lstat:
-        return forward(SBXE_OP_STAT, AT_FDCWD_, (const char *) a0, nr == NR_lstat ? AT_SYMLINK_NOFOLLOW_ : 0, 0, (void *) a1, SBXE_STAT_SIZE);
+        return forward(SBX_STAT, AT_FDCWD_, (const char *) a0, nr == NR_lstat ? AT_SYMLINK_NOFOLLOW_ : 0, 0, (void *) a1, SBXE_STAT_SIZE);
     case NR_access:
-        return forward(SBXE_OP_ACCESS, AT_FDCWD_, (const char *) a0, 0, (unsigned) a1, 0, 0);
+        return forward(SBX_ACCESS, AT_FDCWD_, (const char *) a0, 0, (unsigned) a1, 0, 0);
     case NR_readlink:
         if (a2 <= 0) return -22;
-        return forward(SBXE_OP_READLINK, AT_FDCWD_, (const char *) a0, 0, (unsigned) a2, (void *) a1, (size_t) a2);
+        return forward(SBX_READLINK, AT_FDCWD_, (const char *) a0, 0, (unsigned) a2, (void *) a1, (size_t) a2);
 #endif
     case NR_rt_sigaction:
         return sigaction_call(a0, (const struct kernel_sigaction *) a1, (void *) a2, (unsigned long) a3);
@@ -469,7 +474,7 @@ static void load(int fd, struct loaded *out, char *interp) {
             if (PAGE_DOWN(phdrs[i].vaddr) < low) low = PAGE_DOWN(phdrs[i].vaddr);
             if (phdrs[i].vaddr + phdrs[i].memsz > high) high = phdrs[i].vaddr + phdrs[i].memsz;
         } else if (phdrs[i].type == PT_INTERP_ && interp) {
-            if (phdrs[i].filesz == 0 || phdrs[i].filesz >= SBXE_PATH_MAX) die("a bad PT_INTERP");
+            if (phdrs[i].filesz == 0 || phdrs[i].filesz >= SBX_PATH_MAX) die("a bad PT_INTERP");
             read_exactly(fd, interp, phdrs[i].filesz, phdrs[i].offset);
             interp[phdrs[i].filesz] = 0;
         } else if (phdrs[i].type == PT_PHDR_) {
@@ -639,13 +644,13 @@ __attribute__((noreturn, used)) void sbxe_main(long *initial) {
     }
 
     /* The target, then its interpreter, opened through the broker like any path. */
-    char interp_path[SBXE_PATH_MAX];
+    char interp_path[SBX_PATH_MAX];
     struct loaded target, interp;
     load(target_fd, &target, interp_path);
     sys3(NR_close, target_fd, 0, 0);
     uint64_t start = target.entry, base = 0;
     if (interp_path[0]) {
-        long interp_fd = forward(SBXE_OP_OPEN, AT_FDCWD_, interp_path, O_CLOEXEC_, 0, 0, 0);
+        long interp_fd = forward(SBX_OPEN, AT_FDCWD_, interp_path, O_CLOEXEC_, 0, 0, 0);
         if (interp_fd < 0) die("the broker refused the target's interpreter");
         load((int) interp_fd, &interp, 0);
         sys3(NR_close, interp_fd, 0, 0);
@@ -691,7 +696,7 @@ __attribute__((noreturn, used)) void sbxe_main(long *initial) {
         /* Already first: an image this tree started, which execs again. */
         new_envp[envc++] = put_two(&b, "LD_PRELOAD=", old_preload);
     } else if (old_preload && old_preload[0]) {
-        char joined[SBXE_PATH_MAX * 2];
+        char joined[SBX_PATH_MAX * 2];
         size_t n = length_of(child_library), m = length_of(old_preload);
         if (n + m + 2 > sizeof(joined)) die("LD_PRELOAD too long");
         memcpy(joined, child_library, n);

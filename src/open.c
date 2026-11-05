@@ -7,23 +7,18 @@
  */
 #define _GNU_SOURCE
 #include "sbx.h"
+#include "open_flags.h"
 
 #include <errno.h>
 #include <fcntl.h>
 
-#define WRITING (SBX_OPEN_WRITE | SBX_OPEN_CREATE | SBX_OPEN_TRUNCATE | SBX_OPEN_EXCLUSIVE | SBX_OPEN_APPEND)
-#define ALL (SBX_OPEN_READ | WRITING | SBX_OPEN_DIRECTORY)
-
 int sbx_open(const char *path, unsigned flags, sbx_handle *out) {
-    if (!path || !out || path[0] != '/' || (flags & ~ALL)) return -EINVAL;
+    if (!path || !out || path[0] != '/' || !sbx_open_flags_valid(flags)) return -EINVAL;
     int open_flags = O_CLOEXEC;
     if (flags & SBX_OPEN_DIRECTORY) {
-        if (flags & WRITING) return -EINVAL;
         open_flags |= O_RDONLY | O_DIRECTORY;
     } else {
         unsigned access = flags & (SBX_OPEN_READ | SBX_OPEN_WRITE);
-        if (!access || ((flags & (SBX_OPEN_TRUNCATE | SBX_OPEN_APPEND)) && !(flags & SBX_OPEN_WRITE))) return -EINVAL;
-        if ((flags & SBX_OPEN_EXCLUSIVE) && !(flags & SBX_OPEN_CREATE)) return -EINVAL;
         open_flags |= access == (SBX_OPEN_READ | SBX_OPEN_WRITE) ? O_RDWR : access == SBX_OPEN_WRITE ? O_WRONLY : O_RDONLY;
         if (flags & SBX_OPEN_CREATE) open_flags |= O_CREAT;
         if (flags & SBX_OPEN_TRUNCATE) open_flags |= O_TRUNC;

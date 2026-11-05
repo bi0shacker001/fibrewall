@@ -22,6 +22,7 @@
 #include "sbx_contract.h"
 #include "sbx_zones.h"
 #include "protocol.h"
+#include "exec_shared.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -4409,6 +4410,26 @@ static int gpu_proxy_check(const char *self) {
 #endif
 }
 
+/* ---- #767: sbx-exec's handler routes only calls the library's filter sends to the broker. ---- */
+
+static int helper_routes_check(void) {
+#define NAME_OF(name) #name,
+    static const char *const library[] = {SBX_BROKERED_CALLS(NAME_OF) "renameat", SBX_BROKERED_LEGACY_CALLS(NAME_OF)};
+    static const char *const helper[] = {SBXE_HELPER_CALLS(NAME_OF) SBXE_HELPER_LEGACY_CALLS(NAME_OF)};
+#undef NAME_OF
+    int missing = 0;
+    for (size_t i = 0; i < sizeof(helper) / sizeof(helper[0]); i++) {
+        int found = 0;
+        for (size_t k = 0; k < sizeof(library) / sizeof(library[0]); k++) found |= strcmp(helper[i], library[k]) == 0;
+        if (!found) {
+            printf("FAIL helper routes: sbx-exec routes %s, which the library's filter does not broker\n", helper[i]);
+            missing++;
+        }
+    }
+    if (!missing) printf("ok   helper routes: every call sbx-exec routes is one the library brokers (#767)\n");
+    return missing != 0;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -4560,7 +4581,7 @@ int main(int argc, char **argv) {
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
     int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
-                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check() | ioctl_allow_check() | gpu_proxy_check(self);
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check() | perf_check() | ioctl_allow_check() | gpu_proxy_check(self) | helper_routes_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

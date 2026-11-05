@@ -32,6 +32,7 @@
 #include <userenv.h>
 
 #include "sbx.h"
+#include "open_flags.h"
 #include "windows_protocol.h"
 
 #include <errno.h>
@@ -97,8 +98,6 @@
 #define STATUS_NOT_A_DIRECTORY_ ((NTSTATUS) 0xC0000103L)
 #define STATUS_ACCESS_DENIED_ ((NTSTATUS) 0xC0000022L)
 
-#define WRITING (SBX_OPEN_WRITE | SBX_OPEN_CREATE | SBX_OPEN_TRUNCATE | SBX_OPEN_EXCLUSIVE | SBX_OPEN_APPEND)
-#define ALL_OPEN (SBX_OPEN_READ | WRITING | SBX_OPEN_DIRECTORY)
 #define MODE_BITS (SBX_READ | SBX_WRITE | SBX_DECIDE | SBX_STATIC)
 #define WPATH_MAX 32768
 
@@ -385,15 +384,6 @@ static ULONG disposition_for(unsigned flags) {
     return (flags & SBX_OPEN_TRUNCATE) ? FILE_OVERWRITE : FILE_OPEN;
 }
 
-static int valid_flags(unsigned flags) {
-    if (flags & ~ALL_OPEN) return 0;
-    if (flags & SBX_OPEN_DIRECTORY) return !(flags & WRITING);
-    if (!(flags & (SBX_OPEN_READ | SBX_OPEN_WRITE))) return 0;
-    if ((flags & (SBX_OPEN_TRUNCATE | SBX_OPEN_APPEND)) && !(flags & SBX_OPEN_WRITE)) return 0;
-    if ((flags & SBX_OPEN_EXCLUSIVE) && !(flags & SBX_OPEN_CREATE)) return 0;
-    return 1;
-}
-
 /* Opens leaf relative to folder; follow: whether a reparse point is followed. */
 static NTSTATUS open_relative(HANDLE folder, const wchar_t *leaf, ACCESS_MASK access, ULONG disposition,
                               ULONG options, int follow, HANDLE *out) {
@@ -487,7 +477,7 @@ static int open_contained(const wchar_t *full, const wchar_t *bound, unsigned fl
         CloseHandle(handle);
         handle = NULL;
         /* A link at the leaf is followed for reading only, and only to a place inside the bound. */
-        if (flags & WRITING) {
+        if (flags & SBX_OPEN_WRITING) {
             result = -EACCES;
             goto done;
         }
@@ -516,14 +506,20 @@ done:
 static int answer_open(struct broker *broker, const char *asked, unsigned flags, uint64_t *remote) {
     struct sbx_policy *policy = broker->policy;
     char resolved[3 * SBXW_PATH_MAX] = "";
-    struct sbx_access access = {"open", asked, resolved, 0, (int) flags, (pid_t) broker->pid, 0, NULL};
+    struct sbx_access access;
+    memset(&access, 0, sizeof(access));
+    access.op = "open";
+    access.asked = asked;
+    access.resolved = resolved;
+    access.flags = (int) flags;
+    access.pid = (pid_t) broker->pid;
     int result;
     wchar_t *full = NULL;
-    if (!valid_flags(flags)) {
+    if (!sbx_open_flags_valid(flags)) {
         result = -EINVAL;
         goto report;
     }
-    access.need = (flags & WRITING) ? SBX_WRITE : SBX_READ;
+    access.need = (flags & SBX_OPEN_WRITING) ? SBX_WRITE : SBX_READ;
     wchar_t *given = wide(asked);
     int error = EINVAL;
     full = given ? full_path(given, &error) : NULL;

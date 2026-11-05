@@ -11,16 +11,25 @@
 
 #include "protocol.h"
 
-#define sbxe_request sbx_request
-#define sbxe_reply sbx_reply
-#define SBXE_PROTOCOL_VERSION SBX_PROTOCOL_VERSION
-#define SBXE_PATH_MAX SBX_PATH_MAX
-#define SBXE_OP_OPEN SBX_OPEN
-#define SBXE_OP_STAT SBX_STAT
-#define SBXE_OP_ACCESS SBX_ACCESS
-#define SBXE_OP_READLINK SBX_READLINK
-#define SBXE_OP_STATFS SBX_STATFS
-#define SBXE_OP_GETCWD SBX_GETCWD
+/*
+ * The path calls the library's filter sends to the broker (lockdown.c,
+ * emit_paths), one table: X(name) for each, named as in __NR_name. renameat,
+ * which arm64 has, is apart from x86_64's older forms
+ * (SBX_BROKERED_LEGACY_CALLS), which arm64 lacks.
+ */
+#define SBX_BROKERED_CALLS(X) \
+    X(openat) X(newfstatat) X(faccessat) X(faccessat2) X(readlinkat) X(mkdirat) X(unlinkat) X(renameat2) \
+    X(statfs) X(chdir) X(fchdir) X(getcwd) X(fchmodat)
+#define SBX_BROKERED_LEGACY_CALLS(X) \
+    X(open) X(creat) X(stat) X(lstat) X(access) X(readlink) X(mkdir) X(unlink) X(rmdir) X(rename) X(chmod)
+
+/*
+ * The calls sbx-exec's own handler routes to the broker while the loader
+ * runs (exec_helper.c, dispatch); everything else waits for the full
+ * handler. It must stay a subset of the library's (#767): sbx_test checks it.
+ */
+#define SBXE_HELPER_CALLS(X) X(openat) X(newfstatat) X(faccessat) X(faccessat2) X(readlinkat) X(statfs) X(getcwd)
+#define SBXE_HELPER_LEGACY_CALLS(X) X(open) X(stat) X(lstat) X(access) X(readlink)
 
 /* The trap data of a brokered call (lockdown.c's SBX_TRAP_DATA). */
 #define SBXE_TRAP_DATA 0x5b0
