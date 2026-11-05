@@ -291,6 +291,39 @@ int sbx_open(const char *path, unsigned flags, sbx_handle *out);
  */
 #define SBX_LOCK_AUDIT 0x40u
 
+/*
+ * A process that only computes over descriptors it was given, such as a
+ * media decoder parsing untrusted input (Droidtop/tracker#906). A
+ * deny-by-default allow-list with no broker (broker_fd is -1, and no
+ * handler is installed):
+ * - Allowed: memory (mmap, mremap, munmap, madvise, brk; never PROT_EXEC,
+ *   and mprotect may not add it), threads (clone with CLONE_THREAD, futex,
+ *   set_robust_list, rseq, sched_yield, sched_getaffinity, membarrier),
+ *   I/O on the descriptors it holds (read, write, the p and v forms,
+ *   lseek, fstat, close, dup, fcntl, ppoll, sendmsg, recvmsg, sendto,
+ *   recvfrom), time (clock_gettime, clock_getres, gettimeofday, nanosleep,
+ *   clock_nanosleep), getrandom, getrusage, uname, the process's ids,
+ *   prctl's naming calls, the signal calls (signals only to itself), exit.
+ * - Refused with an errno, so a library's incidental probe fails soft:
+ *   every path call, ioctl, getdents64, statfs, clone3 (ENOSYS, so libc
+ *   falls back to clone), mmap or mprotect asking for PROT_EXEC (EPERM).
+ * - Everything else ends the process (SECCOMP_RET_KILL_PROCESS; before
+ *   Linux 4.14, which lacks it, the calling thread): exec, every socket
+ *   and network call, a fork, ptrace, process_vm_*, bpf, io_uring,
+ *   userfaultfd, memfd_create, a signal to another process, any call not
+ *   named here.
+ * Before the filter goes on, every descriptor not in keep_fds is closed
+ * and the limits are set (RLIMIT_AS for memory, RLIMIT_CPU for CPU time;
+ * a wall-clock limit is the host's: it kills the process). With
+ * SBX_LOCK_LEARN, a call that would end the process is allowed and logged
+ * by the kernel (SECCOMP_RET_LOG, "audit: type=1326") instead, to find
+ * what a real workload needs. Combines with SBX_LOCK_LEARN and
+ * SBX_LOCK_AUDIT only; the claims, own opens, sealed descriptors and ioctl
+ * allowlist must be empty.
+ */
+#define SBX_LOCK_COMPUTE 0x20000u
+#define SBX_KEEP_MAX 16
+
 #define SBX_SEALED_MAX 8
 #define SBX_OWN_OPENS_MAX 16
 #define SBX_CLAIMS_MAX 32
@@ -374,6 +407,13 @@ struct sbx_lockdown_options {
      */
     const uint32_t *ioctl_allow;
     unsigned ioctl_allow_count;  /* at most SBX_IOCTL_ALLOW_MAX */
+    /*
+     * With SBX_LOCK_COMPUTE: the descriptors the process keeps (its input,
+     * its output, a control socket); every other one is closed before the
+     * filter goes on. Appended with SBX_LOCK_COMPUTE.
+     */
+    const int *keep_fds;
+    unsigned keep_count;  /* at most SBX_KEEP_MAX */
 };
 
 /*

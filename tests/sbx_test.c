@@ -511,6 +511,7 @@ static void race(void) {
 #include "area_net.c"
 #include "area_exec.c"
 #include "area_contract.c"
+#include "area_compute.c"
 
 /* ---- The parent: the broker, with a decider and an audit. ---- */
 
@@ -604,6 +605,7 @@ int main(int argc, char **argv) {
                            helper_routes_check();
     }
     if (area("contract")) sealed_failures |= contract_check() | zones_check();
+    if (area("compute")) sealed_failures |= compute_check();
     if (!area("core")) {
         /* One area asked for, and it is not the core's escape attempts: done. */
         return sealed_failures || spawn_failures ? 1 : 0;

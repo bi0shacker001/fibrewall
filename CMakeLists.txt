@@ -92,6 +92,16 @@ if(SBX_TESTS)
   target_include_directories(sbx_test PRIVATE src)
   # Frame records in the test's own functions: the fault test walks them (fault_check).
   target_compile_options(sbx_test PRIVATE -Wall -Wextra -Werror -fno-omit-frame-pointer)
+  # FFmpeg decoding under SBX_LOCK_COMPUTE (Droidtop/tracker#906), when FFmpeg's libraries are here.
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(SBX_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil)
+    if(SBX_FFMPEG_FOUND)
+      add_executable(sbx_decode_test tests/sbx_decode_test.c)
+      target_link_libraries(sbx_decode_test PRIVATE sbx PkgConfig::SBX_FFMPEG)
+      target_compile_options(sbx_decode_test PRIVATE -Wall -Wextra -Werror)
+    endif()
+  endif()
 endif()
 
 # The broker fuzz target (tests/fuzz_broker.c): clang's libFuzzer + ASan/UBSan on the request path.

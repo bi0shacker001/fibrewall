@@ -2166,6 +2166,62 @@ own answer socket, so the process's other threads are served meanwhile.
 Every thread the broker starts for one request (an accept, a name relay, a
 lookup) may block the same way.
 
+## A process that only computes: SBX_LOCK_COMPUTE (built 2026-11-05, Droidtop/tracker#906)
+
+The owner, 2026-11-05: Enginehost's cores get one shared FFmpeg decode
+service, "with extra protections". Decoders parse untrusted game media, so
+the decoder runs as a process of its own, under a profile that leaves it
+nothing to do but compute. The service and its client are the cores lane's;
+this is the confinement under them.
+
+**Threat model.** A crafted file gets code execution in the decoder. What it
+must not reach: the network, any file, another process, a new program,
+executable memory, unbounded memory or CPU. What it may still do: write
+wrong pixels into its own output ring, or spin until it is killed. The core
+treats the output as untrusted data, and a crash ends only that stream.
+
+**The mode.** The other lockdown modes are deny-lists over a process whose
+path and socket calls a broker decides. `SBX_LOCK_COMPUTE` is a
+deny-by-default allow-list with no broker and no handler (`compute_build`):
+- **Allowed:** memory without `PROT_EXEC`, threads (`clone` with
+  `CLONE_THREAD`), I/O on the descriptors it holds, time, `getrandom`,
+  naming calls, signals to itself, and exit.
+- **Refused with an errno, so a library's probe fails soft:** path calls,
+  `ioctl`, `getdents64`, `clone3` (`ENOSYS`, so libc falls back to `clone`),
+  and executable memory (`EPERM`).
+- **Ends the process** (`SECCOMP_RET_KILL_PROCESS`): everything else,
+  including exec, sockets, a fork, another process's signals, and any call
+  not named.
+- **Before the filter goes on:** every descriptor not in `keep_fds` is
+  closed, so nothing it inherited is reachable. The rlimits are set
+  (`RLIMIT_AS`, `RLIMIT_CPU`); the wall-clock limit is the host's watchdog.
+- **Learning** (`SBX_LOCK_LEARN`) turns the kill into `SECCOMP_RET_LOG`, so a
+  rig run with real media records what the decoder needs.
+
+The list was written from what a decoder calls and checked against real
+decodes. AOSP's `mediaswcodec` seccomp policy, the one Android runs its own
+software codecs under, is the reference to compare it with; it could not be
+fetched from the build session, so that comparison is on the rig with
+learning.
+
+**Process shape (recommended, owner to confirm; the service is the cores
+lane's):**
+- **One decoder process per stream**, so a crash, limit or kill ends that
+  stream alone.
+- **Each forked from a native fork server, not from ART.** An ART process's
+  reservations would make `RLIMIT_AS` meaningless. The fork server is
+  started once with `sbx-exec`, the same native launcher #550 needs. It loads
+  FFmpeg with only the allow-listed codecs, and forks before any media is
+  read.
+
+**Tests:**
+- **area compute:** every refusal and kill path, threads, W^X, a kept and a
+  closed descriptor, a descriptor received after lockdown, and the memory
+  and CPU limits.
+- **`sbx_decode_test`**, on the Linux jobs: H.264, VP9, AV1, WMV2 and MPEG-2
+  decoded by the distro's FFmpeg from a memfd into shared memory, each
+  matched against an unconfined decode.
+
 ## The confinement contract (built 2026-10-29, Droidtop/tracker#651)
 
 `include/sbx_contract.h` adds a report of what a policy and options

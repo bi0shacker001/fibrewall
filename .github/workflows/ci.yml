@@ -26,8 +26,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Kernel
         run: uname -a; cat /proc/sys/kernel/seccomp/actions_avail
-      - name: The GPU proxy's test pieces (virglrenderer's vtest server, Mesa's virgl driver and eglinfo)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq virgl-server mesa-utils libegl-mesa0 libgl1-mesa-dri mesa-vulkan-drivers vulkan-tools
+      - name: The GPU proxy's test pieces (virglrenderer's vtest server, Mesa's virgl driver and eglinfo), and FFmpeg for the decode test
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq virgl-server mesa-utils libegl-mesa0 libgl1-mesa-dri mesa-vulkan-drivers vulkan-tools ffmpeg libavformat-dev libavcodec-dev libavutil-dev pkg-config
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DSBX_SANITIZE=${{ matrix.sanitize }}
@@ -37,6 +37,9 @@ jobs:
           # LeakSanitizer stops the world with ptrace, which the lockdown refuses.
           ASAN_OPTIONS: detect_leaks=0
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+      - name: FFmpeg decoding under SBX_LOCK_COMPUTE (Droidtop/tracker#906)
+        if: matrix.sanitize == 'OFF'
+        run: ./build/sbx_decode_test "$RUNNER_TEMP"
       - name: Benchmark (a measurement, not a gate; Droidtop/tracker#791)
         if: matrix.sanitize == 'OFF'
         continue-on-error: true
@@ -74,14 +77,16 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: The GPU proxy's test pieces (virglrenderer's vtest server, Mesa's virgl driver and eglinfo)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq virgl-server mesa-utils libegl-mesa0 libgl1-mesa-dri mesa-vulkan-drivers vulkan-tools
+      - name: The GPU proxy's test pieces (virglrenderer's vtest server, Mesa's virgl driver and eglinfo), and FFmpeg for the decode test
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq virgl-server mesa-utils libegl-mesa0 libgl1-mesa-dri mesa-vulkan-drivers vulkan-tools ffmpeg libavformat-dev libavcodec-dev libavutil-dev pkg-config
       - name: Build
         run: |
           cmake -S . -B build
           cmake --build build -j
       - name: Test
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_test
+      - name: FFmpeg decoding under SBX_LOCK_COMPUTE (Droidtop/tracker#906)
+        run: ./build/sbx_decode_test "$RUNNER_TEMP"
       - name: Benchmark (a measurement, not a gate; Droidtop/tracker#791)
         continue-on-error: true
         run: TMPDIR="$RUNNER_TEMP" ./build/sbx_bench 100000

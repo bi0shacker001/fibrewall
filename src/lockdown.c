@@ -2417,6 +2417,161 @@ static void emit_refusals(unsigned flags, pid_t pid) {
     for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++) rule(denied[i], DENY);
 }
 
+/* ---- SBX_LOCK_COMPUTE (sbx.h; Droidtop/tracker#906): an allow-list for a process that only computes. ---- */
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+#ifndef SECCOMP_RET_LOG
+#define SECCOMP_RET_LOG 0x7ffc0000U
+#endif
+#ifndef SECCOMP_GET_ACTION_AVAIL
+#define SECCOMP_GET_ACTION_AVAIL 2
+#endif
+#ifndef __NR_clone3
+#define __NR_clone3 435
+#endif
+#ifndef __NR_rseq
+#define __NR_rseq 334
+#endif
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+
+#ifndef SECCOMP_RET_KILL_THREAD
+#define SECCOMP_RET_KILL_THREAD 0x00000000U
+#endif
+
+static int apply_limits(const struct sbx_lockdown_options *options);
+
+/* The call is allowed unless its argument arg has any of bits; then refused (EPERM). */
+static void allowed_without(unsigned nr, unsigned arg, unsigned bits) {
+    unsigned short block = block_begin(nr);
+    load(ARG_LO(arg));
+    jset(bits, 0, 1);
+    ret(SECCOMP_RET_ERRNO | EPERM);
+    ret(ALLOW);
+    block_end(block);
+}
+
+static int compute_build(unsigned flags, pid_t pid) {
+    filter_length = 0;
+    /* What ends the process: kill it, or (learning) let the call through with a kernel log record. */
+    unsigned kill = SECCOMP_RET_KILL_PROCESS;
+    uint32_t action = SECCOMP_RET_KILL_PROCESS;
+    if (syscall(__NR_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) != 0) kill = SECCOMP_RET_KILL_THREAD;
+    if (flags & SBX_LOCK_LEARN) {
+        action = SECCOMP_RET_LOG;
+        if (syscall(__NR_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) != 0) return -EINVAL;
+        kill = SECCOMP_RET_LOG;
+    }
+    load(offsetof(struct seccomp_data, arch));
+    jeq(SBX_ARCH, 1, 0);
+    ret(kill);
+    load(offsetof(struct seccomp_data, nr));
+#ifdef __x86_64__
+    emit((struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1));
+    ret(kill);
+#endif
+    /* Memory: never executable after lockdown. */
+    allowed_without(__NR_mmap, 2, PROT_EXEC);
+    allowed_without(__NR_mprotect, 2, PROT_EXEC);
+    /* Threads only: a clone without CLONE_THREAD is a fork. */
+    unsigned short clone = block_begin(__NR_clone);
+    load(ARG_LO(0));
+    jset(CLONE_THREAD, 0, 1);
+    ret(ALLOW);
+    ret(kill);
+    block_end(clone);
+    /* prctl: naming a thread or a mapping. */
+    unsigned short naming = block_begin(__NR_prctl);
+    load(ARG_LO(0));
+    jeq(PR_SET_NAME, 2, 0);
+    jeq(PR_GET_NAME, 1, 0);
+    jeq(PR_SET_VMA, 0, 1);
+    ret(ALLOW);
+    ret(SECCOMP_RET_ERRNO | EPERM);
+    block_end(naming);
+    /* Signals: to itself only. */
+    own_process_only(__NR_kill, pid, kill);
+    own_process_only(__NR_tgkill, pid, kill);
+    own_process_only(__NR_rt_sigqueueinfo, pid, kill);
+    own_process_only(__NR_rt_tgsigqueueinfo, pid, kill);
+    static const unsigned allowed[] = {
+        __NR_munmap, __NR_mremap, __NR_madvise, __NR_brk,
+        __NR_futex, __NR_set_robust_list, __NR_get_robust_list, __NR_rseq, __NR_sched_yield,
+        __NR_sched_getaffinity, __NR_membarrier,
+        __NR_read, __NR_write, __NR_pread64, __NR_pwrite64, __NR_readv, __NR_writev, __NR_preadv, __NR_pwritev,
+        __NR_lseek, __NR_fstat, __NR_close, __NR_dup, __NR_dup3, __NR_fcntl, __NR_ppoll,
+        __NR_sendmsg, __NR_recvmsg, __NR_sendto, __NR_recvfrom,
+        __NR_clock_gettime, __NR_clock_getres, __NR_gettimeofday, __NR_nanosleep, __NR_clock_nanosleep,
+        __NR_getrandom, __NR_getrusage, __NR_uname,
+        __NR_getpid, __NR_gettid, __NR_getppid, __NR_getuid, __NR_geteuid, __NR_getgid, __NR_getegid,
+        __NR_rt_sigaction, __NR_rt_sigprocmask, __NR_rt_sigreturn, __NR_sigaltstack, __NR_tkill,
+        __NR_exit, __NR_exit_group, __NR_restart_syscall,
+#ifdef __NR_poll
+        __NR_poll, __NR_dup2,
+#endif
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) rule(allowed[i], ALLOW);
+    /* Refused softly: what a library may probe. */
+    rule(__NR_clone3, SECCOMP_RET_ERRNO | ENOSYS);
+#define SBX_NR(name) __NR_##name,
+    static const unsigned soft[] = {
+        SBX_BROKERED_CALLS(SBX_NR)
+#ifdef __NR_open
+        SBX_BROKERED_LEGACY_CALLS(SBX_NR)
+#endif
+        __NR_statx, __NR_openat2, __NR_ioctl, __NR_getdents64, __NR_fstatfs, __NR_sysinfo,
+    };
+#undef SBX_NR
+    for (size_t i = 0; i < sizeof(soft) / sizeof(soft[0]); i++) rule(soft[i], SECCOMP_RET_ERRNO | EACCES);
+    ret(kill);
+    return filter_length <= FILTER_MAX ? 0 : -E2BIG;
+}
+
+/* Closes every descriptor except keep[] (as close_range would, from 0 up), with a plain loop where close_range is missing. */
+static void close_all_but(const int *keep, unsigned keep_count) {
+    struct rlimit limit;
+    long top = getrlimit(RLIMIT_NOFILE, &limit) == 0 ? (long) (limit.rlim_cur > (1u << 20) ? (1u << 20) : limit.rlim_cur) : 1024;
+    for (long fd = 0; fd < top;) {
+        long next = top;  /* the next kept descriptor at or above fd */
+        for (unsigned i = 0; i < keep_count; i++) {
+            if (keep[i] >= fd && keep[i] < next) next = keep[i];
+        }
+        if (next > fd) {
+            if (syscall(__NR_close_range, (unsigned) fd, (unsigned) (next - 1), 0) != 0) {
+                for (long k = fd; k < next; k++) close((int) k);
+            }
+        }
+        fd = next + 1;
+    }
+}
+
+static int compute_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
+    unsigned others = options->flags & ~(SBX_LOCK_COMPUTE | SBX_LOCK_LEARN | SBX_LOCK_AUDIT);
+    if (others || broker_fd != -1 || options->sealed_count || options->own_open_count || options->claim_count ||
+        options->ioctl_allow_count || options->keep_count > SBX_KEEP_MAX || (options->keep_count && !options->keep_fds) ||
+        options->limit_count > SBX_LIMITS_MAX || (options->limit_count && !options->limits)) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < options->keep_count; i++) {
+        if (options->keep_fds[i] < 0 || fcntl(options->keep_fds[i], F_GETFD) < 0) return -EBADF;
+    }
+    int built = compute_build(options->flags, getpid());
+    if (built != 0) return built;
+    close_all_but(options->keep_fds, options->keep_count);
+    int limited = apply_limits(options);
+    if (limited != 0) return limited;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -errno;
+    unsigned install = SECCOMP_FILTER_FLAG_TSYNC | ((options->flags & SBX_LOCK_AUDIT) ? SECCOMP_FILTER_FLAG_LOG : 0);
+    struct sock_fprog program = {.len = filter_length, .filter = filter};
+    long synced = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, install, &program);
+    if (synced != 0) return synced > 0 ? -EBUSY : -errno;
+    locked = 1;
+    return 0;
+}
+
 static int build_filter(unsigned flags, pid_t pid, const int *sealed, unsigned sealed_count) {
     filter_length = 0;
     int learn = (flags & SBX_LOCK_LEARN) != 0;
@@ -2587,6 +2742,7 @@ int sbx_lockdown(int broker_fd, const struct sbx_lockdown_options *options) {
     if (locked) return -EALREADY;
     struct sbx_lockdown_options none = {.flags = 0};
     if (!options) options = &none;
+    if (options->flags & SBX_LOCK_COMPUTE) return compute_lockdown(broker_fd, options);
     int invalid = validate_options(broker_fd, options);
     if (invalid != 0) return invalid;
     int unbrokered = (options->flags & SBX_LOCK_UNBROKERED) != 0;
