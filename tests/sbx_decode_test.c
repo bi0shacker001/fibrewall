@@ -66,6 +66,7 @@ static void decode(struct result *out) {
     if (avformat_find_stream_info(format, NULL) < 0) { out->error = 3; return; }
     const AVCodec *codec = NULL;
     int stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (stream < 0) stream = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if (stream < 0 || !codec) { out->error = 4; return; }
     AVCodecContext *context = avcodec_alloc_context3(codec);
     if (!context || avcodec_parameters_to_context(context, format->streams[stream]->codecpar) < 0) { out->error = 5; return; }
@@ -94,8 +95,9 @@ static void decode(struct result *out) {
             if (received == AVERROR_EOF) goto done;
             if (received < 0) { out->error = 7; goto done; }
             out->frames++;
-            /* The first row of the first plane: enough to tell two decodes apart. */
-            for (int x = 0; x < frame->width && frame->data[0]; x++) {
+            /* The first row of the first plane (or the first bytes of audio): enough to tell two decodes apart. */
+            int bytes = frame->width > 0 ? frame->width : (frame->linesize[0] < 64 ? frame->linesize[0] : 64);
+            for (int x = 0; x < bytes && frame->data[0]; x++) {
                 out->checksum = out->checksum * 31 + frame->data[0][x];
             }
             av_frame_unref(frame);
@@ -153,13 +155,17 @@ static int run(const char *path, int confined, struct result *out, int *signal_o
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
-static int make_sample(const char *folder, const char *name, const char *const *codec_args, char *path, size_t size) {
+static int make_sample(const char *folder, const char *name, const char *const *codec_args, int audio, char *path,
+                       size_t size) {
     snprintf(path, size, "%s/%s", folder, name);
     const char *argv[24];
     int n = 0;
-    const char *head[] = {"ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25",
-                          "-t", "2", "-pix_fmt", "yuv420p"};
-    for (size_t i = 0; i < sizeof(head) / sizeof(head[0]); i++) argv[n++] = head[i];
+    const char *video[] = {"ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25",
+                           "-t", "2", "-pix_fmt", "yuv420p"};
+    const char *sound[] = {"ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2"};
+    const char **head = audio ? sound : video;
+    size_t head_count = audio ? sizeof(sound) / sizeof(sound[0]) : sizeof(video) / sizeof(video[0]);
+    for (size_t i = 0; i < head_count; i++) argv[n++] = head[i];
     for (int i = 0; codec_args[i]; i++) argv[n++] = codec_args[i];
     argv[n++] = path;
     argv[n] = NULL;
@@ -177,20 +183,24 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     av_log_set_level(AV_LOG_QUIET);
     const char *folder = argc > 1 ? argv[1] : "/tmp";
+    /* Droidtop/tracker#913's correction to #906: H.264, HEVC and AAC are in. */
     struct sample {
         const char *name;
         const char *args[8];
+        int audio;
     } samples[] = {
-        {"h264.mp4", {"-c:v", "libx264", NULL}},
-        {"vp9.webm", {"-c:v", "libvpx-vp9", "-deadline", "realtime", NULL}},
-        {"av1.mkv", {"-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1", NULL}},
-        {"wmv2.asf", {"-c:v", "wmv2", NULL}},
-        {"mpeg2.mpg", {"-c:v", "mpeg2video", NULL}},
+        {"h264.mp4", {"-c:v", "libx264", NULL}, 0},
+        {"hevc.mp4", {"-c:v", "libx265", "-x265-params", "log-level=error", NULL}, 0},
+        {"aac.m4a", {"-c:a", "aac", NULL}, 1},
+        {"vp9.webm", {"-c:v", "libvpx-vp9", "-deadline", "realtime", NULL}, 0},
+        {"av1.mkv", {"-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1", NULL}, 0},
+        {"wmv2.asf", {"-c:v", "wmv2", NULL}, 0},
+        {"mpeg2.mpg", {"-c:v", "mpeg2video", NULL}, 0},
     };
     int failures = 0, ran = 0;
     for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
         char path[600];
-        if (make_sample(folder, samples[i].name, samples[i].args, path, sizeof(path)) != 0) {
+        if (make_sample(folder, samples[i].name, samples[i].args, samples[i].audio, path, sizeof(path)) != 0) {
             printf("skip decode %s: ffmpeg could not make it here\n", samples[i].name);
             continue;
         }
@@ -198,7 +208,8 @@ int main(int argc, char **argv) {
         int plain_signal = 0, confined_signal = 0;
         int a = run(path, 0, &plain, &plain_signal);
         int b = run(path, 1, &confined, &confined_signal);
-        int ok = a == 0 && b == 0 && plain.error == 0 && confined.error == 0 && plain.frames == 50 &&
+        int ok = a == 0 && b == 0 && plain.error == 0 && confined.error == 0 &&
+                 plain.frames == (samples[i].audio ? plain.frames : 50) && plain.frames > 0 &&
                  confined.frames == plain.frames && confined.checksum == plain.checksum;
         printf("%s decode %s under SBX_LOCK_COMPUTE: %ld frames (unconfined %ld), checksums %s",
                ok ? "ok  " : "FAIL", samples[i].name, confined.frames, plain.frames,

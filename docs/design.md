@@ -2218,7 +2218,7 @@ lane's):**
 - **area compute:** every refusal and kill path, threads, W^X, a kept and a
   closed descriptor, a descriptor received after lockdown, and the memory
   and CPU limits.
-- **`sbx_decode_test`**, on the Linux jobs: H.264, VP9, AV1, WMV2 and MPEG-2
+- **`sbx_decode_test`**, on the Linux jobs: H.264, HEVC, AAC (audio), VP9, AV1, WMV2 and MPEG-2
   decoded by the distro's FFmpeg from a memfd into shared memory, each
   matched against an unconfined decode.
 
