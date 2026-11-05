@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include "sbx.h"
 #include "sbx_contract.h"
+#include "sbx_zones.h"
 #include "protocol.h"
 
 #include <dirent.h>
@@ -49,6 +50,7 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -3720,6 +3722,192 @@ static int net_filter_check(void) {
     return child_failed | (local_failures ? 1 : 0);
 }
 
+/* ---- Bounded zones (sbx_zones.h; docs/zones.md, Droidtop/tracker#651). ---- */
+
+static int zt_asks, zt_remembered;
+static unsigned short zt_port_yes;
+static char zt_stored_detail[400];
+
+static enum sbx_zone zt_recall(void *context, const char *game, const char *entry, const char *detail) {
+    (void) context;
+    (void) game;
+    if (zt_remembered && strcmp(entry, "files.own.write") == 0 && strcmp(detail, zt_stored_detail) == 0) return SBX_ZONE_ALLOW;
+    return SBX_ZONE_PROMPT;
+}
+
+static enum sbx_zone zt_ask(void *context, const struct sbx_zone_question *q, int *remember) {
+    (void) context;
+    __atomic_add_fetch(&zt_asks, 1, __ATOMIC_ACQ_REL);
+    if (strcmp(q->entry, "files.own.write") == 0) {
+        usleep(600 * 1000);  /* a person taking their time: only the asking thread may wait */
+        *remember = 1;
+        return SBX_ZONE_ALLOW;
+    }
+    if (strcmp(q->entry, "files.nearby.read") == 0) return SBX_ZONE_ALLOW;
+    if (strcmp(q->entry, "net.local") == 0) {
+        char yes[16];
+        snprintf(yes, sizeof(yes), ":%u", (unsigned) zt_port_yes);
+        size_t n = strlen(q->detail), m = strlen(yes);
+        return n >= m && strcmp(q->detail + n - m, yes) == 0 ? SBX_ZONE_ALLOW : SBX_ZONE_DENY;
+    }
+    return SBX_ZONE_DENY;
+}
+
+static void zt_remember(void *context, const char *game, const char *entry, const char *detail, enum sbx_zone answer) {
+    (void) context;
+    (void) game;
+    if (strcmp(entry, "files.own.write") == 0 && answer == SBX_ZONE_ALLOW) {
+        snprintf(zt_stored_detail, sizeof(zt_stored_detail), "%s", detail);
+        __atomic_store_n(&zt_remembered, 1, __ATOMIC_RELEASE);
+    }
+}
+
+struct zt_reader {
+    char path[600];
+    long elapsed_ms;
+    int ok;
+};
+
+static long zt_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void *zt_read_thread(void *argument) {
+    struct zt_reader *r = argument;
+    usleep(150 * 1000);  /* while the other thread's write waits on the person */
+    long start = zt_now_ms();
+    struct stat st;
+    r->ok = stat(r->path, &st) == 0;
+    r->elapsed_ms = zt_now_ms() - start;
+    return NULL;
+}
+
+static int zones_check(void) {
+    /* The catalogue and the shipped profiles. */
+    EXPECT(sbx_zone_catalogue_version() == 1 && sbx_zone_entry(0) && strcmp(sbx_zone_entry(0)->id, "files.own.write") == 0 &&
+               sbx_zone_entry(10) && !sbx_zone_entry(11),
+           "zones: the catalogue's eleven entries");
+    const struct sbx_zone_profile *careful = sbx_zone_shipped("careful");
+    EXPECT(careful && sbx_zone_of(careful, "files.own.write") == SBX_ZONE_ALLOW &&
+               sbx_zone_of(careful, "net.internet") == SBX_ZONE_DENY && sbx_zone_of(careful, "programs.own") == SBX_ZONE_PROMPT,
+           "zones: careful, the default profile");
+    int internet_never_allowed = 1;
+    const char *names[] = {"locked", "careful", "balanced", "relaxed", "open"};
+    for (int i = 0; i < 5; i++) {
+        const struct sbx_zone_profile *p = sbx_zone_shipped(names[i]);
+        if (!p || sbx_zone_of(p, "net.internet") == SBX_ZONE_ALLOW || sbx_zone_of(p, "files.picked.read") == SBX_ZONE_ALLOW) {
+            internet_never_allowed = 0;
+        }
+    }
+    EXPECT(internet_never_allowed && !sbx_zone_shipped("reckless"),
+           "zones: no shipped profile allows the internet or a picked folder without asking");
+
+    /* The person's own profiles. */
+    struct sbx_zone_profile *own = NULL;
+    char error[160];
+    int parsed = sbx_zone_profile_parse("sbx-zones 1\nname: Mine\nbased-on: balanced\n# a comment\nnet.internet = allow\n",
+                                        &own, error, sizeof(error));
+    EXPECT(parsed == 0 && own && sbx_zone_of(own, "net.internet") == SBX_ZONE_ALLOW &&
+               sbx_zone_of(own, "net.local") == SBX_ZONE_PROMPT && strcmp(sbx_zone_profile_name(own), "Mine") == 0,
+           "zones: a person's own profile, the rest from based-on");
+    sbx_zone_profile_free(own);
+    struct sbx_zone_profile *bad = NULL;
+    EXPECT(sbx_zone_profile_parse("sbx-zones 1\nnet.everything = allow\n", &bad, error, sizeof(error)) == -EINVAL && !bad &&
+               strstr(error, "no entry"),
+           "zones: an id the catalogue lacks is an error");
+    EXPECT(sbx_zone_profile_parse("sbx-zones 1\nprograms.outside = allow\n", &bad, error, sizeof(error)) == -EINVAL &&
+               strstr(error, "every profile"),
+           "zones: the never layer cannot be granted");
+    EXPECT(sbx_zone_profile_parse("sbx-zones 2\n", &bad, error, sizeof(error)) == -EINVAL && strstr(error, "newer"),
+           "zones: a profile from a newer library is refused");
+    EXPECT(sbx_zone_profile_parse("net.local = allow\n", &bad, error, sizeof(error)) == -EINVAL,
+           "zones: the version line is required");
+    EXPECT(sbx_zone_profile_parse("sbx-zones 1\nnet.local = maybe\n", &bad, error, sizeof(error)) == -EINVAL,
+           "zones: a zone is allow, prompt or deny");
+
+    /* Applied: a program whose own writes and local network are asked, nearby folders asked, the internet denied. */
+    struct sbx_zone_profile *profile = NULL;
+    parsed = sbx_zone_profile_parse("sbx-zones 1\nbased-on: careful\nfiles.own.write = prompt\nnet.local = prompt\n", &profile,
+                                    error, sizeof(error));
+    EXPECT(parsed == 0, "zones: the test's profile");
+    if (parsed != 0) return 1;
+    char folder[400], library[400], other[400], nearby_file[500], inside[500];
+    snprintf(library, sizeof(library), "%s/zlib", root);
+    snprintf(folder, sizeof(folder), "%s/zlib/game", root);
+    snprintf(other, sizeof(other), "%s/zlib/other", root);
+    snprintf(nearby_file, sizeof(nearby_file), "%s/zlib/other/readme", root);
+    snprintf(inside, sizeof(inside), "%s/zlib/game/data", root);
+    mkdir(library, 0755);
+    mkdir(folder, 0755);
+    mkdir(other, 0755);
+    write_file(nearby_file, "nearby");
+    write_file(inside, "data");
+    unsigned short port_no = 0;
+    int yes_server = nf_listen(SOCK_STREAM, &zt_port_yes), no_server = nf_listen(SOCK_STREAM, &port_no);
+    struct sbx_policy *policy = sbx_policy_new();
+    struct sbx_lockdown_options options = {.flags = 0};
+    struct sbx_zone_game game = {.id = "test-game", .folder = folder, .library = library};
+    struct sbx_zone_host host = {.recall = zt_recall, .ask = zt_ask, .remember = zt_remember};
+    EXPECT(sbx_zone_apply(policy, &options, profile, &game, &host) == 0, "zones: apply");
+    EXPECT((options.flags & SBX_LOCK_NET_BROKERED) && (options.flags & SBX_LOCK_NET_FILTER) &&
+               !(options.flags & SBX_LOCK_EXEC) && !(options.flags & SBX_LOCK_WATCH),
+           "zones: the flags the entries need, and no others");
+    sbx_zone_profile_free(profile);
+    sbx_policy_add(policy, "/", SBX_READ);  /* the test's own baseline: the system, to run at all */
+    sbx_policy_add(policy, library, SBX_DENY);
+
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0 || sbx_broker_prepare(pair[0]) != 0) return 1;
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        alarm(60);
+        close(pair[0]);
+        int locked = sbx_lockdown(pair[1], &options);
+        errno = -locked;
+        EXPECT(locked == 0, "zones: lockdown");
+        if (locked == 0) {
+            struct zt_reader reader;
+            memset(&reader, 0, sizeof(reader));
+            snprintf(reader.path, sizeof(reader.path), "%s", inside);
+            pthread_t thread;
+            pthread_create(&thread, NULL, zt_read_thread, &reader);
+            char made[520];
+            snprintf(made, sizeof(made), "%s/save1", folder);
+            int fd = open(made, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            EXPECT(fd >= 0, "zones: a write in its own folder, asked and allowed");
+            if (fd >= 0) close(fd);
+            pthread_join(thread, NULL);
+            EXPECT(reader.ok && reader.elapsed_ms < 300,
+                   "zones: while one thread waits on the person, the program's other calls go on (parked)");
+            snprintf(made, sizeof(made), "%s/save2", folder);
+            fd = open(made, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            EXPECT(fd >= 0, "zones: a second write, answered from the remembered answer");
+            if (fd >= 0) close(fd);
+            fd = open(nearby_file, O_RDONLY | O_CLOEXEC);
+            EXPECT(fd >= 0, "zones: a nearby folder, asked and allowed");
+            if (fd >= 0) close(fd);
+            EXPECT(nf_connect("127.0.0.1", zt_port_yes) == 0, "zones: a local address, asked and allowed");
+            EXPECT(nf_connect("127.0.0.1", port_no) == EACCES, "zones: a local address, asked and refused");
+            EXPECT(nf_connect("192.0.2.1", 80) == EACCES, "zones: the internet, denied without asking");
+        }
+        _exit(failures ? 1 : 0);
+    }
+    close(pair[1]);
+    sbx_broker_serve(policy, pair[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int asks = __atomic_load_n(&zt_asks, __ATOMIC_ACQUIRE);
+    int ok = asks == 4;
+    printf("%s zones: the person was asked exactly four times (write once, nearby, two local addresses): %d\n",
+           ok ? "ok  " : "FAIL", asks);
+    if (yes_server >= 0) close(yes_server);
+    if (no_server >= 0) close(no_server);
+    return (WIFEXITED(status) ? WEXITSTATUS(status) : 1) | !ok;
+}
+
 /* ---- sbx_spawn: a program starts with only what it was handed. ---- */
 
 extern char **environ;
@@ -3871,7 +4059,7 @@ int main(int argc, char **argv) {
     if (symlink(secret, link) != 0) { perror("symlink"); return 2; }
 
     int sealed_failures = sealed_check() | own_fd_link_check() | sigsys_check() | learn_check() | trace_check() | fault_check(self, 0) | fault_check(self, 1) | pathops_check() | fifo_check() | harness_check() | reply_wedge_check() | fail_closed_check() | einval_drop_check() | watch_check() | unix_check() | contain_check(self) | signal_tree_check() | listen_check(self) | exec_helper_check(self) | exec_check(self) | spawn_confined_check(self) | program_tree_check(self) | unbrokered_check() | limits_check() | inet_check() | contract_check() | tiocsti_check() | passthrough_check() | list_check() |
-                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check();
+                          net_check(SBX_NET_CONNECT | SBX_NET_LISTEN | SBX_NET_RESOLVE | SBX_NET_DECIDE) | net_check(0) | net_filter_check() | zones_check();
 
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) { perror("socketpair"); return 2; }

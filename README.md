@@ -68,10 +68,16 @@ Early. Built today:
 Not built yet:
 
 - minijail policy files, for per-process allowlists;
+- the zones' owner questions (docs/zones.md, "Questions for the owner"): built with the design's proposals until answered;
 - the `native` launcher, a binder-less process that keeps the GPU;
 - the Android AAR with its Kotlin API.
 
 ### Releases
+
+- **v0.3.0** (2026-11-05): bounded zones ([Droidtop/tracker#651](https://github.com/Droidtop/tracker/issues/651); [docs/zones.md](docs/zones.md)):
+  - `include/sbx_zones.h`: the catalogue of eleven entries, the five shipped profiles (Locked, Careful as the default, Balanced, Relaxed, Open), a person's own profiles parsed from text, and `sbx_zone_apply`, which turns one profile for one program into path rules, network rules and lockdown flags, and a decider that answers from the zone, the person's stored answer, then the host's prompt.
+  - `SBX_PARK`: a decider that has to ask a person parks the request on a thread of its own (`sbx_access.parked`); only the asking thread of the program waits.
+  - `sbx_access.net_name`: the name the broker resolved a network call's address for, so a question can name the host.
 
 - **v0.2.0** (2026-11-05): network filtering ([Droidtop/tracker#850](https://github.com/Droidtop/tracker/issues/850); [docs/design.md](docs/design.md), "Network filtering"):
   - `sbx_policy_net_rule`: a host declares, per sandboxed process, the destinations it may reach, as lines such as `allow out tcp example.com port 443`, `allow in tcp loopback port 8384` or `allow dns any`: by address, prefix, `loopback`, `local` or `internet`, or by name; by port and protocol; allow, deny or ask the decider. The first rule that matches answers; anything else is refused, and the audit names the rule (`sbx_access.net_rule`, "no rule").

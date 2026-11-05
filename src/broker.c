@@ -107,6 +107,8 @@ struct sbx_policy {
     unsigned unix_name_modes[SBX_UNIX_NAMES_MAX];
     unsigned unix_name_count;
     struct netp *netp;  /* the network rules (sbx_policy_net_rule) and the addresses the broker resolved */
+    void *attached;     /* sbx_policy_attach: state the policy owns (a zone session), freed with it */
+    void (*attached_free)(void *);
     int refs;           /* the host's, plus one per broker thread that outlives a request (accept, relays) */
 };
 
@@ -115,6 +117,32 @@ static void default_audit(void *context, const struct sbx_access *access, int re
     if (result >= 0) return;
     fprintf(stderr, "sbx: refused %s %s (%s): %s\n", access->op, access->asked,
             access->resolved[0] ? access->resolved : "unresolved", strerror(-result));
+}
+
+/*
+ * Parking (sbx.h, SBX_PARK): a decider that would block -- it has to ask a
+ * person -- answers SBX_PARK on the serve thread. The request's reply and
+ * audit are then held back, and once serve_one returns it is served again
+ * from the start on a thread of its own, where the decider sees parked = 1
+ * and may wait. Only the asking thread of the process waits; its other
+ * calls go on. Every thread a broker starts for one request (an accept, a
+ * name relay, a lookup) is such a thread too.
+ */
+static __thread int park_pending;   /* this request is to be served again, parked */
+static __thread int parked_thread;  /* this thread may block in the decider */
+
+static int ask_decider(const struct sbx_policy *policy, struct sbx_access *access) {
+    access->parked = parked_thread;
+    int said = policy->decide(policy->decide_context, access);
+    if (said == SBX_PARK) {
+        if (!parked_thread) park_pending = 1;
+        return -EACCES;
+    }
+    return said;
+}
+
+static void audit_access(const struct sbx_policy *policy, const struct sbx_access *access, int result) {
+    if (!park_pending) policy->audit(policy->audit_context, access, result);
 }
 
 /*
@@ -263,6 +291,7 @@ static void policy_release(const struct sbx_policy *policy) { sbx_policy_free((s
 void sbx_policy_free(struct sbx_policy *policy) {
     if (!policy) return;
     if (__atomic_sub_fetch(&policy->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (policy->attached_free) policy->attached_free(policy->attached);
     netp_free(policy->netp);
     for (size_t i = 0; i < policy->count; i++) free(policy->rules[i].path);
     for (size_t i = 0; i < policy->alias_count; i++) {
@@ -710,7 +739,7 @@ static void audit(const struct check *c, unsigned need, int result) {
         .op = op_name(c->op), .asked = c->asked, .resolved = c->real,
         .need = need == LOOKUP ? 0 : need, .flags = c->flags, .pid = c->pid, .rule_verdict = result,
     };
-    c->policy->audit(c->policy->audit_context, &access, result);
+    audit_access(c->policy, &access, result);
 }
 
 /*
@@ -746,7 +775,7 @@ static int decide(struct check *c, const char *base, const char *raw, size_t len
             .op = op_name(c->op), .asked = c->asked, .resolved = c->real,
             .need = need == LOOKUP ? 0 : need, .flags = c->flags, .pid = c->pid, .rule_verdict = verdict,
         };
-        int answer = c->policy->decide(c->policy->decide_context, &access);
+        int answer = ask_decider(c->policy, &access);
         if (answer != SBX_KEEP) result = answer > 0 ? -EACCES : answer;
     }
     /* A refusal never says whether the path exists; an allowed path that does not resolve says why. */
@@ -834,6 +863,7 @@ static int confirm_opened(struct check *c, int fd, unsigned need) {
 }
 
 static void reply(int to, int64_t result, const void *data, uint32_t data_len, int fd) {
+    if (park_pending) return;
     struct sbx_reply header = {.result = result, .data_len = data_len};
     struct iovec parts[2] = {{&header, sizeof(header)}, {(void *) data, data_len}};
     union {
@@ -1200,6 +1230,12 @@ void sbx_policy_set_net(struct sbx_policy *policy, unsigned grants) {
     if (policy) policy->net = grants;
 }
 
+void sbx_policy_attach(struct sbx_policy *policy, void *state, void (*release)(void *)) {
+    if (policy->attached_free) policy->attached_free(policy->attached);
+    policy->attached = state;
+    policy->attached_free = release;
+}
+
 int sbx_policy_net_rule(struct sbx_policy *policy, const char *rule) {
     if (!policy) return -EINVAL;
     return netp_add(policy->netp, rule);
@@ -1254,17 +1290,22 @@ static unsigned short port_of(const struct sockaddr *address) {
 }
 
 /* The grants' verdict, then the decider's (on a refusal, or on every call with SBX_NET_DECIDE), then the audit. */
-static int net_decide_rule(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict,
-                           const char *rule) {
+static int net_decide_named(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict,
+                            const char *rule, const char *name) {
     struct sbx_access access = {.op = op_name(op), .asked = words, .resolved = words, .pid = pid, .rule_verdict = verdict,
-                                .net_rule = rule};
+                                .net_rule = rule, .net_name = name};
     int result = verdict;
     if (policy->decide && (verdict != 0 || (policy->net & SBX_NET_DECIDE))) {
-        int said = policy->decide(policy->decide_context, &access);
+        int said = ask_decider(policy, &access);
         if (said != SBX_KEEP) result = said > 0 ? 0 : said;
     }
-    policy->audit(policy->audit_context, &access, result);
+    audit_access(policy, &access, result);
     return result;
+}
+
+static int net_decide_rule(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict,
+                           const char *rule) {
+    return net_decide_named(policy, op, words, pid, verdict, rule, NULL);
 }
 
 static int net_decide(const struct sbx_policy *policy, uint16_t op, const char *words, pid_t pid, int verdict) {
@@ -1298,7 +1339,10 @@ static int broker_lookup(void *argument, const char *name, int family, struct so
     const struct lookup_context *l = argument;
     const struct sbx_policy *policy = l->policy;
     int verdict;
-    if (netp_active(policy->netp)) verdict = rule_decide(policy, SBX_RESOLVE, name, l->pid, netp_name(policy->netp, name));
+    if (netp_active(policy->netp)) {
+        struct netp_verdict v = netp_name(policy->netp, name);
+        verdict = net_decide_named(policy, SBX_RESOLVE, name, l->pid, v.action == NETP_ALLOW ? 0 : -EACCES, v.rule, name);
+    }
     else verdict = net_decide(policy, SBX_RESOLVE, name, l->pid, (policy->net & SBX_NET_RESOLVE) ? 0 : -EACCES);
     if (verdict != 0) return -EACCES;
     return netp_resolve(policy->netp, name, family, out, max);
@@ -1405,6 +1449,7 @@ static int accept_allowed(const struct net_wait *w, int listening, const struct 
 
 static void *net_wait_thread(void *argument) {
     struct net_wait *w = argument;
+    parked_thread = 1;
     if (w->kind == WAIT_CONNECT) {
         int r = connect(w->socket, (const struct sockaddr *) &w->address, w->length);
         reply(w->answer, r == 0 ? 0 : -errno, NULL, 0, -1);
@@ -1959,7 +2004,11 @@ static void net_one(const struct sbx_policy *policy, const struct sbx_request *r
             }
             verdict = net_decide_rule(policy, request->op, words, pid, -EACCES, dns_rule);
         } else {
-            verdict = rule_decide(policy, request->op, words, pid, netp_out(policy->netp, protocol ? protocol : NETP_TCP, &to));
+            struct netp_verdict v = netp_out(policy->netp, protocol ? protocol : NETP_TCP, &to);
+            char name[256];
+            int named = netp_name_for(policy->netp, &to, name, sizeof(name)) == 0;
+            verdict = net_decide_named(policy, request->op, words, pid, v.action == NETP_ALLOW ? 0 : -EACCES, v.rule,
+                                       named ? name : NULL);
         }
     } else {
         verdict = net_decide(policy, request->op, words, pid, (grants & SBX_NET_CONNECT) ? 0 : -EACCES);
@@ -2033,7 +2082,11 @@ static void send_one(const struct sbx_policy *policy, const struct sbx_request *
             } else if (to.port == 53) {
                 verdict = net_decide_rule(policy, SBX_SEND, words, pid, -EACCES, dns_rule);
             } else {
-                verdict = rule_decide(policy, SBX_SEND, words, pid, netp_out(policy->netp, protocol ? protocol : NETP_UDP, &to));
+                struct netp_verdict v = netp_out(policy->netp, protocol ? protocol : NETP_UDP, &to);
+                char name[256];
+                int named = netp_name_for(policy->netp, &to, name, sizeof(name)) == 0;
+                verdict = net_decide_named(policy, SBX_SEND, words, pid, v.action == NETP_ALLOW ? 0 : -EACCES, v.rule,
+                                           named ? name : NULL);
             }
         } else {
             verdict = -EAFNOSUPPORT;
@@ -2298,7 +2351,7 @@ static void signal_one(const struct sbx_policy *policy, const char *body, size_t
     int verdict = in_tree(policy->tree, pid, target) ? 0 : -EPERM;
     struct sbx_access access = {.op = "signal", .asked = asked, .resolved = asked, .pid = pid, .rule_verdict = verdict};
     if (verdict != 0 && policy->decide) {
-        int decided = policy->decide(policy->decide_context, &access);
+        int decided = ask_decider(policy, &access);
         if (decided == 0) verdict = 0;
     }
     long result = verdict;
@@ -2312,7 +2365,7 @@ static void signal_one(const struct sbx_policy *policy, const char *body, size_t
         }
         if (result != 0) result = -errno;
     }
-    policy->audit(policy->audit_context, &access, (int) result);
+    audit_access(policy, &access, (int) result);
     reply(answer, result, NULL, 0, -1);
 }
 
@@ -2397,6 +2450,71 @@ static void serve_one(const struct sbx_policy *policy, const struct sbx_request 
     handle(policy, request, body, body + request->path_len, base, base2, pid, answer);
 }
 
+struct parked {
+    const struct sbx_policy *policy;
+    struct conn_budget *budget;
+    struct sbx_request request;
+    char *body;
+    size_t body_len;
+    int fds[SBX_FDS_MAX];
+    int fd_count;
+    pid_t pid;
+};
+
+static void *parked_serve(void *argument) {
+    struct parked *p = argument;
+    parked_thread = 1;
+    park_pending = 0;
+    serve_one(p->policy, &p->request, p->body, p->body_len, p->fds, p->fd_count, p->pid, p->budget);
+    for (int i = 0; i < p->fd_count; i++) close(p->fds[i]);
+    struct conn_budget *budget = p->budget;
+    policy_release(p->policy);
+    free(p->body);
+    free(p);
+    net_wait_unreserve(budget);
+    return NULL;
+}
+
+/* Serves one request; one a decider parked is served again on a thread of its own, with copies of everything. */
+static void serve_request(const struct sbx_policy *policy, const struct sbx_request *request, const char *body,
+                          size_t body_len, int *fds, int fd_count, pid_t pid, struct conn_budget *budget) {
+    park_pending = 0;
+    serve_one(policy, request, body, body_len, fds, fd_count, pid, budget);
+    if (!park_pending) return;
+    park_pending = 0;
+    struct parked *p = calloc(1, sizeof(*p));
+    char *copy = malloc(body_len ? body_len : 1);
+    int ok = p && copy;
+    for (int i = 0; ok && i < fd_count; i++) {
+        p->fds[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 0);
+        if (p->fds[i] < 0) ok = 0;
+        else p->fd_count++;
+    }
+    if (ok && net_wait_reserve(budget) != 0) ok = -1;
+    if (ok == 1) {
+        memcpy(copy, body, body_len);
+        p->policy = policy_hold(policy);
+        p->budget = budget;
+        p->request = *request;
+        p->body = copy;
+        p->body_len = body_len;
+        p->pid = pid;
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_t thread;
+        int error = pthread_create(&thread, &attributes, parked_serve, p);
+        pthread_attr_destroy(&attributes);
+        if (error == 0) return;
+        policy_release(policy);
+        net_wait_unreserve(budget);
+    }
+    reply(fds[0], ok == -1 ? -EAGAIN : -ENOMEM, NULL, 0, -1);
+    if (p) for (int i = 0; i < p->fd_count; i++) close(p->fds[i]);
+    free(copy);
+    free(p);
+}
+
 int sbx_broker_prepare(int fd) {
     int on = 1;
     return setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0 ? 0 : -errno;
@@ -2451,8 +2569,8 @@ static void serve_loop(const struct sbx_policy *policy, int fd) {
             }
         }
         if (pid > 0 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) && (size_t) n >= sizeof(struct sbx_request)) {
-            serve_one(policy, &incoming.request, incoming.body, (size_t) n - sizeof(struct sbx_request), fds,
-                      fd_count, pid, budget);
+            serve_request(policy, &incoming.request, incoming.body, (size_t) n - sizeof(struct sbx_request), fds,
+                          fd_count, pid, budget);
         } else if (fd_count >= 1) {
             /*
              * A message too short to be a request, one whose descriptors or

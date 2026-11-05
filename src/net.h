@@ -65,6 +65,9 @@ struct netp_verdict netp_name(struct netp *n, const char *name);
  */
 int netp_resolve(struct netp *n, const char *name, int family, struct sockaddr_storage *out, int max);
 
+/* The name the broker most recently resolved address for, into out; 0, or -ENOENT. */
+int netp_name_for(struct netp *n, const struct netp_addr *address, char *out, size_t size);
+
 /* The rule lines in order, for the policy's digest: appends to *buffer (malloc'd) and *length. */
 int netp_serialize(const struct netp *n, unsigned char **buffer, size_t *length);
 

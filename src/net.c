@@ -376,6 +376,21 @@ static int resolved_for(struct netp *n, const struct rule *r, const struct netp_
     return found;
 }
 
+int netp_name_for(struct netp *n, const struct netp_addr *address, char *out, size_t size) {
+    time_t now = time(NULL), best = 0;
+    pthread_mutex_lock(&n->lock);
+    for (unsigned i = 0; i < TABLE_SIZE; i++) {
+        const struct entry *e = &n->table[i];
+        if (e->expires > now && e->expires > best && e->address.family == address->family &&
+            memcmp(e->address.a, address->a, address->family == AF_INET ? 4 : 16) == 0) {
+            best = e->expires;
+            snprintf(out, size, "%s", e->name);
+        }
+    }
+    pthread_mutex_unlock(&n->lock);
+    return best ? 0 : -ENOENT;
+}
+
 int netp_resolve(struct netp *n, const char *name, int family, struct sockaddr_storage *out, int max) {
     char canonical[NAME_MAX_LEN + 1];
     if (canonical_name(name, canonical) != 0) return -ENOENT;
