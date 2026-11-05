@@ -998,6 +998,48 @@ static void make_bundle(void) {
     to_utf8(bundle8, sizeof(bundle8), exe_to);
 }
 
+/* Spawns program with argv under the probe's grants; its exit code (or -1 when it did not start). */
+static int spawn_exit(const char *program, char **argv, int less) {
+    struct sbx_policy *policy = sbx_policy_new();
+    sbx_policy_add(policy, exe_dir8, SBX_READ | SBX_STATIC);
+    sbx_policy_add(policy, python_dir8, SBX_READ | SBX_STATIC);
+    struct sbx_spawn_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.path = program;
+    spec.argv = argv;
+    spec.container = CONTAINER;
+    spec.less_privileged = less;
+    spec.policy = policy;
+    struct sbx_process process;
+    int code = -1;
+    if (sbx_spawn(&spec, &process) == 0) sbx_process_wait(&process, &code);
+    else printf("info bundle probe: sbx_spawn of %s failed (Windows error %lu)\n", program, sbx_spawn_error());
+    return code;
+}
+
+static void bundle_probe(int less) {
+    /* 1. python.exe itself as a module: its whole import closure, resolved from the bundle. */
+    probe_one(bundle8, less);
+    /* 2. The bundled interpreter with nothing but -I -c pass: no channel, no script. */
+    char *plain[] = {bundle8, "-I", "-c", "pass", NULL};
+    printf("info bundle probe: bundled python.exe -I -c pass -> %d\n", spawn_exit(bundle8, plain, less));
+    /* 3. This test program, copied into the bundle's folder, loading kernel32: whether the folder itself matters. */
+    wchar_t from[MAX_PATH], to[MAX_PATH];
+    MultiByteToWideChar(CP_UTF8, 0, exe8, -1, from, MAX_PATH);
+    MultiByteToWideChar(CP_UTF8, 0, bundle8, -1, to, MAX_PATH);
+    wcscpy(wcsrchr(to, L'\\') + 1, L"sbx_test_copy.exe");
+    if (copy_bytes(from, to)) {
+        char to8[MAX_PATH * 3];
+        to_utf8(to8, sizeof(to8), to);
+        char *load[] = {to8, "--load", "kernel32.dll", NULL};
+        printf("info bundle probe: this program from the bundle's folder -> %d\n", spawn_exit(to8, load, less));
+        DeleteFileW(to);
+    }
+    /* 4. The original python.exe with -I -c pass, for comparison. */
+    char *original[] = {python8, "-I", "-c", "pass", NULL};
+    printf("info bundle probe: original python.exe -I -c pass -> %d\n", spawn_exit(python8, original, less));
+}
+
 static void python_checks(void) {
     wchar_t python[MAX_PATH];
     if (!GetEnvironmentVariableW(L"SBX_TEST_PYTHON", python, MAX_PATH)) {
@@ -1113,6 +1155,7 @@ static void python_checks(void) {
                     *wcsrchr(python_dir, L'\\') = 0;
                     printf("info dll probe: the bundle's own files:\n");
                     dll_probe(less);
+                    bundle_probe(less);
                     wcscpy(python_dir, saved);
                 }
             }
