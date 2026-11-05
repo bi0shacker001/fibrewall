@@ -761,10 +761,10 @@ static void python_checks(void) {
             child_path(errors_path, L"python-stderr.txt");
             FILE *errors = _wfopen(errors_path, L"rb");
             static char said[3000];
-            size_t n = errors ? fread(said, 1, sizeof(said) - 1, errors) : 0;
+            size_t said_length = errors ? fread(said, 1, sizeof(said) - 1, errors) : 0;
             if (errors) fclose(errors);
-            said[n] = 0;
-            printf("info %s: its stderr:\n%s\n", label, n ? said : "(nothing)");
+            said[said_length] = 0;
+            printf("info %s: its stderr:\n%s\n", label, said_length ? said : "(nothing)");
         }
     }
     DeleteFileW(profile_file);
